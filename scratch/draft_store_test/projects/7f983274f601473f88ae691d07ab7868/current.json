@@ -1,0 +1,111 @@
+{
+  "name": "Draft Smoke",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30.0,
+  "sample_rate": 48000,
+  "tracks": [
+    {
+      "kind": "video",
+      "name": "Main",
+      "clips": [
+        {
+          "clip_type": "media",
+          "source": "D:/video.mp4",
+          "proxy": null,
+          "in_point": 0.0,
+          "out_point": 10.5,
+          "start": 12.345,
+          "volume": 0.5,
+          "speed": 2.0,
+          "reverse": false,
+          "scale": null,
+          "pos_x": null,
+          "pos_y": null,
+          "text_main": "",
+          "text_second": "",
+          "text_display": "main",
+          "text_font_family": "Verdana",
+          "text_font_size": 36,
+          "text_color": "#ffffff",
+          "text_second_font_size": 36,
+          "text_second_color": "#ffffff",
+          "text_stroke_color": "#000000",
+          "text_stroke_width": 2,
+          "effects": {
+            "blur": 0.0,
+            "brightness": 0.0,
+            "contrast": 1.0,
+            "saturation": 1.0,
+            "grayscale": false,
+            "crop": null,
+            "rotate": 0.0,
+            "hflip": false,
+            "vflip": false,
+            "chromakey": null
+          },
+          "audio_effects": {
+            "fade_in": 0.0,
+            "fade_out": 0.0,
+            "pitch_semitones": 0.0,
+            "denoise": false,
+            "denoise_method": "afftdn",
+            "denoise_model": null,
+            "normalize": false
+          }
+        },
+        {
+          "clip_type": "media",
+          "source": "D:/video.mp4",
+          "proxy": null,
+          "in_point": 1.0,
+          "out_point": 3.0,
+          "start": 25.0,
+          "volume": 1.0,
+          "speed": 1.0,
+          "reverse": false,
+          "scale": null,
+          "pos_x": null,
+          "pos_y": null,
+          "text_main": "",
+          "text_second": "",
+          "text_display": "main",
+          "text_font_family": "Verdana",
+          "text_font_size": 36,
+          "text_color": "#ffffff",
+          "text_second_font_size": 36,
+          "text_second_color": "#ffffff",
+          "text_stroke_color": "#000000",
+          "text_stroke_width": 2,
+          "effects": {
+            "blur": 0.0,
+            "brightness": 0.0,
+            "contrast": 1.0,
+            "saturation": 1.0,
+            "grayscale": false,
+            "crop": null,
+            "rotate": 0.0,
+            "hflip": false,
+            "vflip": false,
+            "chromakey": null
+          },
+          "audio_effects": {
+            "fade_in": 0.0,
+            "fade_out": 0.0,
+            "pitch_semitones": 0.0,
+            "denoise": false,
+            "denoise_method": "afftdn",
+            "denoise_model": null,
+            "normalize": false
+          }
+        }
+      ],
+      "overlays": [],
+      "image_overlays": [],
+      "transitions": [],
+      "locked": false,
+      "hidden": false,
+      "muted": false
+    }
+  ]
+}

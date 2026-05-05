@@ -1,0 +1,27 @@
+{
+  "name": "demo",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "sample_rate": 48000,
+  "tracks": [
+    {
+      "kind": "video",
+      "name": "V1",
+      "clips": [
+        { "source": "clip_a.mp4", "in_point": 0, "out_point": 5, "start": 0 },
+        { "source": "clip_b.mp4", "in_point": 2, "out_point": 8, "start": 5 }
+      ],
+      "overlays": [
+        { "text": "Hello from ComeCut-Py!", "start": 0, "end": 4, "font_size": 64, "font_color": "white" }
+      ]
+    },
+    {
+      "kind": "audio",
+      "name": "A1",
+      "clips": [
+        { "source": "music.mp3", "in_point": 0, "out_point": 11, "start": 0, "volume": 0.4 }
+      ]
+    }
+  ]
+}

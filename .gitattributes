@@ -1,0 +1,4 @@
+capcut_generator/_internal/bin/ffmpeg.exe filter=lfs diff=lfs merge=lfs -text
+capcut_generator/_internal/bin/ffprobe.exe filter=lfs diff=lfs merge=lfs -text
+python/ffmpeg/ffmpeg.exe filter=lfs diff=lfs merge=lfs -text
+python/ffmpeg/ffprobe.exe filter=lfs diff=lfs merge=lfs -text

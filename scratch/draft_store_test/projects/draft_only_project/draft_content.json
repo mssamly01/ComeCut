@@ -1,0 +1,92 @@
+{
+  "id": "FC7EB557-662B-4F24-92D0-DE6191270E4E",
+  "version": 1,
+  "app_version": "1.0.0",
+  "name": "Fallback Smoke",
+  "duration": 3000000,
+  "fps": 30.0,
+  "sample_rate": 48000,
+  "create_time": 1777893114297771,
+  "update_time": 1777893114297771,
+  "canvas_config": {
+    "width": 1920,
+    "height": 1080,
+    "ratio": "16:9",
+    "background": null
+  },
+  "tracks": [
+    {
+      "id": "67F673EF-1FEC-448B-BBD4-2D7A45B1975E",
+      "type": "text",
+      "name": "Text 1",
+      "locked": false,
+      "hidden": false,
+      "muted": false,
+      "segments": [
+        {
+          "id": "32F624C5-6377-4870-992D-E12C39C5DA06",
+          "material_id": "826DB7E2-F24A-4619-A78A-C6AC335F2FAD",
+          "source_timerange": null,
+          "target_timerange": {
+            "start": 1000000,
+            "duration": 2000000
+          },
+          "speed": 1.0,
+          "volume": 1.0,
+          "reverse": false,
+          "visible": true,
+          "clip": {
+            "scale": {
+              "x": 1.0,
+              "y": 1.0
+            },
+            "transform": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "rotation": 0.0,
+            "alpha": 1.0,
+            "flip": {
+              "horizontal": false,
+              "vertical": false
+            }
+          },
+          "extra_material_refs": [],
+          "pip_scale": null,
+          "pip_pos_x": null,
+          "pip_pos_y": null,
+          "opacity_keyframes": [],
+          "x_keyframes": [],
+          "y_keyframes": []
+        }
+      ]
+    }
+  ],
+  "materials": {
+    "videos": [],
+    "audios": [],
+    "texts": [
+      {
+        "id": "826DB7E2-F24A-4619-A78A-C6AC335F2FAD",
+        "type": "text",
+        "text_main": "hello",
+        "text_second": "",
+        "text_display": "main",
+        "font_family": "Verdana",
+        "font_size": 36,
+        "color": "#ffffff",
+        "second_font_size": 36,
+        "second_color": "#ffffff",
+        "stroke_color": "#000000",
+        "stroke_width": 2
+      }
+    ],
+    "images": [],
+    "effects": [],
+    "audio_effects": [],
+    "crops": [],
+    "chromas": [],
+    "transitions": []
+  },
+  "keyframes": {}
+}
