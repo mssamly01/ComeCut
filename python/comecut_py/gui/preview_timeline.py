@@ -1,0 +1,64 @@
+"""Timeline helpers used by preview playback selection/sync."""
+
+from __future__ import annotations
+
+from ..core.project import Clip, Track
+
+_EPS = 1e-3
+
+
+def clip_end_seconds(clip: Clip) -> float:
+    dur = clip.timeline_duration or 0.0
+    return float(clip.start) + max(0.0, float(dur))
+
+
+def clip_contains_time(clip: Clip, seconds: float) -> bool:
+    start = float(clip.start)
+    return start <= float(seconds) < clip_end_seconds(clip)
+
+
+def visible_audio_tracks(tracks: list[Track]) -> list[Track]:
+    return [
+        track
+        for track in tracks
+        if track.kind == "audio"
+        and track.clips
+        and not bool(getattr(track, "hidden", False))
+        and not bool(getattr(track, "muted", False))
+    ]
+
+
+def pick_timeline_audio_clip(
+    tracks: list[Track],
+    seconds: float,
+    *,
+    fallback_to_first: bool = False,
+) -> Clip | None:
+    s = max(0.0, float(seconds))
+    audio_tracks = visible_audio_tracks(tracks)
+    for track in audio_tracks:
+        for clip in track.clips:
+            if clip_contains_time(clip, s):
+                return clip
+    if fallback_to_first and audio_tracks:
+        return audio_tracks[0].clips[0]
+    return None
+
+
+def next_playable_time_after(tracks: list[Track], seconds: float) -> float | None:
+    after = max(0.0, float(seconds)) + _EPS
+    best: float | None = None
+    for track in tracks:
+        if track.kind not in {"video", "audio"} or bool(getattr(track, "hidden", False)):
+            continue
+        if track.kind == "audio" and bool(getattr(track, "muted", False)):
+            continue
+        for clip in track.clips:
+            end = clip_end_seconds(clip)
+            if end <= after:
+                continue
+            start = float(clip.start)
+            candidate = start if start >= after else after
+            if candidate < end and (best is None or candidate < best):
+                best = candidate
+    return best

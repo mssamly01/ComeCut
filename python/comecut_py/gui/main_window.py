@@ -61,6 +61,7 @@ from .dialogs.export_dialog import ExportDialog
 from .dialogs.plugin_manager import PluginManagerDialog
 from .dialogs.subtitle_edit_translate import SubtitleDialogInfo, SubtitleEditTranslateDialog
 from .plugin_config import PluginConfigStore, build_translate_provider
+from .preview_timeline import next_playable_time_after, pick_timeline_audio_clip
 from .widgets.inspector import InspectorPanel
 from .widgets.left_rail import TAB_MEDIA, TAB_TEXT, LeftRail
 from .widgets.media_library import MediaLibraryPanel
@@ -289,6 +290,10 @@ class MainWindow(QMainWindow):
         self.preview_panel.playback_state_changed.connect(
             self.timeline_panel.set_playing_state
         )
+        self.preview_panel.playback_state_changed.connect(
+            self._on_preview_playback_state_changed
+        )
+        self.preview_panel.media_ended.connect(self._on_preview_media_ended)
         self.text_panel.template_chosen.connect(self._on_subtitle_template)
         self.timeline_panel.project_mutated.connect(self._on_timeline_project_mutated)
         # OCR connections
@@ -342,6 +347,10 @@ class MainWindow(QMainWindow):
         if clip is not None and not clip.is_text_clip:
             timeline_seconds = _source_to_timeline_seconds(clip, media_seconds)
         self._apply_preview_audio_state(clip, timeline_seconds)
+        self._sync_timeline_audio_for_time(
+            timeline_seconds,
+            playing=self.preview_panel.is_playing(),
+        )
         self.timeline_panel.set_playhead(timeline_seconds)
         self._update_subtitle_overlay(timeline_seconds)
         self._auto_select_text_clip_at_playhead()
@@ -539,8 +548,8 @@ class MainWindow(QMainWindow):
 
     def _on_timeline_playpause_requested(self) -> None:
         self._preview_sync_mode = "timeline"
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         if not self.preview_panel.is_playing():
-            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
             clip = self._pick_preview_clip_for_time(current)
             if clip is not None:
                 self._set_preview_source_for_clip(clip)
@@ -556,6 +565,39 @@ class MainWindow(QMainWindow):
             else:
                 self._apply_preview_audio_state(None, current)
         self.preview_panel.toggle_play_pause()
+        self._sync_timeline_audio_for_time(
+            current,
+            playing=self.preview_panel.is_playing(),
+            force_seek=True,
+        )
+
+    def _on_preview_playback_state_changed(self, playing: bool) -> None:
+        if self._preview_sync_mode != "timeline":
+            return
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        self._sync_timeline_audio_for_time(
+            current,
+            playing=bool(playing),
+            force_seek=True,
+        )
+
+    def _on_preview_media_ended(self) -> None:
+        if self._preview_sync_mode != "timeline":
+            return
+
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        ended_clip = self._pick_preview_clip_for_time(max(0.0, current - 1e-4))
+        if ended_clip is not None:
+            current = max(current, self._clip_end_seconds(ended_clip))
+
+        next_time = next_playable_time_after(self.project.tracks, current)
+        if next_time is None:
+            self.preview_panel.clear_timeline_audio()
+            return
+
+        self._on_timeline_seek(next_time)
+        self.preview_panel.play()
+        self._sync_timeline_audio_for_time(next_time, playing=True, force_seek=True)
 
     def _set_preview_source(self, path: Path | str, *, force: bool = False) -> None:
         path_str = str(path)
@@ -710,47 +752,6 @@ class MainWindow(QMainWindow):
         end = start + float(clip.timeline_duration or 0.0)
         return start <= float(seconds) < end
 
-    def _pick_active_audio_clip_for_time(
-        self,
-        seconds: float,
-        *,
-        prefer_selected: bool = True,
-        fallback_to_first: bool = True,
-    ) -> Clip | None:
-        s = max(0.0, float(seconds))
-        if prefer_selected:
-            selected = self.inspector_panel.current_clip()
-            if (
-                isinstance(selected, Clip)
-                and not selected.is_text_clip
-                and self._clip_contains_time(selected, s)
-            ):
-                track = self._find_track_for_clip(selected)
-                if (
-                    track is not None
-                    and track.kind == "audio"
-                    and not self._is_track_hidden(track)
-                    and not self._is_track_muted(track)
-                ):
-                    return selected
-            return None
-
-        audio_tracks = [
-            tr
-            for tr in self.project.tracks
-            if tr.kind == "audio"
-            and tr.clips
-            and not self._is_track_hidden(tr)
-            and not self._is_track_muted(tr)
-        ]
-        for track in audio_tracks:
-            for clip in track.clips:
-                if self._clip_contains_time(clip, s):
-                    return clip
-        if fallback_to_first and audio_tracks:
-            return audio_tracks[0].clips[0]
-        return None
-
     @staticmethod
     def _preview_fade_multiplier(clip: Clip, timeline_seconds: float) -> float:
         local_t = max(0.0, float(timeline_seconds) - float(clip.start))
@@ -779,62 +780,90 @@ class MainWindow(QMainWindow):
         gain = base * self._preview_fade_multiplier(clip, timeline_seconds)
         self.preview_panel.set_audio_gain(gain)
 
-    def _pick_preview_clip_for_time(self, seconds: float) -> Clip | None:
+    def _pick_video_clip_for_time(self, seconds: float) -> Clip | None:
         s = max(0.0, float(seconds))
-        selected_audio = self._pick_active_audio_clip_for_time(
-            s,
-            prefer_selected=True,
-            fallback_to_first=False,
-        )
-        if selected_audio is not None:
-            return selected_audio
-
-        active_audio = self._pick_active_audio_clip_for_time(
-            s,
-            prefer_selected=False,
-            fallback_to_first=False,
-        )
-        video_candidate: Clip | None = None
-
         main = self._main_video_track()
         if main is not None:
             for clip in main.clips:
                 if clip.start <= s < self._clip_end_seconds(clip):
-                    video_candidate = clip
-                    break
-            if video_candidate is None and main.clips:
-                video_candidate = main.clips[0]
+                    return clip
 
-        if video_candidate is None:
-            video_tracks = [
-                tr for tr in self.project.tracks
-                if tr.kind == "video" and tr.clips and not self._is_track_hidden(tr)
-            ]
-            for track in video_tracks:
-                for clip in track.clips:
-                    if clip.start <= s < self._clip_end_seconds(clip):
-                        video_candidate = clip
-                        break
-                if video_candidate is not None:
-                    break
-            if video_candidate is None and video_tracks:
-                video_candidate = video_tracks[0].clips[0]
+        video_tracks = [
+            tr
+            for tr in self.project.tracks
+            if tr.kind == "video" and tr.clips and not self._is_track_hidden(tr)
+        ]
+        for track in video_tracks:
+            for clip in track.clips:
+                if clip.start <= s < self._clip_end_seconds(clip):
+                    return clip
+        return None
 
-        if active_audio is not None:
-            use_audio = (
-                video_candidate is None
-                or not self._clip_contains_time(video_candidate, s)
-                or not self._clip_has_preview_audio(video_candidate)
-            )
-            if use_audio:
-                return active_audio
-
+    def _pick_preview_clip_for_time(self, seconds: float) -> Clip | None:
+        s = max(0.0, float(seconds))
+        video_candidate = self._pick_video_clip_for_time(s)
         if video_candidate is not None:
             return video_candidate
-        return self._pick_active_audio_clip_for_time(
+
+        audio_candidate = pick_timeline_audio_clip(
+            self.project.tracks,
             s,
-            prefer_selected=False,
             fallback_to_first=True,
+        )
+        if audio_candidate is not None:
+            return audio_candidate
+
+        main = self._main_video_track()
+        if main is not None and main.clips:
+            return main.clips[0]
+        for track in self.project.tracks:
+            if track.kind == "video" and track.clips and not self._is_track_hidden(track):
+                return track.clips[0]
+        return None
+
+    def _main_preview_is_audio_clip(self, clip: Clip | None) -> bool:
+        if clip is None:
+            return False
+        track = self._find_track_for_clip(clip)
+        return track is not None and track.kind == "audio"
+
+    def _sync_timeline_audio_for_time(
+        self,
+        timeline_seconds: float,
+        *,
+        playing: bool,
+        force_seek: bool = False,
+    ) -> None:
+        current_preview = self._pick_preview_clip_for_time(timeline_seconds)
+        if self._main_preview_is_audio_clip(current_preview):
+            self.preview_panel.clear_timeline_audio()
+            return
+
+        audio_clip = pick_timeline_audio_clip(
+            self.project.tracks,
+            timeline_seconds,
+            fallback_to_first=False,
+        )
+        if audio_clip is None:
+            self.preview_panel.clear_timeline_audio()
+            return
+
+        track = self._find_track_for_clip(audio_clip)
+        if track is None or self._is_track_hidden(track) or self._is_track_muted(track):
+            self.preview_panel.clear_timeline_audio()
+            return
+
+        source_ms = int(_timeline_to_source_seconds(audio_clip, timeline_seconds) * 1000.0)
+        gain = max(0.0, float(audio_clip.volume or 0.0))
+        gain *= self._preview_fade_multiplier(audio_clip, timeline_seconds)
+        self.preview_panel.sync_timeline_audio(
+            self._clip_preview_path(audio_clip),
+            source_ms,
+            playback_rate=float(audio_clip.speed or 1.0),
+            gain=gain,
+            muted=False,
+            playing=playing,
+            force_seek=force_seek,
         )
 
     def _ensure_preview_source_for_time(self, seconds: float) -> None:
@@ -881,6 +910,11 @@ class MainWindow(QMainWindow):
             self.preview_panel.clear_video_transform()
             self.preview_panel.clear()
             self._preview_source_path = None
+        self._sync_timeline_audio_for_time(
+            float(seconds),
+            playing=self.preview_panel.is_playing(),
+            force_seek=True,
+        )
         self._update_subtitle_overlay(seconds)
         self._auto_select_text_clip_at_playhead()
         try:
@@ -1199,6 +1233,11 @@ class MainWindow(QMainWindow):
                     float(getattr(preview_clip, "speed", 1.0) or 1.0)
                 )
             self._apply_preview_audio_state(preview_clip, current_seconds)
+            self._sync_timeline_audio_for_time(
+                current_seconds,
+                playing=self.preview_panel.is_playing(),
+                force_seek=True,
+            )
         if clip is not None:
             try:
                 selected = self.timeline_panel.selected_clips()
@@ -1813,6 +1852,7 @@ class MainWindow(QMainWindow):
             return
         self._preview_sync_mode = "library"
         self.preview_panel.clear_video_transform()
+        self.preview_panel.clear_timeline_audio()
         if not isinstance(path_obj, Path):
             self.preview_panel.set_audio_muted(False)
             self.preview_panel.clear()

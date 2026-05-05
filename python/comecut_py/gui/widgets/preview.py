@@ -953,6 +953,7 @@ def _preview_icon(symbol_id: str, *, color: str = ICON_NORMAL, size: int = 16) -
 class PreviewPanel(QWidget):
     position_changed = Signal(int)  # current playhead in milliseconds
     playback_state_changed = Signal(bool)
+    media_ended = Signal()
     ocr_area_selected = Signal(float, float, float, float)  # y1, y2, x1, x2 (0.0-1.0)
     ocr_cancelled = Signal()
     transform_changed = Signal(float, int, int, float)  # scale, x, y, rotate
@@ -1086,6 +1087,11 @@ class PreviewPanel(QWidget):
         self._audio = QAudioOutput(self)
         self._player.setVideoSink(self._video.video_sink)
         self._player.setAudioOutput(self._audio)
+        self._timeline_audio_player = QMediaPlayer(self)
+        self._timeline_audio = QAudioOutput(self)
+        self._timeline_audio_player.setAudioOutput(self._timeline_audio)
+        self._timeline_audio_source_path: str | None = None
+        self._timeline_audio_last_seek_ms: int = -1
 
         self._duration_ms = 0
         self._pending_seek_ms: int | None = None
@@ -1188,6 +1194,7 @@ class PreviewPanel(QWidget):
         self._duration_ms = 0
         self._player.stop()
         self._player.setSource(QUrl())
+        self.clear_timeline_audio()
         self._video.clear_frame()
         self._video.clear_video_transform()
         self._update_time(0)
@@ -1288,6 +1295,64 @@ class PreviewPanel(QWidget):
         value = max(0.1, min(10.0, value))
         if abs(float(self._player.playbackRate()) - value) > 1e-9:
             self._player.setPlaybackRate(value)
+
+    def sync_timeline_audio(
+        self,
+        path: Path | str,
+        ms: int,
+        *,
+        playback_rate: float = 1.0,
+        gain: float = 1.0,
+        muted: bool = False,
+        playing: bool = False,
+        force_seek: bool = False,
+    ) -> None:
+        path_str = str(path)
+        source_changed = self._timeline_audio_source_path != path_str
+        if source_changed:
+            self._timeline_audio_player.pause()
+            self._timeline_audio_player.setSource(QUrl.fromLocalFile(path_str))
+            self._timeline_audio_source_path = path_str
+            self._timeline_audio_last_seek_ms = -1
+            force_seek = True
+
+        try:
+            rate = float(playback_rate)
+        except Exception:
+            rate = 1.0
+        rate = max(0.1, min(10.0, rate))
+        if abs(float(self._timeline_audio_player.playbackRate()) - rate) > 1e-9:
+            self._timeline_audio_player.setPlaybackRate(rate)
+
+        try:
+            volume = float(gain)
+        except Exception:
+            volume = 1.0
+        volume = max(0.0, min(1.0, volume))
+        self._timeline_audio.setMuted(bool(muted))
+        self._timeline_audio.setVolume(volume)
+
+        try:
+            ms_i = max(0, int(ms))
+        except Exception:
+            ms_i = 0
+
+        current = int(self._timeline_audio_player.position())
+        should_seek = force_seek or self._timeline_audio_last_seek_ms < 0 or abs(current - ms_i) > 180
+        if should_seek:
+            self._timeline_audio_player.setPosition(ms_i)
+            self._timeline_audio_last_seek_ms = ms_i
+
+        if playing and not muted and volume > 0.0:
+            self._timeline_audio_player.play()
+        else:
+            self._timeline_audio_player.pause()
+
+    def clear_timeline_audio(self) -> None:
+        self._timeline_audio_player.pause()
+        self._timeline_audio_player.setSource(QUrl())
+        self._timeline_audio_source_path = None
+        self._timeline_audio_last_seek_ms = -1
 
     def play(self) -> None:
         self._cancel_prime_frame(keep_playing=True)
@@ -1408,6 +1473,9 @@ class PreviewPanel(QWidget):
         self._update_time(self._player.position())
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.media_ended.emit()
+            return
         if self._seek_on_load_ms is None:
             return
         if status not in (
