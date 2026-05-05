@@ -1090,6 +1090,10 @@ class PreviewPanel(QWidget):
         self._timeline_audio_player = QMediaPlayer(self)
         self._timeline_audio = QAudioOutput(self)
         self._timeline_audio_player.setAudioOutput(self._timeline_audio)
+        try:
+            self._timeline_audio_player.setPitchCompensation(True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         self._timeline_audio_source_path: str | None = None
         self._timeline_audio_last_seek_ms: int = -1
 
@@ -1320,7 +1324,7 @@ class PreviewPanel(QWidget):
             rate = float(playback_rate)
         except Exception:
             rate = 1.0
-        rate = max(0.1, min(10.0, rate))
+        rate = max(0.5, min(2.0, rate))
         if abs(float(self._timeline_audio_player.playbackRate()) - rate) > 1e-9:
             self._timeline_audio_player.setPlaybackRate(rate)
 
@@ -1338,14 +1342,26 @@ class PreviewPanel(QWidget):
             ms_i = 0
 
         current = int(self._timeline_audio_player.position())
-        should_seek = force_seek or self._timeline_audio_last_seek_ms < 0 or abs(current - ms_i) > 180
+        drift_limit_ms = 900 if playing else 80
+        if abs(rate - 1.0) > 1e-3:
+            drift_limit_ms = 1200 if playing else 80
+        should_seek = (
+            force_seek
+            or self._timeline_audio_last_seek_ms < 0
+            or abs(current - ms_i) > drift_limit_ms
+        )
         if should_seek:
             self._timeline_audio_player.setPosition(ms_i)
             self._timeline_audio_last_seek_ms = ms_i
 
-        if playing and not muted and volume > 0.0:
+        should_play = playing and not muted and volume > 0.0
+        is_playing = (
+            self._timeline_audio_player.playbackState()
+            == QMediaPlayer.PlaybackState.PlayingState
+        )
+        if should_play and not is_playing:
             self._timeline_audio_player.play()
-        else:
+        elif not should_play and is_playing:
             self._timeline_audio_player.pause()
 
     def clear_timeline_audio(self) -> None:

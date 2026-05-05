@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from comecut_py.core.project import Clip, Track
-from comecut_py.gui.preview_timeline import next_playable_time_after, pick_timeline_audio_clip
+from comecut_py.gui.preview_timeline import (
+    clip_fade_multiplier_at_local_time,
+    next_playable_time_after,
+    pick_timeline_audio_clip,
+)
 
 
 def test_audio_clip_can_be_picked_without_selection() -> None:
@@ -33,3 +39,13 @@ def test_next_playable_time_skips_to_later_audio_clip() -> None:
     clip2 = Clip(source="b.wav", start=3.0, in_point=0.0, out_point=2.0)
     tracks = [Track(kind="audio", clips=[clip1, clip2])]
     assert next_playable_time_after(tracks, 1.0) == 3.0
+
+
+def test_fade_multiplier_clamps_overlapping_fades_to_half_duration() -> None:
+    clip = Clip(source="a.wav", start=0.0, in_point=0.0, out_point=2.0, speed=2.0)
+    clip.audio_effects.fade_in = 3.0
+    clip.audio_effects.fade_out = 3.0
+
+    assert clip_fade_multiplier_at_local_time(clip, 0.25) == pytest.approx(0.5)
+    assert clip_fade_multiplier_at_local_time(clip, 0.5) == pytest.approx(1.0)
+    assert clip_fade_multiplier_at_local_time(clip, 0.75) == pytest.approx(0.5)

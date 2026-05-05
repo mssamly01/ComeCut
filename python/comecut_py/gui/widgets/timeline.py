@@ -47,8 +47,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency on some runtimes
     QSvgRenderer = None
 
-from ...core.project import Clip, Project, Track
 from ...core.ffmpeg_cmd import get_video_duration
+from ...core.project import Clip, Project, Track
+from ..preview_timeline import clip_fade_multiplier_at_local_time
 BASE_PIXELS_PER_SECOND = 50.0
 PIXELS_PER_SECOND = BASE_PIXELS_PER_SECOND
 TRACK_HEIGHT = 64.0
@@ -651,6 +652,32 @@ class ClipRect(QGraphicsRectItem):
         afx.fade_out = new_fade
         return True
 
+    def _apply_waveform_fade_envelope(self, peaks: list[float]) -> list[float]:
+        if not peaks:
+            return peaks
+
+        dur = max(0.0, float(self.clip.timeline_duration or 0.0))
+        if dur <= 1e-6:
+            return peaks
+
+        afx = self.clip.audio_effects
+        if (
+            float(getattr(afx, "fade_in", 0.0) or 0.0) <= 0.0
+            and float(getattr(afx, "fade_out", 0.0) or 0.0) <= 0.0
+        ):
+            return peaks
+
+        denom = float(max(1, len(peaks) - 1))
+        return [
+            max(0.0, float(peak))
+            * clip_fade_multiplier_at_local_time(
+                self.clip,
+                (float(i) / denom) * dur,
+                duration_seconds=dur,
+            )
+            for i, peak in enumerate(peaks)
+        ]
+
     def _hit_fade_handle(self, pos: QPointF) -> str | None:
         if self._is_text_clip or self._locked:
             return None
@@ -833,6 +860,7 @@ class ClipRect(QGraphicsRectItem):
                             if bar_count >= len(peaks_full)
                             else _downsample_peaks(peaks_full, bar_count)
                         )
+                        peaks = self._apply_waveform_fade_envelope(peaks)
                         wave_gain = max(0.0, float(getattr(self.clip, "volume", 1.0) or 0.0))
                         draw_waveform = (
                             self._draw_waveform_polygon

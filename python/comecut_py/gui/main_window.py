@@ -61,7 +61,11 @@ from .dialogs.export_dialog import ExportDialog
 from .dialogs.plugin_manager import PluginManagerDialog
 from .dialogs.subtitle_edit_translate import SubtitleDialogInfo, SubtitleEditTranslateDialog
 from .plugin_config import PluginConfigStore, build_translate_provider
-from .preview_timeline import next_playable_time_after, pick_timeline_audio_clip
+from .preview_timeline import (
+    clip_fade_multiplier,
+    next_playable_time_after,
+    pick_timeline_audio_clip,
+)
 from .widgets.inspector import InspectorPanel
 from .widgets.left_rail import TAB_MEDIA, TAB_TEXT, LeftRail
 from .widgets.media_library import MediaLibraryPanel
@@ -754,16 +758,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _preview_fade_multiplier(clip: Clip, timeline_seconds: float) -> float:
-        local_t = max(0.0, float(timeline_seconds) - float(clip.start))
-        dur = float(clip.timeline_duration or 0.0)
-        afx = clip.audio_effects
-        mult = 1.0
-        if afx.fade_in > 0.0:
-            mult *= max(0.0, min(1.0, local_t / float(afx.fade_in)))
-        if afx.fade_out > 0.0 and dur > 0.0:
-            remain = max(0.0, dur - local_t)
-            mult *= max(0.0, min(1.0, remain / float(afx.fade_out)))
-        return mult
+        return clip_fade_multiplier(clip, timeline_seconds)
 
     def _apply_preview_audio_state(self, clip: Clip | None, timeline_seconds: float) -> None:
         if clip is None:
@@ -1183,6 +1178,13 @@ class MainWindow(QMainWindow):
         self._push_timeline_history()
         self.inspector_panel.refresh()
         self._refresh_auto_speed_issue_overlays()
+        if self.preview_panel.is_playing():
+            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+            self._sync_timeline_audio_for_time(
+                current,
+                playing=True,
+                force_seek=True,
+            )
 
     def _on_topbar_project_title_changed(self, title: str) -> None:
         new_name = (title or "").strip() or "Untitled"
