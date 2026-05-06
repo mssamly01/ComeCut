@@ -1209,6 +1209,8 @@ class PreviewPanel(QWidget):
         self._last_seek_ms: int = -1
         self._last_seek_flush_ts: float = 0.0
         self._seek_on_load_ms: int | None = None
+        self._pending_play_on_load = False
+        self._pending_play_seek_ms: int | None = None
         self._prime_seek_ms: int | None = None
         self._prime_prev_muted: bool | None = None
         self._seek_flush = QTimer(self)
@@ -1303,6 +1305,9 @@ class PreviewPanel(QWidget):
         self._pending_seek_ms = None
         self._last_seek_ms = -1
         self._seek_on_load_ms = 0
+        self._pending_play_on_load = False
+        self._pending_play_seek_ms = None
+        self._duration_ms = 0
         self._media_source_path = str(path)
         self._clear_meter_status()
         self._player.pause()
@@ -1316,6 +1321,8 @@ class PreviewPanel(QWidget):
             self._seek_flush.stop()
         self._pending_seek_ms = None
         self._seek_on_load_ms = None
+        self._pending_play_on_load = False
+        self._pending_play_seek_ms = None
         self._last_seek_ms = -1
         self._duration_ms = 0
         self._media_source_path = None
@@ -1373,6 +1380,63 @@ class PreviewPanel(QWidget):
 
         if not self._seek_flush.isActive():
             self._seek_flush.start(interval_ms)
+
+    def load_seek_play(self, path: Path | str, ms: int, *, rate: float = 1.0) -> None:
+        """Load a source, then seek and play after Qt reports it is ready."""
+        path_s = str(path)
+        same_source = self._media_source_path == path_s and not self._player.source().isEmpty()
+        ready_statuses = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        )
+        source_ready = same_source and self._player.mediaStatus() in ready_statuses
+        if source_ready:
+            ms_i = self._normalize_seek_ms(ms)
+        else:
+            try:
+                ms_i = int(ms)
+            except Exception:
+                ms_i = 0
+            ms_i = max(0, ms_i)
+
+        self.set_playback_rate(rate)
+        self._pending_play_on_load = True
+        self._pending_play_seek_ms = ms_i
+
+        if source_ready:
+            self._pending_play_on_load = False
+            self._pending_play_seek_ms = None
+            self._cancel_prime_frame(keep_playing=True)
+            if self._seek_flush.isActive():
+                self._seek_flush.stop()
+            self._pending_seek_ms = None
+            self._seek_on_load_ms = None
+            self.seek(ms_i)
+            self._player.play()
+            self._sync_play_icon()
+            return
+
+        if same_source:
+            self._cancel_prime_frame(keep_playing=False)
+            if self._seek_flush.isActive():
+                self._seek_flush.stop()
+            self._pending_seek_ms = None
+            self._seek_on_load_ms = None
+            self._sync_play_icon()
+            return
+
+        self._cancel_prime_frame(keep_playing=False)
+        if self._seek_flush.isActive():
+            self._seek_flush.stop()
+        self._pending_seek_ms = None
+        self._last_seek_ms = -1
+        self._seek_on_load_ms = None
+        self._duration_ms = 0
+        self._media_source_path = path_s
+        self._clear_meter_status()
+        self._player.pause()
+        self._player.setSource(QUrl.fromLocalFile(path_s))
+        self._sync_play_icon()
 
     def _flush_pending_seek(self) -> None:
         if self._pending_seek_ms is None:
@@ -1779,12 +1843,22 @@ class PreviewPanel(QWidget):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             self.media_ended.emit()
             return
-        if self._seek_on_load_ms is None:
-            return
         if status not in (
             QMediaPlayer.MediaStatus.LoadedMedia,
             QMediaPlayer.MediaStatus.BufferedMedia,
         ):
+            return
+        if self._pending_play_on_load:
+            ms = self._pending_play_seek_ms or 0
+            self._pending_play_on_load = False
+            self._pending_play_seek_ms = None
+            self._seek_on_load_ms = None
+            self._cancel_prime_frame(keep_playing=True)
+            self.seek(ms)
+            self._player.play()
+            self._sync_play_icon()
+            return
+        if self._seek_on_load_ms is None:
             return
         ms = self._seek_on_load_ms
         self._seek_on_load_ms = None

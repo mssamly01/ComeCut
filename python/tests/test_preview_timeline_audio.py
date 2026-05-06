@@ -30,6 +30,18 @@ class _PreviewPickerStub:
                 return track
         return None
 
+    def _pick_preview_clip_for_time(
+        self,
+        seconds: float,
+        *,
+        fallback_to_first: bool = False,
+    ):
+        return MainWindow._pick_preview_clip_for_time(
+            self,
+            seconds,
+            fallback_to_first=fallback_to_first,
+        )
+
     @staticmethod
     def _is_track_hidden(track: Track) -> bool:
         return bool(getattr(track, "hidden", False))
@@ -84,6 +96,26 @@ def test_main_window_preview_picker_does_not_fallback_by_default() -> None:
 
     assert MainWindow._pick_preview_clip_for_time(stub, 0.5) is None
     assert MainWindow._pick_preview_clip_for_time(stub, 0.5, fallback_to_first=True) is audio
+
+
+def test_timeline_play_start_keeps_current_gap_position() -> None:
+    audio = Clip(source="a.wav", start=3.0, in_point=0.0, out_point=2.0)
+    stub = _PreviewPickerStub([Track(kind="audio", clips=[audio])])
+
+    play_time, clip = MainWindow._resolve_timeline_play_start(stub, 0.5)
+
+    assert play_time == pytest.approx(0.5)
+    assert clip is None
+
+
+def test_timeline_play_start_returns_clip_when_playhead_touches_media() -> None:
+    audio = Clip(source="a.wav", start=3.0, in_point=0.0, out_point=2.0)
+    stub = _PreviewPickerStub([Track(kind="audio", clips=[audio])])
+
+    play_time, clip = MainWindow._resolve_timeline_play_start(stub, 3.5)
+
+    assert play_time == pytest.approx(3.5)
+    assert clip is audio
 
 
 def test_next_playable_time_skips_to_later_audio_clip() -> None:

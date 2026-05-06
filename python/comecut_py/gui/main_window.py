@@ -616,8 +616,7 @@ class MainWindow(QMainWindow):
                 force_seek=False,
             )
             return
-        play_time, clip = self._resolve_timeline_play_start(current)
-        if clip is None:
+        if not self._timeline_has_any_components():
             self.timeline_panel.set_playing_state(False)
             self.preview_panel.set_timeline_playing_override(False)
             self._sync_timeline_audio_for_time(
@@ -626,8 +625,7 @@ class MainWindow(QMainWindow):
                 force_seek=True,
             )
             return
-        if abs(play_time - current) > 1e-6:
-            self.timeline_panel.set_playhead(play_time)
+        play_time, _clip = self._resolve_timeline_play_start(current)
         self._start_timeline_playback_at(play_time)
 
     def _on_preview_playpause_requested(self) -> None:
@@ -768,6 +766,17 @@ class MainWindow(QMainWindow):
         self._set_preview_source(self._clip_preview_path(clip), force=force)
         self.preview_panel.set_playback_rate(float(getattr(clip, "speed", 1.0) or 1.0))
 
+    def _play_preview_clip_at(self, clip: Clip, timeline_seconds: float) -> None:
+        self._preview_active_media_clip = clip
+        preview_path = self._clip_preview_path(clip)
+        source_ms = int(_timeline_to_source_seconds(clip, timeline_seconds) * 1000.0)
+        self._preview_source_path = str(preview_path)
+        self.preview_panel.load_seek_play(
+            preview_path,
+            source_ms,
+            rate=float(getattr(clip, "speed", 1.0) or 1.0),
+        )
+
     def _prewarm_timeline_cache_for_clips(self, clips: list[Clip]) -> None:
         if not clips:
             return
@@ -832,14 +841,12 @@ class MainWindow(QMainWindow):
             self.preview_panel.clear_timeline_audio()
             return
 
-        self._set_preview_source_for_clip(clip)
         if track is not None and track.kind == "video":
             self._apply_preview_video_transform(clip)
         else:
             self._apply_preview_video_transform(None)
         self._apply_preview_audio_state(clip, s)
-        self.preview_panel.seek(int(_timeline_to_source_seconds(clip, s) * 1000.0))
-        self.preview_panel.play()
+        self._play_preview_clip_at(clip, s)
         self._sync_timeline_audio_for_time(
             s,
             playing=True,
@@ -1492,19 +1499,7 @@ class MainWindow(QMainWindow):
 
     def _resolve_timeline_play_start(self, current: float) -> tuple[float, Clip | None]:
         current_s = max(0.0, float(current))
-        clip = self._pick_preview_clip_for_time(current_s)
-        if clip is not None:
-            return current_s, clip
-
-        next_time = next_playable_time_after(self.project.tracks, current_s)
-        if next_time is not None:
-            return next_time, self._pick_preview_clip_for_time(next_time)
-
-        first_time = next_playable_time_after(self.project.tracks, -0.001)
-        if first_time is not None:
-            return first_time, self._pick_preview_clip_for_time(first_time)
-
-        return current_s, None
+        return current_s, self._pick_preview_clip_for_time(current_s)
 
     def _sync_preview_play_availability(self) -> None:
         self.preview_panel.set_timeline_play_available(self._timeline_has_any_components())
