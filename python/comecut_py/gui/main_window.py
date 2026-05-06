@@ -609,21 +609,37 @@ class MainWindow(QMainWindow):
         if not want_play:
             self._stop_gap_playback()
             self.preview_panel.pause()
+            self.preview_panel.set_timeline_playing_override(False)
             self._sync_timeline_audio_for_time(
                 current,
                 playing=False,
                 force_seek=False,
             )
             return
-        self._start_timeline_playback_at(current)
+        play_time, clip = self._resolve_timeline_play_start(current)
+        if clip is None:
+            self.timeline_panel.set_playing_state(False)
+            self.preview_panel.set_timeline_playing_override(False)
+            self._sync_timeline_audio_for_time(
+                current,
+                playing=False,
+                force_seek=True,
+            )
+            return
+        if abs(play_time - current) > 1e-6:
+            self.timeline_panel.set_playhead(play_time)
+        self._start_timeline_playback_at(play_time)
 
     def _on_preview_playpause_requested(self) -> None:
-        if self._preview_sync_mode != "timeline":
-            self.preview_panel.toggle_play_pause()
+        if self._timeline_has_any_components():
+            self._preview_sync_mode = "timeline"
+            want_play = not bool(getattr(self.timeline_panel, "_is_playing", False))
+            self.timeline_panel.set_playing_state(want_play)
+            self.preview_panel.set_timeline_playing_override(want_play)
+            self._on_timeline_playpause_requested()
             return
-        want_play = not bool(getattr(self.timeline_panel, "_is_playing", False))
-        self.timeline_panel.set_playing_state(want_play)
-        self._on_timeline_playpause_requested()
+        self.preview_panel.set_timeline_playing_override(None)
+        self.preview_panel.toggle_play_pause()
 
     def _on_preview_playback_state_changed(self, playing: bool) -> None:
         if self._preview_sync_mode != "timeline":
@@ -660,6 +676,7 @@ class MainWindow(QMainWindow):
         if next_time is None:
             self._stop_gap_playback()
             self.timeline_panel.set_playing_state(False)
+            self.preview_panel.set_timeline_playing_override(False)
             self.preview_panel.clear_timeline_audio()
             return
 
@@ -777,6 +794,7 @@ class MainWindow(QMainWindow):
         if not self._gap_play_timer.isActive():
             self._gap_play_timer.start()
         self.timeline_panel.set_playing_state(True)
+        self.preview_panel.set_timeline_playing_override(True)
 
     def _stop_gap_playback(self) -> None:
         self._gap_play_active = False
@@ -864,6 +882,7 @@ class MainWindow(QMainWindow):
         if next_clip is None and next_playable_time_after(self.project.tracks, next_seconds) is None:
             self._stop_gap_playback()
             self.timeline_panel.set_playing_state(False)
+            self.preview_panel.set_timeline_playing_override(False)
             self.preview_panel.clear_timeline_audio()
 
     def _start_proxy_generation_if_needed(
@@ -1470,6 +1489,22 @@ class MainWindow(QMainWindow):
 
     def _timeline_has_any_components(self) -> bool:
         return any(bool(track.clips) for track in self.project.tracks)
+
+    def _resolve_timeline_play_start(self, current: float) -> tuple[float, Clip | None]:
+        current_s = max(0.0, float(current))
+        clip = self._pick_preview_clip_for_time(current_s)
+        if clip is not None:
+            return current_s, clip
+
+        next_time = next_playable_time_after(self.project.tracks, current_s)
+        if next_time is not None:
+            return next_time, self._pick_preview_clip_for_time(next_time)
+
+        first_time = next_playable_time_after(self.project.tracks, -0.001)
+        if first_time is not None:
+            return first_time, self._pick_preview_clip_for_time(first_time)
+
+        return current_s, None
 
     def _sync_preview_play_availability(self) -> None:
         self.preview_panel.set_timeline_play_available(self._timeline_has_any_components())
@@ -2373,6 +2408,7 @@ class MainWindow(QMainWindow):
             # don't clear the preview just because the library card was deselected.
             return
         self._preview_sync_mode = "library"
+        self.preview_panel.set_timeline_playing_override(None)
         self.preview_panel.clear_video_transform()
         self.preview_panel.clear_timeline_audio()
         if not isinstance(path_obj, Path):
@@ -2942,6 +2978,7 @@ class MainWindow(QMainWindow):
     def _stop_preview_playback(self) -> None:
         """Stop all preview media immediately (video + timeline audio)."""
         self._stop_gap_playback()
+        self.preview_panel.set_timeline_playing_override(False)
         try:
             self.preview_panel.clear()
         except Exception:

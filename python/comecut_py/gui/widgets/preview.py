@@ -1197,6 +1197,7 @@ class PreviewPanel(QWidget):
         self._timeline_audio_last_seek_ts: float = 0.0
         self._media_source_path: str | None = None
         self._timeline_play_available = False
+        self._timeline_playing_override: bool | None = None
         self._meter_token = 0
         self._meter_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -1270,7 +1271,10 @@ class PreviewPanel(QWidget):
         else:
             self._play_btn.setCursor(Qt.CursorShape.ArrowCursor)
 
-        is_playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        if self._timeline_playing_override is None:
+            is_playing = self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        else:
+            is_playing = bool(self._timeline_playing_override)
         symbol = "icon-editor-preview-pause" if is_playing else "icon-editor-preview-play"
         fallback = "||" if is_playing else ">"
         
@@ -1284,6 +1288,10 @@ class PreviewPanel(QWidget):
 
     def set_timeline_play_available(self, available: bool) -> None:
         self._timeline_play_available = bool(available)
+        self._sync_play_icon()
+
+    def set_timeline_playing_override(self, playing: bool | None) -> None:
+        self._timeline_playing_override = None if playing is None else bool(playing)
         self._sync_play_icon()
 
     # ---- playback control ----
