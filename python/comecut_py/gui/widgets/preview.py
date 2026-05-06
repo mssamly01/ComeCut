@@ -1029,6 +1029,7 @@ def _preview_icon(symbol_id: str, *, color: str = ICON_NORMAL, size: int = 16) -
 
 class PreviewPanel(QWidget):
     position_changed = Signal(int)  # current playhead in milliseconds
+    playpause_requested = Signal()
     playback_state_changed = Signal(bool)
     media_ended = Signal()
     ocr_area_selected = Signal(float, float, float, float)  # y1, y2, x1, x2 (0.0-1.0)
@@ -1108,7 +1109,7 @@ class PreviewPanel(QWidget):
         self._play_btn.setObjectName("iconBtn")
         self._play_btn.setFixedSize(28, 28)
         self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._play_btn.clicked.connect(self._toggle_play)
+        self._play_btn.clicked.connect(self.playpause_requested.emit)
         footer_layout.addWidget(self._play_btn)
 
         footer_layout.addStretch(1)

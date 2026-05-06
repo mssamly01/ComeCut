@@ -3946,6 +3946,131 @@ class TimelinePanel(QWidget):
 
             self._thumb_executor.submit(_prewarm_video)
 
+    def _prewarm_clip_media_assets(self, clip: Clip) -> None:
+        if bool(getattr(clip, "is_text_clip", False)):
+            return
+        source_raw = self._clip_decode_source(clip)
+        if not source_raw:
+            return
+        try:
+            source = str(Path(source_raw).resolve())
+        except Exception:
+            source = str(source_raw)
+        ext = Path(source).suffix.lower()
+        is_audio = ext in AUDIO_EXTS
+        try:
+            duration = float(
+                getattr(clip, "source_duration", 0.0)
+                or getattr(clip, "timeline_duration", 0.0)
+                or 0.0
+            )
+        except Exception:
+            duration = 0.0
+        duration = max(0.0, duration)
+        fast_key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
+        self._submit_waveform_extract(
+            fast_key,
+            source,
+            WAVEFORM_PEAKS_FAST,
+        )
+        hi_key = self._peaks_key(clip, WAVEFORM_PEAKS_RESOLUTION)
+        self._submit_waveform_extract(
+            hi_key,
+            source,
+            WAVEFORM_PEAKS_RESOLUTION,
+        )
+
+        if is_audio:
+            return
+        if TIMELINE_USE_TILED_FILMSTRIP:
+            src_duration = duration
+            if src_duration <= 1e-6:
+                try:
+                    src_duration = float(get_video_duration(source))
+                except Exception:
+                    src_duration = 0.0
+            src_duration = max(0.0, src_duration)
+            if src_duration <= 1e-6:
+                return
+            chunk_count = max(
+                1,
+                int(math.ceil(src_duration / float(max(1, FILMSTRIP_TILES_PER_CHUNK)))),
+            )
+            for chunk_idx in range(chunk_count):
+                key = self._filmstrip_chunk_key(source, chunk_idx)
+                self._submit_filmstrip_chunk_extract(key, source, int(chunk_idx))
+            return
+
+        strip_width = FILMSTRIP_FRAMES * FILMSTRIP_TILE_WIDTH
+        main_track_h = MAIN_TRACK_HEIGHT_FACTOR * TRACK_HEIGHT
+        _, main_filmstrip_h, _ = _clip_section_heights(main_track_h)
+        raw_strip_height = max(16.0, main_filmstrip_h)
+        strip_height = max(
+            16,
+            int(
+                (
+                    (int(raw_strip_height) + FILMSTRIP_HEIGHT_BUCKET - 1)
+                    // FILMSTRIP_HEIGHT_BUCKET
+                )
+                * FILMSTRIP_HEIGHT_BUCKET
+            ),
+        )
+        if duration <= 1e-6:
+            try:
+                duration = float(get_video_duration(source))
+            except Exception:
+                duration = 0.0
+        key = self._filmstrip_key_from_source(
+            source,
+            strip_width=strip_width,
+            strip_height=strip_height,
+            frames=FILMSTRIP_FRAMES,
+            duration=duration,
+        )
+        self._submit_filmstrip_extract(
+            key,
+            source,
+            strip_width=strip_width,
+            strip_height=strip_height,
+            frames=FILMSTRIP_FRAMES,
+            duration=duration,
+        )
+
+    def prewarm_track_clips(self, clips: list[Clip]) -> None:
+        """Eagerly preload timeline cache for clips already on tracks."""
+        seen: set[tuple[str, int, str]] = set()
+        for clip in clips:
+            if not isinstance(clip, Clip):
+                continue
+            source_raw = self._clip_decode_source(clip)
+            if not source_raw:
+                continue
+            try:
+                source = str(Path(source_raw).resolve())
+            except Exception:
+                source = str(source_raw)
+            try:
+                duration_ms = int(
+                    round(
+                        max(
+                            0.0,
+                            float(
+                                getattr(clip, "source_duration", 0.0)
+                                or getattr(clip, "timeline_duration", 0.0)
+                                or 0.0
+                            ),
+                        )
+                        * 1000.0
+                    )
+                )
+            except Exception:
+                duration_ms = 0
+            signature = (source, duration_ms, str(clip.clip_type))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            self._prewarm_clip_media_assets(clip)
+
     def _update_clip_items_for_cache_key(
         self,
         key: tuple,
