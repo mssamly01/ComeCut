@@ -1205,6 +1205,9 @@ class PreviewPanel(QWidget):
         )
 
         self._duration_ms = 0
+        self._timeline_time_display_enabled = False
+        self._timeline_current_ms = 0
+        self._timeline_total_ms = 0
         self._pending_seek_ms: int | None = None
         self._last_seek_ms: int = -1
         self._last_seek_flush_ts: float = 0.0
@@ -1296,6 +1299,28 @@ class PreviewPanel(QWidget):
         self._timeline_playing_override = None if playing is None else bool(playing)
         self._sync_play_icon()
 
+    def set_timeline_time_display(self, current_ms: int, total_ms: int) -> None:
+        try:
+            current_i = int(current_ms)
+        except Exception:
+            current_i = 0
+        try:
+            total_i = int(total_ms)
+        except Exception:
+            total_i = 0
+        current_i = max(0, current_i)
+        total_i = max(0, total_i)
+        if total_i > 0:
+            current_i = min(current_i, total_i)
+        self._timeline_time_display_enabled = True
+        self._timeline_current_ms = current_i
+        self._timeline_total_ms = total_i
+        self._update_time(current_i)
+
+    def clear_timeline_time_display(self) -> None:
+        self._timeline_time_display_enabled = False
+        self._update_time(self._player.position())
+
     # ---- playback control ----
 
     def load(self, path: Path | str) -> None:
@@ -1333,6 +1358,25 @@ class PreviewPanel(QWidget):
         self._video.clear_frame()
         self._video.clear_video_transform()
         self._update_time(0)
+        self._sync_play_icon()
+
+    def clear_video_preview(self) -> None:
+        """Clear only the main preview video/audio source, keeping timeline audio alive."""
+        self._cancel_prime_frame(keep_playing=False)
+        if self._seek_flush.isActive():
+            self._seek_flush.stop()
+        self._pending_seek_ms = None
+        self._seek_on_load_ms = None
+        self._pending_play_on_load = False
+        self._pending_play_seek_ms = None
+        self._last_seek_ms = -1
+        self._duration_ms = 0
+        self._media_source_path = None
+        self._clear_meter_status()
+        self._player.stop()
+        self._player.setSource(QUrl())
+        self._video.clear_frame()
+        self._video.clear_video_transform()
         self._sync_play_icon()
 
     def _normalize_seek_ms(self, ms: int) -> int:
@@ -1464,6 +1508,9 @@ class PreviewPanel(QWidget):
         self._toggle_play()
 
     def is_playing(self) -> bool:
+        return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def main_player_is_playing(self) -> bool:
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
     def set_audio_muted(self, muted: bool) -> None:
@@ -2164,8 +2211,12 @@ class PreviewPanel(QWidget):
         super().closeEvent(event)
 
     def _update_time(self, pos: int) -> None:
-        cur = _fmt_time(pos)
-        total = _fmt_time(self._duration_ms)
+        if self._timeline_time_display_enabled:
+            cur = _fmt_time(self._timeline_current_ms)
+            total = _fmt_time(self._timeline_total_ms)
+        else:
+            cur = _fmt_time(pos)
+            total = _fmt_time(self._duration_ms)
         self._time_lbl.setText(
             f'<span style="color:{ICON_ACTIVE}">{cur}</span> '
             f'<span style="color:#8c93a0">/ {total}</span>'

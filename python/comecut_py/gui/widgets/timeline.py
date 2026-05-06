@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic
+from uuid import uuid4
 
 from PySide6.QtCore import QByteArray, QPoint, QPointF, QRectF, QSize, Qt, QSignalBlocker, QTimer, Signal  # type: ignore
 from PySide6.QtGui import (  # type: ignore
@@ -1627,6 +1628,13 @@ class ClipRect(QGraphicsRectItem):
             self.clip.start = snapped_sec
             self._drag_y = float(value.y())
             value.setX(self._panel.seconds_to_pixels(snapped_sec))
+            self._panel._update_live_link_follow(
+                self.clip,
+                origin_start=float(self._drag_origin_start),
+                parent_start=snapped_sec,
+                parent_scene_y=float(value.y()),
+                parent_lane_y=float(self._lane_y),
+            )
         return super().itemChange(change, value)
 
     def _apply_trim_geometry_from_clip(self) -> None:
@@ -1712,6 +1720,7 @@ class ClipRect(QGraphicsRectItem):
         # Clicking to select should not trigger timeline mutation/rebuild.
         if not self._drag_happened:
             self.setZValue(0)
+            self._panel._clear_live_link_follow()
             return
         # Only treat as a drop when position/lane actually changed.
         time_moved = abs(float(self.clip.start) - float(self._drag_origin_start)) > 1e-4
@@ -1719,6 +1728,7 @@ class ClipRect(QGraphicsRectItem):
         if not (time_moved or lane_moved):
             self.setZValue(0)
             self.setSelected(True)
+            self._panel._clear_live_link_follow()
             return
         # Defer model/scene mutation until Qt finishes release handling.
         # This avoids deleting the active QGraphicsItem while native code is
@@ -1797,6 +1807,10 @@ class ClipRect(QGraphicsRectItem):
         self._drag_origin_start = self.clip.start
         src_idx = self._panel._track_index_for_clip(self.clip)
         self._drag_origin_track_idx = -1 if src_idx is None else src_idx
+        self._panel._begin_live_link_follow(
+            self.clip,
+            origin_start=float(self._drag_origin_start),
+        )
         self._drag_happened = False
         sp = event.scenePos()
         self._press_scene_x = float(sp.x())
@@ -1804,6 +1818,9 @@ class ClipRect(QGraphicsRectItem):
         # Keep the dragged clip visually above overlapping clips while moving.
         self.setZValue(2002)
         super().mousePressEvent(event)
+        # Qt can toggle Ctrl/Shift-clicked items after our manual selection.
+        # Re-assert selection so multi-select actions like Link see every clip.
+        self.setSelected(True)
 
     def mouseMoveEvent(self, event):
         if self._fade_dragging is not None:
@@ -2467,7 +2484,13 @@ class TimelinePanel(QWidget):
         self._zoom_anchor_seconds: float | None = None
         self._zoom_anchor_view_x: float | None = None
         self._is_playing = False
-        self._is_auto_track_magnet = True
+        self._snapping_enabled = True
+        self._main_track_magnet_enabled = True
+        self._linked_selection_enabled = True
+        self._suppress_linked_selection = False
+        self._live_link_parent_runtime_id: int | None = None
+        self._live_link_parent_origin_start = 0.0
+        self._live_link_follow_snapshot: dict[int, tuple[Clip, float, str, float]] = {}
         self._hover_scrub_enabled = False
         self._use_opengl_viewport = TIMELINE_USE_OPENGL_VIEWPORT
         self._empty_drop_preview_visible = False
@@ -2550,6 +2573,7 @@ class TimelinePanel(QWidget):
         content_layout.addWidget(self._view)
         
         main_layout.addWidget(content)
+        self._ensure_unique_clip_ids()
         self.refresh()
 
     def _schedule_refresh(self) -> None:
@@ -2628,12 +2652,32 @@ class TimelinePanel(QWidget):
         self._btn_snap = self._make_toolbar_button(
             "icon-editor-timeline-snapping",
             "Báº¯t dÃ­nh",
-            self._toggle_auto_track_magnet,
+            self._toggle_snapping,
             checkable=True,
-            checked=self._is_auto_track_magnet,
+            checked=self._snapping_enabled,
             fallback="SN",
         )
         h.addWidget(self._btn_snap)
+
+        self._btn_main_magnet = self._make_toolbar_button(
+            "icon-editor-timeline-main-magnet",
+            "Hút vào đoạn chính",
+            self._toggle_main_track_magnet,
+            checkable=True,
+            checked=self._main_track_magnet_enabled,
+            fallback="MG",
+        )
+        h.addWidget(self._btn_main_magnet)
+
+        self._btn_link = self._make_toolbar_button(
+            "icon-editor-timeline-link",
+            "Liên kết/Bỏ liên kết clip đã chọn",
+            self._toggle_link_selected_clips,
+            checkable=True,
+            checked=False,
+            fallback="LK",
+        )
+        h.addWidget(self._btn_link)
 
         self._btn_hover_scrub = self._make_toolbar_button(
             "icon-editor-timeline-hoverscrub",
@@ -2782,7 +2826,35 @@ class TimelinePanel(QWidget):
         has_clips = any(len(track.clips) > 0 for track in self._project.tracks)
         btn.setEnabled(has_clips)
     def _refresh_toggle_icons(self) -> None:
-        self._apply_button_icon(self._btn_snap, active=self._is_auto_track_magnet)
+        self._apply_button_icon(self._btn_snap, active=self._snapping_enabled)
+        if hasattr(self, "_btn_main_magnet"):
+            self._apply_button_icon(
+                self._btn_main_magnet, active=self._main_track_magnet_enabled
+            )
+        if hasattr(self, "_btn_link"):
+            has_linked = False
+            selected_count = 0
+            if hasattr(self, "_scene"):
+                selected = self.selected_clips()
+                selected_count = len(selected)
+                has_linked = any(
+                    getattr(clip, "link_group_id", None)
+                    for clip in selected
+                )
+            active = bool(self._linked_selection_enabled or has_linked)
+            blocker = QSignalBlocker(self._btn_link)
+            try:
+                self._btn_link.setChecked(active)
+            finally:
+                del blocker
+            self._btn_link.setEnabled(True)
+            if selected_count >= 2:
+                tip = "LiÃªn káº¿t/Bá» liÃªn káº¿t clip Ä‘Ã£ chá»n"
+            else:
+                state = "Báº¬T" if self._linked_selection_enabled else "Táº®T"
+                tip = f"Linked Selection: {state} (chọn 2+ clip để tạo liên kết)"
+            self._btn_link.setToolTip(tip)
+            self._apply_button_icon(self._btn_link, active=active)
         if hasattr(self, "_btn_hover_scrub"):
             self._apply_button_icon(
                 self._btn_hover_scrub, active=self._hover_scrub_enabled
@@ -2821,12 +2893,16 @@ class TimelinePanel(QWidget):
             if isinstance(item, ClipRect) and id(item.clip) in affected:
                 item.update()
 
-    def _toggle_auto_track_magnet(self) -> None:
+    def _toggle_snapping(self) -> None:
         self._set_snapping_enabled(self._btn_snap.isChecked())
+
+    def _toggle_auto_track_magnet(self) -> None:
+        # Backward-compatible alias for older toolbar wiring/tests.
+        self._toggle_snapping()
 
     def _set_snapping_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
-        self._is_auto_track_magnet = enabled
+        self._snapping_enabled = enabled
         if hasattr(self, "_btn_snap"):
             blocker_snap = QSignalBlocker(self._btn_snap)
             try:
@@ -2834,6 +2910,77 @@ class TimelinePanel(QWidget):
             finally:
                 del blocker_snap
         self._refresh_toggle_icons()
+
+    def is_snapping_enabled(self) -> bool:
+        return bool(self._snapping_enabled)
+
+    def is_main_track_magnet_enabled(self) -> bool:
+        return bool(self._main_track_magnet_enabled)
+
+    def _toggle_main_track_magnet(self) -> None:
+        self._set_main_track_magnet_enabled(self._btn_main_magnet.isChecked())
+
+    def _set_main_track_magnet_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self._main_track_magnet_enabled = enabled
+        if hasattr(self, "_btn_main_magnet"):
+            blocker = QSignalBlocker(self._btn_main_magnet)
+            try:
+                self._btn_main_magnet.setChecked(enabled)
+            finally:
+                del blocker
+        changed = self.normalize_main_track_magnetic() if enabled else False
+        self._refresh_toggle_icons()
+        if changed:
+            self.refresh()
+            self.project_mutated.emit()
+
+    def _toggle_link_selected_clips(self) -> None:
+        selected = self.selected_clips()
+        if not selected:
+            self._linked_selection_enabled = bool(self._btn_link.isChecked())
+            self._refresh_toggle_icons()
+            return
+        self._ensure_unique_clip_ids()
+
+        linked_groups = {
+            str(getattr(clip, "link_group_id", "") or "")
+            for clip in selected
+            if getattr(clip, "link_group_id", None)
+        }
+        has_linked = bool(linked_groups) or any(
+            getattr(clip, "linked_parent_id", None) for clip in selected
+        )
+        if has_linked:
+            targets = self._expanded_linked_clips(selected)
+            for clip in targets:
+                self._clear_link_fields(clip)
+            self.refresh()
+            self.select_clips(targets)
+            self.project_mutated.emit()
+            return
+
+        if len(selected) < 2:
+            self._linked_selection_enabled = bool(self._btn_link.isChecked())
+            self._refresh_toggle_icons()
+            return
+        parent = self._choose_link_parent(selected)
+        if parent is None:
+            return
+        self._linked_selection_enabled = True
+        group_id = uuid4().hex
+        parent.link_group_id = group_id
+        parent.linked_parent_id = None
+        parent.linked_offset = 0.0
+        for clip in selected:
+            clip.link_group_id = group_id
+            if clip is parent:
+                continue
+            clip.linked_parent_id = parent.clip_id
+            clip.linked_offset = float(clip.start) - float(parent.start)
+        self.refresh()
+        self.select_clips(selected)
+        self.project_mutated.emit()
 
     def _toggle_hover_scrub(self) -> None:
         self._hover_scrub_enabled = self._btn_hover_scrub.isChecked()
@@ -2870,7 +3017,7 @@ class TimelinePanel(QWidget):
 
     def apply_clip_snap(self, moving_clip: Clip, start_seconds: float) -> float:
         raw_start = max(0.0, float(start_seconds))
-        if not self._is_auto_track_magnet:
+        if not self._snapping_enabled:
             return raw_start
 
         # Ported from editor_app.py::handle_drag
@@ -2906,7 +3053,7 @@ class TimelinePanel(QWidget):
 
     def apply_trim_snap(self, moving_clip: Clip, edge: str, edge_seconds: float) -> float:
         raw_edge = max(0.0, float(edge_seconds))
-        if not self._is_auto_track_magnet:
+        if not self._snapping_enabled:
             return raw_edge
         edge_n = (edge or "").strip().lower()
         if edge_n not in {"left", "right"}:
@@ -2933,7 +3080,7 @@ class TimelinePanel(QWidget):
         # Ported from editor_app.py::handle_scrub
         # Snap playhead to nearest clip edge across all tracks when magnet is enabled.
         t = max(0.0, raw_seconds)
-        if not self._is_auto_track_magnet:
+        if not self._snapping_enabled:
             return t
         snap_t = self._snap_tolerance_seconds()
         best_dist = float("inf")
@@ -2953,7 +3100,7 @@ class TimelinePanel(QWidget):
         moving_clip: Clip | None = None,
     ) -> float:
         start_seconds = max(0.0, start_seconds)
-        if not self._is_auto_track_magnet:
+        if not self._snapping_enabled:
             return start_seconds
 
         threshold_seconds = self._snap_tolerance_seconds()
@@ -3031,6 +3178,22 @@ class TimelinePanel(QWidget):
             return 60.0
         # Follow media length once clips exist (CapCut-like first-drop behavior).
         return max(8.0, timeline_end + 5.0)
+
+    def _timeline_end_seconds(self) -> float:
+        try:
+            return max(0.0, float(self._project.duration))
+        except Exception:
+            return 0.0
+
+    def _clamp_playhead_seconds(self, seconds: float) -> float:
+        try:
+            s = max(0.0, float(seconds))
+        except Exception:
+            s = 0.0
+        end = self._timeline_end_seconds()
+        if end > 0.0:
+            return min(s, end)
+        return 0.0
 
     def _visible_scene_right(self) -> float:
         viewport_w = float(self._view.viewport().width())
@@ -3141,14 +3304,367 @@ class TimelinePanel(QWidget):
                     return track, track_idx, clip_idx
         return None
 
+    def _all_timeline_clips(self) -> list[Clip]:
+        return [clip for track in self._project.tracks for clip in track.clips]
+
+    def _ensure_unique_clip_ids(self) -> bool:
+        changed = False
+        seen: set[str] = set()
+        for clip in self._all_timeline_clips():
+            clip_id = str(getattr(clip, "clip_id", "") or "").strip()
+            if not clip_id or clip_id in seen:
+                clip.clip_id = uuid4().hex
+                clip_id = str(clip.clip_id)
+                changed = True
+            seen.add(clip_id)
+        return changed
+
+    def _find_clip_by_clip_id(self, clip_id: str | None) -> Clip | None:
+        if not clip_id:
+            return None
+        target = str(clip_id)
+        for clip in self._all_timeline_clips():
+            if str(getattr(clip, "clip_id", "")) == target:
+                return clip
+        return None
+
+    def _main_track(self) -> Track | None:
+        main_idx = self._main_track_index()
+        if main_idx is None or main_idx < 0 or main_idx >= len(self._project.tracks):
+            return None
+        return self._project.tracks[main_idx]
+
+    def _is_main_track(self, track: Track) -> bool:
+        main = self._main_track()
+        return main is track and track.kind == "video"
+
+    def _is_main_video_clip(self, clip: Clip) -> bool:
+        loc = self._find_clip_location(clip)
+        return loc is not None and self._is_main_track(loc[0])
+
+    def _clips_for_link_group(self, group_id: str | None) -> list[Clip]:
+        if not group_id:
+            return []
+        gid = str(group_id)
+        return [
+            clip
+            for clip in self._all_timeline_clips()
+            if str(getattr(clip, "link_group_id", "") or "") == gid
+        ]
+
+    def _choose_link_parent(self, clips: list[Clip]) -> Clip | None:
+        if not clips:
+            return None
+        for clip in clips:
+            if self._is_main_video_clip(clip):
+                return clip
+        for clip in clips:
+            loc = self._find_clip_location(clip)
+            if loc is not None and loc[0].kind == "video":
+                return clip
+        return min(clips, key=lambda c: (float(c.start), str(getattr(c, "clip_id", ""))))
+
+    def _link_parent_for_clip(self, clip: Clip) -> Clip | None:
+        parent = self._find_clip_by_clip_id(getattr(clip, "linked_parent_id", None))
+        if parent is not None:
+            return parent
+        group = self._clips_for_link_group(getattr(clip, "link_group_id", None))
+        if not group:
+            return clip
+        group_ids = {str(getattr(c, "clip_id", "")) for c in group}
+        for candidate in group:
+            parent_id = str(getattr(candidate, "linked_parent_id", "") or "")
+            if not parent_id or parent_id not in group_ids:
+                return candidate
+        return self._choose_link_parent(group)
+
+    def _expanded_linked_clips(self, clips: list[Clip]) -> list[Clip]:
+        ordered: list[Clip] = []
+        seen: set[int] = set()
+
+        def add(clip: Clip) -> None:
+            if id(clip) not in seen:
+                ordered.append(clip)
+                seen.add(id(clip))
+
+        for clip in clips:
+            add(clip)
+            group_id = getattr(clip, "link_group_id", None)
+            if group_id:
+                for linked in self._clips_for_link_group(str(group_id)):
+                    add(linked)
+        return ordered
+
+    def _sync_linked_children_to_parent(
+        self,
+        parent: Clip,
+        *,
+        skip_main_track: bool = False,
+    ) -> bool:
+        changed = False
+        parent_id = str(getattr(parent, "clip_id", "") or "")
+        if not parent_id:
+            return False
+        for child in self._all_timeline_clips():
+            if child is parent:
+                continue
+            if str(getattr(child, "linked_parent_id", "") or "") != parent_id:
+                continue
+            if skip_main_track and self._is_main_video_clip(child):
+                continue
+            desired = max(0.0, float(parent.start) + float(getattr(child, "linked_offset", 0.0) or 0.0))
+            if abs(float(child.start) - desired) > 1e-6:
+                child.start = desired
+                changed = True
+        return changed
+
+    def _sync_linked_after_clip_move(self, clip: Clip) -> bool:
+        group_id = getattr(clip, "link_group_id", None)
+        if group_id and self._linked_selection_enabled:
+            parent = self._link_parent_for_clip(clip)
+            if parent is None:
+                return False
+            if parent is not clip:
+                desired_parent_start = max(
+                    0.0,
+                    float(clip.start) - float(getattr(clip, "linked_offset", 0.0) or 0.0),
+                )
+                if abs(float(parent.start) - desired_parent_start) > 1e-6:
+                    parent.start = desired_parent_start
+            return self._sync_linked_children_to_parent(parent)
+
+        if getattr(clip, "linked_parent_id", None):
+            parent = self._find_clip_by_clip_id(getattr(clip, "linked_parent_id", None))
+            if parent is not None:
+                clip.linked_offset = float(clip.start) - float(parent.start)
+                return True
+            clip.linked_parent_id = None
+            clip.linked_offset = 0.0
+            return True
+
+        return self._sync_linked_children_to_parent(clip)
+
+    def _clip_overlaps_range(self, clip: Clip, start: float, end: float) -> bool:
+        duration = max(0.0, float(clip.timeline_duration or 0.0))
+        if duration <= 0.0:
+            return False
+        clip_start = float(clip.start)
+        clip_end = clip_start + duration
+        return clip_start < end and clip_end > start
+
+    def _begin_live_link_follow(self, parent: Clip, *, origin_start: float) -> None:
+        self._live_link_parent_runtime_id = id(parent)
+        self._live_link_parent_origin_start = max(0.0, float(origin_start))
+        self._live_link_follow_snapshot = {}
+        if not self._linked_selection_enabled:
+            return
+
+        parent_duration = max(0.0, float(parent.timeline_duration or 0.0))
+        parent_old_end = self._live_link_parent_origin_start + parent_duration
+        parent_id = str(getattr(parent, "clip_id", "") or "")
+        parent_group_id = str(getattr(parent, "link_group_id", "") or "")
+        for child in self._all_timeline_clips():
+            if child is parent:
+                continue
+            child_loc = self._find_clip_location(child)
+            if child_loc is None:
+                continue
+            child_track, _, _ = child_loc
+            if self._is_track_locked(child_track):
+                continue
+
+            mode: str | None = None
+            if (
+                parent_id
+                and str(getattr(child, "linked_parent_id", "") or "") == parent_id
+            ):
+                mode = "linked_offset"
+            elif (
+                parent_group_id
+                and str(getattr(child, "link_group_id", "") or "") == parent_group_id
+            ):
+                mode = "delta"
+            elif (
+                self._is_main_video_clip(parent)
+                and not self._is_main_track(child_track)
+                and not getattr(child, "link_group_id", None)
+                and not getattr(child, "linked_parent_id", None)
+                and self._clip_overlaps_range(
+                    child,
+                    self._live_link_parent_origin_start,
+                    parent_old_end,
+                )
+            ):
+                mode = "delta"
+
+            if mode is not None:
+                item = self._clip_items_by_id.get(id(child))
+                child_lane_y = float(item._lane_y) if item is not None else 0.0
+                self._live_link_follow_snapshot[id(child)] = (
+                    child,
+                    float(child.start),
+                    mode,
+                    child_lane_y,
+                )
+
+    def _clear_live_link_follow(self) -> None:
+        self._live_link_parent_runtime_id = None
+        self._live_link_parent_origin_start = 0.0
+        self._live_link_follow_snapshot = {}
+
+    def _move_clip_item_live(self, clip: Clip, *, visual_y: float | None = None) -> None:
+        item = self._clip_items_by_id.get(id(clip))
+        if item is None:
+            return
+        item._updating_layout = True
+        try:
+            item.setPos(
+                self.seconds_to_pixels(float(clip.start)),
+                item._lane_y if visual_y is None else float(visual_y),
+            )
+        finally:
+            item._updating_layout = False
+        item.update()
+
+    def _update_live_link_follow(
+        self,
+        parent: Clip,
+        *,
+        origin_start: float,
+        parent_start: float,
+        parent_scene_y: float | None = None,
+        parent_lane_y: float | None = None,
+    ) -> bool:
+        if self._live_link_parent_runtime_id != id(parent):
+            self._begin_live_link_follow(parent, origin_start=origin_start)
+        if self._live_link_parent_runtime_id != id(parent):
+            return False
+        if not self._live_link_follow_snapshot:
+            return False
+
+        new_parent_start = max(0.0, float(parent_start))
+        delta = new_parent_start - self._live_link_parent_origin_start
+        visual_y_delta = 0.0
+        if parent_scene_y is not None and parent_lane_y is not None:
+            visual_y_delta = float(parent_scene_y) - float(parent_lane_y)
+        changed = False
+        for child, child_origin_start, mode, child_lane_y in list(self._live_link_follow_snapshot.values()):
+            if self._find_clip_location(child) is None:
+                continue
+            if mode == "linked_offset":
+                desired = max(
+                    0.0,
+                    new_parent_start + float(getattr(child, "linked_offset", 0.0) or 0.0),
+                )
+            else:
+                desired = max(0.0, child_origin_start + delta)
+            moved_x = abs(float(child.start) - desired) > 1e-6
+            child.start = desired
+            self._move_clip_item_live(child, visual_y=child_lane_y + visual_y_delta)
+            changed = changed or moved_x or abs(visual_y_delta) > 1e-6
+        return changed
+
+    def _sync_overlap_children_after_parent_move(
+        self,
+        parent: Clip,
+        *,
+        origin_start: float | None,
+    ) -> bool:
+        """Move unlinked clips that visually live under a moved Main clip.
+
+        This keeps LK useful as a mode: users can turn it on first, then drag
+        the main media and have overlapping audio/text/effect clips follow.
+        Explicit link groups still take priority and are skipped here.
+        """
+        if not self._linked_selection_enabled or not self._is_main_video_clip(parent):
+            return False
+        if origin_start is None:
+            return False
+        try:
+            old_start = max(0.0, float(origin_start))
+            new_start = max(0.0, float(parent.start))
+        except Exception:
+            return False
+        delta = new_start - old_start
+        if abs(delta) <= 1e-6:
+            return False
+        parent_duration = max(0.0, float(parent.timeline_duration or 0.0))
+        if parent_duration <= 0.0:
+            return False
+        old_end = old_start + parent_duration
+        changed = False
+        for child in self._all_timeline_clips():
+            if child is parent:
+                continue
+            if getattr(child, "link_group_id", None) or getattr(child, "linked_parent_id", None):
+                continue
+            child_loc = self._find_clip_location(child)
+            if child_loc is None:
+                continue
+            child_track, _, _ = child_loc
+            if self._is_main_track(child_track) or self._is_track_locked(child_track):
+                continue
+            child_duration = max(0.0, float(child.timeline_duration or 0.0))
+            if child_duration <= 0.0:
+                continue
+            child_start = float(child.start)
+            child_end = child_start + child_duration
+            overlaps_old_parent = child_start < old_end and child_end > old_start
+            if not overlaps_old_parent:
+                continue
+            child.start = max(0.0, child_start + delta)
+            changed = True
+        return changed
+
+    def _clear_link_fields(self, clip: Clip) -> None:
+        clip.link_group_id = None
+        clip.linked_parent_id = None
+        clip.linked_offset = 0.0
+
+    def _unlink_orphaned_children(self) -> bool:
+        existing_ids = {
+            str(getattr(clip, "clip_id", "") or "")
+            for clip in self._all_timeline_clips()
+        }
+        changed = False
+        for clip in self._all_timeline_clips():
+            parent_id = str(getattr(clip, "linked_parent_id", "") or "")
+            if parent_id and parent_id not in existing_ids:
+                clip.linked_parent_id = None
+                clip.linked_offset = 0.0
+                changed = True
+        return changed
+
+    def normalize_main_track_magnetic(self) -> bool:
+        if not self._main_track_magnet_enabled:
+            return False
+        track = self._main_track()
+        if track is None or track.kind != "video" or not track.clips:
+            return False
+
+        changed = self._ensure_unique_clip_ids()
+        track.clips.sort(key=lambda c: (float(c.start), str(getattr(c, "clip_id", ""))))
+        cursor = 0.0
+        for clip in track.clips:
+            duration = max(0.0, float(clip.timeline_duration or 0.0))
+            if duration <= 0.0:
+                continue
+            old_start = float(clip.start)
+            if abs(old_start - cursor) > 1e-6:
+                clip.start = cursor
+                changed = True
+                if self._sync_linked_children_to_parent(clip, skip_main_track=True):
+                    changed = True
+            cursor += duration
+        track.clips.sort(key=lambda c: (float(c.start), str(getattr(c, "clip_id", ""))))
+        normalize_track_transitions(track)
+        return changed
+
     def _refresh_and_reselect(self, clip: Clip | None = None) -> None:
         self.refresh()
         if clip is None:
             return
-        for item in self._scene.items():
-            if isinstance(item, ClipRect) and item.clip is clip:
-                item.setSelected(True)
-                break
+        self.select_clip(clip)
 
     def select_clip(self, clip: Clip | None) -> None:
         self.select_clips([clip] if clip is not None else [])
@@ -3157,6 +3673,8 @@ class TimelinePanel(QWidget):
         return [it.clip for it in self._selected_clip_items()]
 
     def select_clips(self, clips: list[Clip]) -> None:
+        if self._linked_selection_enabled and not self._suppress_linked_selection:
+            clips = self._expanded_linked_clips([c for c in clips if c is not None])
         clip_ids = {id(c) for c in clips}
         blocker = QSignalBlocker(self._scene)
         try:
@@ -3169,6 +3687,7 @@ class TimelinePanel(QWidget):
             del blocker
         if clip_ids:
             self._view.setFocus()
+        self._refresh_toggle_icons()
         self._emit_current_selection()
 
     def _track_index_from_scene_y(self, scene_y: float) -> int:
@@ -3293,6 +3812,8 @@ class TimelinePanel(QWidget):
             )
         track.clips.sort(key=lambda c: c.start)
         normalize_track_transitions(track)
+        self._sync_linked_after_clip_move(clip)
+        self.normalize_main_track_magnetic()
         self._refresh_and_reselect(clip)
         self.project_mutated.emit()
         self.seek_requested.emit(float(self._playhead_seconds))
@@ -3305,15 +3826,21 @@ class TimelinePanel(QWidget):
     ) -> None:
         source_idx = self._track_index_for_clip(clip)
         if source_idx is None or not self._project.tracks:
+            self._clear_live_link_follow()
             self.refresh()
             return
 
-        original_track_count = len(self._project.tracks)
-        original_start = float(clip.start)
+        origin_start = (
+            max(0.0, float(drag_origin_start))
+            if drag_origin_start is not None
+            else float(clip.start)
+        )
+        had_live_follow = self._live_link_parent_runtime_id == id(clip)
         source_track = self._project.tracks[source_idx]
         if self._is_track_locked(source_track):
             if drag_origin_start is not None:
                 clip.start = max(0.0, drag_origin_start)
+            self._clear_live_link_follow()
             self._refresh_and_reselect(clip)
             return
         kind = source_track.kind
@@ -3354,6 +3881,7 @@ class TimelinePanel(QWidget):
         ):
             if drag_origin_start is not None:
                 clip.start = max(0.0, drag_origin_start)
+            self._clear_live_link_follow()
             self._refresh_and_reselect(clip)
             return
 
@@ -3372,14 +3900,30 @@ class TimelinePanel(QWidget):
         )
         if abs(resolved_start - clip.start) > 1e-6:
             clip.start = resolved_start
-        final_track.clips.sort(key=lambda c: c.start)
-        normalize_track_transitions(source_track)
-        if final_track is not source_track:
-            normalize_track_transitions(final_track)
+        self._sync_linked_after_clip_move(clip)
+        for track in self._project.tracks:
+            track.clips.sort(key=lambda c: c.start)
+            normalize_track_transitions(track)
+        self.normalize_main_track_magnetic()
+        if had_live_follow:
+            live_changed = self._update_live_link_follow(
+                clip,
+                origin_start=origin_start,
+                parent_start=float(clip.start),
+                parent_scene_y=None,
+                parent_lane_y=None,
+            )
+        else:
+            live_changed = self._sync_overlap_children_after_parent_move(
+                clip,
+                origin_start=origin_start,
+            )
+        if live_changed:
+            for track in self._project.tracks:
+                track.clips.sort(key=lambda c: c.start)
+                normalize_track_transitions(track)
+        self._clear_live_link_follow()
 
-        changed_track_count = len(self._project.tracks) != original_track_count
-        changed_track = final_track is not source_track or target_idx != source_idx
-        changed_time = abs(float(clip.start) - float(original_start)) > 1e-6
         # Ensure we always refresh to snap back if dropped in empty space.
         self._auto_clean_empty_tracks()
         self._refresh_and_reselect(clip)
@@ -4405,6 +4949,17 @@ class TimelinePanel(QWidget):
         )
 
     def _on_selection_changed(self) -> None:
+        if self._linked_selection_enabled and not self._suppress_linked_selection:
+            selected = self.selected_clips()
+            expanded = self._expanded_linked_clips(selected)
+            if {id(c) for c in expanded} != {id(c) for c in selected}:
+                self._suppress_linked_selection = True
+                try:
+                    self.select_clips(expanded)
+                finally:
+                    self._suppress_linked_selection = False
+                return
+        self._refresh_toggle_icons()
         self._emit_current_selection()
 
     def _emit_current_selection(self) -> None:
@@ -4418,6 +4973,7 @@ class TimelinePanel(QWidget):
         self._clear_transient_items()
         self._clear_clip_items()
         self._project = project
+        self._ensure_unique_clip_ids()
         self.refresh()
 
     def closeEvent(self, event) -> None:
@@ -4432,7 +4988,7 @@ class TimelinePanel(QWidget):
         super().closeEvent(event)
 
     def set_playhead(self, seconds: float) -> None:
-        self._playhead_seconds = max(0.0, seconds)
+        self._playhead_seconds = self._clamp_playhead_seconds(seconds)
         self._refresh_playhead()
 
     def is_playhead_scrubbing(self) -> bool:
@@ -4473,6 +5029,7 @@ class TimelinePanel(QWidget):
         seconds = max(0.0, self.pixels_to_seconds(scene_x))
         seconds = self._snap_playhead_time(seconds)
         self.set_playhead(seconds)
+        seconds = float(self._playhead_seconds)
         if not emit_seek:
             return
         scrub_like = self._is_playhead_scrubbing or self._hover_scrub_enabled
@@ -4858,6 +5415,8 @@ class TimelinePanel(QWidget):
             old_transitions,
             old_clip_count=len(old_clips),
         )
+        self._unlink_orphaned_children()
+        self.normalize_main_track_magnetic()
         self._auto_clean_empty_tracks()
         self._refresh_and_reselect(selected)
         self.project_mutated.emit()
@@ -4882,16 +5441,29 @@ class TimelinePanel(QWidget):
         left_dur = t_sec - clip.start
         cut_out = clip.in_point + left_dur * clip.speed
         left = clip.model_copy(update={"out_point": cut_out})
-        right = clip.model_copy(update={"in_point": cut_out, "start": t_sec})
+        right = clip.model_copy(
+            update={
+                "clip_id": uuid4().hex,
+                "in_point": cut_out,
+                "start": t_sec,
+                "link_group_id": None,
+                "linked_parent_id": None,
+                "linked_offset": 0.0,
+            }
+        )
         track.clips[clip_idx : clip_idx + 1] = [left, right]
         track.clips.sort(key=lambda c: c.start)
         normalize_track_transitions(track)
+        self.normalize_main_track_magnetic()
         self._auto_clean_empty_tracks()
         self._refresh_and_reselect(right)
         self.project_mutated.emit()
 
     def ripple_delete_selected(self) -> None:
-        selected_ids = {id(it.clip) for it in self._selected_clip_items()}
+        selected = [it.clip for it in self._selected_clip_items()]
+        if self._linked_selection_enabled:
+            selected = self._expanded_linked_clips(selected)
+        selected_ids = {id(clip) for clip in selected}
         if not selected_ids:
             return
         changed = False
@@ -4902,6 +5474,8 @@ class TimelinePanel(QWidget):
                 changed = True
         if not changed:
             return
+        self._unlink_orphaned_children()
+        self.normalize_main_track_magnetic()
         self._auto_clean_empty_tracks()
         self.refresh()
         self.project_mutated.emit()

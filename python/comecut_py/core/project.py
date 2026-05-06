@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, NonNegativeFloat, PositiveInt, field_validator, model_validator
 
@@ -231,6 +232,22 @@ def _validate_keyframes(kfs: list[Keyframe]) -> list[Keyframe]:
 class Clip(BaseModel):
     """A single media clip placed on a track."""
 
+    clip_id: str = Field(
+        default_factory=lambda: uuid4().hex,
+        description="Stable timeline clip ID used for linking and parenting.",
+    )
+    link_group_id: str | None = Field(
+        None,
+        description="Clips with the same group can move/delete together.",
+    )
+    linked_parent_id: str | None = Field(
+        None,
+        description="Optional parent clip ID for CapCut-like linked children.",
+    )
+    linked_offset: float = Field(
+        0.0,
+        description="Child start offset relative to the linked parent start in seconds.",
+    )
     clip_type: Literal["media", "text"] = Field(
         "media",
         description="`media` for video/audio/image clips, `text` for timeline subtitle clips.",

@@ -44,6 +44,10 @@ def test_widget_modules_import() -> None:
     assert left_rail.LeftRail is not None
     assert media_library.MediaLibraryPanel is not None
     assert preview.PreviewPanel is not None
+    assert hasattr(preview.PreviewPanel, "set_timeline_time_display")
+    assert hasattr(preview.PreviewPanel, "clear_timeline_time_display")
+    assert hasattr(preview.PreviewPanel, "clear_video_preview")
+    assert hasattr(preview.PreviewPanel, "main_player_is_playing")
     assert text_panel.TextPanel is not None
     assert timeline.TimelinePanel is not None
     assert topbar.TopBar is not None
