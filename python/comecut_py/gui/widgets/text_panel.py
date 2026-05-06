@@ -253,6 +253,27 @@ class _SubtitleItemWidget(QFrame):
         )
         layout.addWidget(name)
 
+        self.add_btn = QToolButton(self)
+        self.add_btn.setFixedSize(24, 24)
+        self.add_btn.move(84, 4)
+        self.add_btn.hide()
+        self.add_btn.setIcon(_icon_from_svg(PLUS_ICON_SVG, 20))
+        self.add_btn.setIconSize(QSize(20, 20))
+        self.add_btn.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+            }
+            QToolButton:hover {
+                background: rgba(255, 255, 255, 0.08);
+            }
+            """
+        )
+        self.add_btn.clicked.connect(self.add_requested.emit)
+        self.add_btn.raise_()
+
         self.del_btn = QToolButton(self)
         self.del_btn.setText("")
         self.del_btn.setFixedSize(24, 24)
@@ -312,60 +333,6 @@ class _SubtitleItemWidget(QFrame):
             return
         self._selected = selected_b
         self._apply_style()
-        self.del_btn.setStyleSheet(
-            """
-            QToolButton {
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-            }
-            QToolButton:hover {
-                background: rgba(255, 255, 255, 0.08);
-            }
-            """
-        )
-        self.del_btn.clicked.connect(self.delete_requested.emit)
-        self.del_btn.raise_()
-
-        # Missing badge (top-right of thumb), red, hidden by default
-        self.missing_badge = QLabel("Missing", tile)
-        self.missing_badge.setFixedSize(60, 18)
-        self.missing_badge.move(74, 4)  # right side
-        self.missing_badge.setStyleSheet("""
-            QLabel {
-                background: rgba(239, 68, 68, 0.92);
-                color: white;
-                font-size: 10px;
-                font-weight: 700;
-                border-radius: 9px;
-                padding: 0 6px;
-                border: none;
-            }
-        """)
-        self.missing_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.missing_badge.hide()
-        self._missing = False
-
-        self.add_btn = QToolButton(self)
-        self.add_btn.setFixedSize(24, 24)
-        self.add_btn.move(84, 4)
-        self.add_btn.hide()
-        self.add_btn.setIcon(_icon_from_svg(PLUS_ICON_SVG, 20))
-        self.add_btn.setIconSize(QSize(20, 20))
-        self.add_btn.setStyleSheet(
-            """
-            QToolButton {
-                background: transparent;
-                border: none;
-                border-radius: 4px;
-            }
-            QToolButton:hover {
-                background: rgba(255, 255, 255, 0.08);
-            }
-            """
-        )
-        self.add_btn.clicked.connect(self.add_requested.emit)
-        self.add_btn.raise_()
 
     def enterEvent(self, event) -> None:
         self.del_btn.show()
@@ -378,33 +345,6 @@ class _SubtitleItemWidget(QFrame):
         self.del_btn.hide()
         self.add_btn.hide()
         super().leaveEvent(event)
-
-    def set_missing(self, missing: bool) -> None:
-        self._missing = bool(missing)
-        self.missing_badge.setVisible(self._missing)
-        if self._missing:
-            self.setStyleSheet("""
-                QFrame {
-                    background: #1a1d23;
-                    border: 1px solid #ef4444;
-                    border-radius: 6px;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                QFrame {
-                    background: #1a1d23;
-                    border: 1px solid #363b46;
-                    border-radius: 6px;
-                }
-                QFrame:hover {
-                    border-color: #22d3c5;
-                    background: #22262e;
-                }
-            """)
-
-    def is_missing(self) -> bool:
-        return getattr(self, "_missing", False)
 
 
 class _OcrSettingsView(QWidget):
@@ -767,7 +707,13 @@ class TextPanel(QWidget):
                 widget = self.subtitle_list.itemWidget(item)
                 if isinstance(widget, _SubtitleItemWidget):
                     widget.set_missing(missing)
+                self.show_subtitle_list()
+                self.list_stack.setCurrentIndex(1)
+                self.subtitle_list.setCurrentItem(item)
+                self.subtitle_list.scrollToItem(item)
                 return
+        self.show_subtitle_list()
+        self.list_stack.setCurrentIndex(1)
         item = QListWidgetItem(path.name)
         item.setSizeHint(QSize(140, 110))
         item.setToolTip(path_str)
@@ -833,6 +779,11 @@ class TextPanel(QWidget):
                 self.add_imported_subtitle(path_obj, missing=bool(missing))
         finally:
             self._loading_library = False
+        if self.subtitle_list.count() > 0:
+            self.list_stack.setCurrentIndex(1)
+        else:
+            self.list_stack.setCurrentIndex(0)
+        self._update_import_button()
 
     def set_imported_subtitles(self, paths: list[Path]) -> None:
         """Backward-compat alias for list[Path]."""
@@ -875,4 +826,3 @@ class TextPanel(QWidget):
 
 
 __all__ = ["TextPanel"]
-
