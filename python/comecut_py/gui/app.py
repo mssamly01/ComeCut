@@ -139,6 +139,11 @@ def _shutdown_crash_debug_hooks() -> None:
 
 def run() -> int:
     """Launch the GUI. Returns the Qt exit code."""
+    os.environ.setdefault(
+        "QT_LOGGING_RULES",
+        "qt.multimedia.ffmpeg*=false;*.debug=false",
+    )
+    os.environ.setdefault("QT_FFMPEG_DEBUG", "0")
     try:
         from PySide6.QtWidgets import QApplication  # type: ignore
     except ImportError as e:  # pragma: no cover

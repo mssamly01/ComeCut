@@ -57,6 +57,7 @@ from ..core.time_utils import format_timecode
 from ..core.project import Clip, Project, Track
 from ..core.store import load_project as store_load_project
 from ..core.store import save_project as store_save_project
+from ..engine.audio_proxy import audio_proxy_path, make_audio_proxy
 from ..engine.proxy import make_proxy, proxy_path
 from ..engine import render_project, render_project_audio_only, render_project_still_frame
 from ..i18n import t
@@ -113,6 +114,7 @@ class MainWindow(QMainWindow):
     _PROXY_PREVIEW_WIDTH = 720
     _PROXY_PREVIEW_CRF = 30
     _proxy_ready = Signal(object, object, object)
+    _audio_proxy_ready = Signal(object, object, object)
     closed = Signal()
 
     def __init__(self) -> None:
@@ -135,8 +137,11 @@ class MainWindow(QMainWindow):
         self._history_replaying = False
         self._history_limit = 300
         self._proxy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comecut-proxy")
+        self._audio_proxy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comecut-audio-proxy")
         self._proxy_inflight: set[str] = set()
         self._proxy_source_to_clips: dict[str, list[Clip]] = {}
+        self._audio_proxy_by_source: dict[str, str] = {}
+        self._audio_proxy_inflight: set[str] = set()
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
         self._gap_play_timer = QTimer(self)
@@ -145,6 +150,7 @@ class MainWindow(QMainWindow):
         self._gap_play_active = False
         self._gap_play_last_ts = 0.0
         self._proxy_ready.connect(self._on_proxy_ready)
+        self._audio_proxy_ready.connect(self._on_audio_proxy_ready)
 
         self._build_ui()
         self._build_menu()
@@ -654,7 +660,44 @@ class MainWindow(QMainWindow):
         self._preview_source_path = path_str
 
     @staticmethod
-    def _clip_preview_path(clip: Clip) -> Path:
+    def _source_key_for_path(path: Path | str) -> str:
+        try:
+            return str(Path(path).resolve())
+        except Exception:
+            return str(path)
+
+    def _audio_proxy_for_source_path(self, path: Path | str) -> Path | None:
+        key = self._source_key_for_path(path)
+        proxy = self._audio_proxy_by_source.get(key)
+        if proxy:
+            proxy_path_obj = Path(proxy)
+            if proxy_path_obj.exists():
+                return proxy_path_obj
+
+        cached = audio_proxy_path(path)
+        if cached.exists() and cached.stat().st_size > 0:
+            self._audio_proxy_by_source[key] = str(cached)
+            return cached
+        return None
+
+    def _clip_audio_preview_path(self, clip: Clip) -> Path:
+        proxy = self._audio_proxy_for_source_path(clip.source)
+        if proxy is not None:
+            return proxy
+        return Path(clip.source)
+
+    def _clip_uses_deferred_audio_proxy(self, clip: Clip, path: Path) -> bool:
+        source = Path(clip.source)
+        if path != source:
+            return False
+        ext = source.suffix.lower()
+        return ext != ".wav"
+
+    def _clip_preview_path(self, clip: Clip) -> Path:
+        track = self._find_track_for_clip(clip)
+        if track is not None and track.kind == "audio":
+            return self._clip_audio_preview_path(clip)
+
         proxy = str(getattr(clip, "proxy", "") or "").strip()
         if proxy:
             proxy_path_obj = Path(proxy)
@@ -741,8 +784,22 @@ class MainWindow(QMainWindow):
             self.preview_panel.pause()
             return
 
-        self._set_preview_source_for_clip(clip)
         track = self._find_track_for_clip(clip)
+        preview_path = self._clip_preview_path(clip)
+        if (
+            track is not None
+            and track.kind == "audio"
+            and self._clip_uses_deferred_audio_proxy(clip, preview_path)
+        ):
+            self._preview_active_media_clip = clip
+            self._apply_preview_video_transform(None)
+            self._apply_preview_audio_state(clip, s)
+            self.preview_panel.pause()
+            self._start_audio_proxy_generation_if_needed(clip)
+            self.preview_panel.clear_timeline_audio()
+            return
+
+        self._set_preview_source_for_clip(clip)
         if track is not None and track.kind == "video":
             self._apply_preview_video_transform(clip)
         else:
@@ -891,6 +948,70 @@ class MainWindow(QMainWindow):
                     kind=track.kind,
                 )
 
+    def _start_audio_proxy_generation_if_needed(self, clip: Clip) -> None:
+        if clip.is_text_clip:
+            return
+        source = str(getattr(clip, "source", "") or "")
+        if not source:
+            return
+        src_path = Path(source)
+        if not src_path.exists():
+            return
+        if not self._clip_has_preview_audio(clip):
+            return
+
+        source_key = self._source_key_for_path(src_path)
+        cached = audio_proxy_path(src_path)
+        if cached.exists() and cached.stat().st_size > 0:
+            self._audio_proxy_by_source[source_key] = str(cached)
+            return
+        if source_key in self._audio_proxy_inflight:
+            return
+        self._audio_proxy_inflight.add(source_key)
+
+        def _job() -> None:
+            try:
+                generated = make_audio_proxy(src_path)
+                self._audio_proxy_ready.emit(source_key, str(generated), "")
+            except Exception as e:
+                self._audio_proxy_ready.emit(source_key, "", str(e))
+
+        self._audio_proxy_executor.submit(_job)
+
+    def _start_project_audio_proxy_generation(self) -> None:
+        for track in self.project.tracks:
+            if track.kind not in {"video", "audio"}:
+                continue
+            for clip in track.clips:
+                self._start_audio_proxy_generation_if_needed(clip)
+
+    def _on_audio_proxy_ready(self, source_key_obj: object, proxy_obj: object, error_obj: object) -> None:
+        source_key = str(source_key_obj or "")
+        self._audio_proxy_inflight.discard(source_key)
+        proxy = str(proxy_obj or "")
+        if proxy:
+            self._audio_proxy_by_source[source_key] = proxy
+            self.statusBar().showMessage(
+                f"Audio preview ready: {Path(source_key).name}",
+                3000,
+            )
+            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+            active_clip = self._pick_preview_clip_for_time(current)
+            if (
+                bool(getattr(self.timeline_panel, "_is_playing", False))
+                and active_clip is not None
+                and self._source_key_for_path(active_clip.source) == source_key
+            ):
+                self._start_timeline_playback_at(current)
+            return
+
+        error = str(error_obj or "")
+        if error:
+            self.statusBar().showMessage(
+                f"Audio preview failed: {Path(source_key).name}",
+                3000,
+            )
+
     @staticmethod
     def _clip_end_seconds(clip: Clip) -> float:
         dur = clip.timeline_duration or 0.0
@@ -1005,8 +1126,13 @@ class MainWindow(QMainWindow):
         gain = max(0.0, float(audio_clip.volume or 0.0))
         gain *= track_output_gain(track)
         gain *= self._preview_fade_multiplier(audio_clip, timeline_seconds)
+        audio_path = self._clip_audio_preview_path(audio_clip)
+        if playing and self._clip_uses_deferred_audio_proxy(audio_clip, audio_path):
+            self._start_audio_proxy_generation_if_needed(audio_clip)
+            self.preview_panel.clear_timeline_audio()
+            return
         self.preview_panel.sync_timeline_audio(
-            self._clip_preview_path(audio_clip),
+            audio_path,
             source_ms,
             playback_rate=float(audio_clip.speed or 1.0),
             gain=gain,
@@ -2572,6 +2698,7 @@ class MainWindow(QMainWindow):
         start = self._resolve_non_overlapping_start(track, start, dur)
         clip = Clip(source=str(path), start=start, in_point=0.0, out_point=dur)
         self._start_proxy_generation_if_needed(clip, duration=dur, kind=kind)
+        self._start_audio_proxy_generation_if_needed(clip)
         track.clips.append(clip)
         track.clips.sort(key=lambda c: c.start)
         try:
@@ -2817,6 +2944,7 @@ class MainWindow(QMainWindow):
         self.inspector_panel.set_project(self.project)
         self.topbar.set_project_title(self.project.name)
         self._start_project_proxy_generation()
+        QTimer.singleShot(0, self._start_project_audio_proxy_generation)
         self.timeline_panel.refresh()
         all_clips = [clip for track in self.project.tracks for clip in track.clips]
         self._schedule_timeline_cache_prewarm(all_clips)
@@ -3603,6 +3731,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._proxy_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            self._audio_proxy_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         self.closed.emit()
