@@ -1191,7 +1191,9 @@ class PreviewPanel(QWidget):
         except Exception:
             pass
         self._timeline_audio_source_path: str | None = None
+        self._timeline_audio_source_key: str | None = None
         self._timeline_audio_last_seek_ms: int = -1
+        self._timeline_audio_last_seek_ts: float = 0.0
         self._media_source_path: str | None = None
         self._meter_token = 0
         self._meter_executor = ThreadPoolExecutor(
@@ -1418,20 +1420,28 @@ class PreviewPanel(QWidget):
         playing: bool = False,
         force_seek: bool = False,
     ) -> None:
-        path_str = str(path)
-        source_changed = self._timeline_audio_source_path != path_str
+        path_obj = Path(path)
+        try:
+            path_str = str(path_obj.resolve())
+        except Exception:
+            path_str = str(path_obj)
+        path_key = path_str.casefold()
+        is_mp3_source = Path(path_str).suffix.lower() == ".mp3"
+        source_changed = self._timeline_audio_source_key != path_key
         if source_changed:
             self._timeline_audio_player.pause()
             self._timeline_audio_player.setSource(QUrl.fromLocalFile(path_str))
             self._timeline_audio_source_path = path_str
+            self._timeline_audio_source_key = path_key
             self._timeline_audio_last_seek_ms = -1
+            self._timeline_audio_last_seek_ts = 0.0
             force_seek = True
 
         try:
             rate = float(playback_rate)
         except Exception:
             rate = 1.0
-        rate = max(0.5, min(2.0, rate))
+        rate = max(0.1, min(10.0, rate))
         if abs(float(self._timeline_audio_player.playbackRate()) - rate) > 1e-9:
             self._timeline_audio_player.setPlaybackRate(rate)
 
@@ -1448,24 +1458,60 @@ class PreviewPanel(QWidget):
         except Exception:
             ms_i = 0
 
+        should_play = playing and not muted
+        is_playing = (
+            self._timeline_audio_player.playbackState()
+            == QMediaPlayer.PlaybackState.PlayingState
+        )
         current = int(self._timeline_audio_player.position())
         drift_limit_ms = 900 if playing else 80
         if abs(rate - 1.0) > 1e-3:
             drift_limit_ms = 1200 if playing else 80
+        if playing and not force_seek and not source_changed and is_mp3_source:
+            # MP3 timestamp reporting can be jittery during live sync; avoid
+            # aggressive re-seeks that can cause audible looping.
+            drift_limit_ms = max(drift_limit_ms, 2400)
         should_seek = (
             force_seek
             or self._timeline_audio_last_seek_ms < 0
             or abs(current - ms_i) > drift_limit_ms
         )
+        if (
+            should_seek
+            and playing
+            and not force_seek
+            and not source_changed
+            and is_mp3_source
+            and should_play
+            and is_playing
+        ):
+            # During steady MP3 playback, repeated setPosition calls can
+            # re-trigger decoder skip/discard paths and produce audible loops.
+            should_seek = False
+        if should_seek and playing and not force_seek and not source_changed:
+            now = monotonic()
+            elapsed_ms = (now - self._timeline_audio_last_seek_ts) * 1000.0
+            min_interval_ms = 700.0 if is_mp3_source else 350.0
+            if elapsed_ms >= 0.0 and elapsed_ms < min_interval_ms:
+                should_seek = False
+        if (
+            should_seek
+            and is_mp3_source
+            and should_play
+            and not force_seek
+            and not source_changed
+            and not is_playing
+            and self._timeline_audio_last_seek_ms >= 0
+            and abs(current - ms_i) < 5000
+        ):
+            # While backend transitions into playback, repeated MP3 seeks can
+            # retrigger timestamp correction and create audible loop artifacts.
+            should_seek = False
         if should_seek:
             self._timeline_audio_player.setPosition(ms_i)
             self._timeline_audio_last_seek_ms = ms_i
+            self._timeline_audio_last_seek_ts = monotonic()
 
-        should_play = playing and not muted and volume > 0.0
-        is_playing = (
-            self._timeline_audio_player.playbackState()
-            == QMediaPlayer.PlaybackState.PlayingState
-        )
         if should_play and not is_playing:
             self._timeline_audio_player.play()
         elif not should_play and is_playing:
@@ -1475,7 +1521,9 @@ class PreviewPanel(QWidget):
         self._timeline_audio_player.pause()
         self._timeline_audio_player.setSource(QUrl())
         self._timeline_audio_source_path = None
+        self._timeline_audio_source_key = None
         self._timeline_audio_last_seek_ms = -1
+        self._timeline_audio_last_seek_ts = 0.0
 
     def _meter_sources(self) -> list[tuple[str, str, float]]:
         sources: list[tuple[str, str, float]] = []

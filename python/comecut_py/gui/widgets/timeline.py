@@ -136,6 +136,7 @@ VOLUME_LINE_DB_SPAN = 24.0
 VOLUME_LINE_HIT_PX = 7.0
 FADE_HANDLE_RADIUS_PX = 3.6
 FADE_HANDLE_HIT_PX = 8.0
+FADE_HANDLE_AUDIO_TOP_OFFSET_PX = 7.0
 TRIM_HANDLE_HIT_PX = 7.0
 MIN_TRIM_TIMELINE_DURATION_SECONDS = 1.0 / 30.0
 TRANSITION_KIND_LABELS = {
@@ -558,6 +559,62 @@ def _db_to_linear(db: float) -> float:
     return 10.0 ** (db / 20.0)
 
 
+def fade_handle_center_y(*, wave_top: float, wave_height: float, audio_style: bool) -> float:
+    top = float(wave_top)
+    height = max(0.0, float(wave_height))
+    if audio_style:
+        return top + FADE_HANDLE_AUDIO_TOP_OFFSET_PX
+    return top + (height * 0.5)
+
+
+def fade_zone_x_positions(
+    *,
+    left: float,
+    right: float,
+    duration_seconds: float,
+    fade_in_seconds: float,
+    fade_out_seconds: float,
+) -> tuple[float, float]:
+    x_left = float(left)
+    x_right = float(right)
+    if x_right < x_left:
+        x_left, x_right = x_right, x_left
+    dur = max(0.0, float(duration_seconds))
+    if dur <= 1e-9 or x_right <= x_left:
+        return x_left, x_right
+    fade_in = max(0.0, min(dur, float(fade_in_seconds)))
+    fade_out = max(0.0, min(dur, float(fade_out_seconds)))
+    span = x_right - x_left
+    x_in = x_left + (fade_in / dur) * span
+    x_out = x_right - (fade_out / dur) * span
+    x_in = max(x_left, min(x_right, x_in))
+    x_out = max(x_left, min(x_right, x_out))
+    if x_out < x_in:
+        mid = (x_in + x_out) * 0.5
+        return mid, mid
+    return x_in, x_out
+
+
+def apply_fade_endpoint_zero(
+    peaks: list[float],
+    *,
+    fade_in_seconds: float,
+    fade_out_seconds: float,
+) -> list[float]:
+    if not peaks:
+        return peaks
+    out = [max(0.0, float(v)) for v in peaks]
+    if fade_in_seconds > 1e-6:
+        out[0] = 0.0
+        if len(out) > 1:
+            out[1] = 0.0
+    if fade_out_seconds > 1e-6:
+        out[-1] = 0.0
+        if len(out) > 1:
+            out[-2] = 0.0
+    return out
+
+
 class ClipRect(QGraphicsRectItem):
     def __init__(
         self,
@@ -805,21 +862,31 @@ class ClipRect(QGraphicsRectItem):
         return True
 
     def _fade_handle_points(self, wave_rect: QRectF) -> tuple[QPointF, QPointF]:
-        y = float(wave_rect.center().y())
+        y = fade_handle_center_y(
+            wave_top=float(wave_rect.top()),
+            wave_height=float(wave_rect.height()),
+            audio_style=self._is_audio_clip,
+        )
         left = float(wave_rect.left()) + FADE_HANDLE_RADIUS_PX
         right = float(wave_rect.right()) - FADE_HANDLE_RADIUS_PX
+        fade_in, fade_out, dur = self._fade_durations_seconds()
+        x_in, x_out = fade_zone_x_positions(
+            left=left,
+            right=right,
+            duration_seconds=dur,
+            fade_in_seconds=fade_in,
+            fade_out_seconds=fade_out,
+        )
+        return QPointF(x_in, y), QPointF(x_out, y)
+
+    def _fade_durations_seconds(self) -> tuple[float, float, float]:
         dur = max(0.0, float(self.clip.timeline_duration or 0.0))
-        if dur <= 1e-6:
-            return QPointF(left, y), QPointF(right, y)
-        px_per_sec = float(wave_rect.width()) / dur
+        if dur <= 1e-9:
+            return 0.0, 0.0, 0.0
         afx = self.clip.audio_effects
         fade_in = max(0.0, min(dur, float(getattr(afx, "fade_in", 0.0) or 0.0)))
         fade_out = max(0.0, min(dur, float(getattr(afx, "fade_out", 0.0) or 0.0)))
-        x_in = left + (fade_in * px_per_sec)
-        x_out = right - (fade_out * px_per_sec)
-        x_in = max(left, min(right, x_in))
-        x_out = max(left, min(right, x_out))
-        return QPointF(x_in, y), QPointF(x_out, y)
+        return fade_in, fade_out, dur
 
     def _set_fade_from_wave_x(self, which: str, x: float, wave_rect: QRectF) -> bool:
         which_n = (which or "").strip().lower()
@@ -1003,6 +1070,58 @@ class ClipRect(QGraphicsRectItem):
         painter.drawEllipse(QPointF(x1, y), dot_r, dot_r)
         painter.restore()
 
+    def _waveform_fade_clip_path(self, wave_rect: QRectF) -> QPainterPath | None:
+        if self._is_text_clip:
+            return None
+        fade_in, fade_out, _ = self._fade_durations_seconds()
+        if fade_in <= 1e-4 and fade_out <= 1e-4:
+            return None
+        x0 = float(wave_rect.left())
+        x1 = float(wave_rect.right())
+        if x1 <= x0 + 0.5:
+            return None
+        baseline_y = float(wave_rect.bottom()) - 1.0
+        top_y = float(wave_rect.top())
+        p_in, p_out = self._fade_handle_points(wave_rect)
+        apex_in_x = max(x0, min(x1, float(p_in.x())))
+        apex_out_x = max(x0, min(x1, float(p_out.x())))
+        apex_in_y = max(top_y + 0.5, min(baseline_y - 0.5, float(p_in.y())))
+        apex_out_y = max(top_y + 0.5, min(baseline_y - 0.5, float(p_out.y())))
+
+        cut_path = QPainterPath()
+        if fade_in > 1e-4 and apex_in_x > x0 + 0.5:
+            span = max(1.0, apex_in_x - x0)
+            path_in = QPainterPath()
+            path_in.moveTo(x0, top_y)
+            path_in.lineTo(apex_in_x, top_y)
+            path_in.lineTo(apex_in_x, apex_in_y)
+            path_in.cubicTo(
+                QPointF(x0 + (span * 0.72), apex_in_y + ((baseline_y - apex_in_y) * 0.10)),
+                QPointF(x0 + (span * 0.24), baseline_y),
+                QPointF(x0, baseline_y),
+            )
+            path_in.closeSubpath()
+            cut_path.addPath(path_in)
+        if fade_out > 1e-4 and apex_out_x < x1 - 0.5:
+            span = max(1.0, x1 - apex_out_x)
+            path_out = QPainterPath()
+            path_out.moveTo(apex_out_x, top_y)
+            path_out.lineTo(x1, top_y)
+            path_out.lineTo(x1, baseline_y)
+            path_out.cubicTo(
+                QPointF(x1 - (span * 0.24), baseline_y),
+                QPointF(x1 - (span * 0.72), apex_out_y + ((baseline_y - apex_out_y) * 0.10)),
+                QPointF(apex_out_x, apex_out_y),
+            )
+            path_out.closeSubpath()
+            cut_path.addPath(path_out)
+        if cut_path.isEmpty():
+            return None
+
+        visible = QPainterPath()
+        visible.addRect(wave_rect)
+        return visible.subtracted(cut_path)
+
     def _draw_fade_handles(self, painter: QPainter, wave_rect: QRectF) -> None:
         if self._is_text_clip:
             return
@@ -1115,21 +1234,34 @@ class ClipRect(QGraphicsRectItem):
                             if bar_count >= len(peaks_full)
                             else _downsample_peaks(peaks_full, bar_count)
                         )
-                        peaks = self._apply_waveform_fade_envelope(peaks)
+                        fade_in, fade_out, _ = self._fade_durations_seconds()
+                        peaks = apply_fade_endpoint_zero(
+                            peaks,
+                            fade_in_seconds=fade_in,
+                            fade_out_seconds=fade_out,
+                        )
                         wave_gain = max(0.0, float(getattr(self.clip, "volume", 1.0) or 0.0))
                         draw_waveform = (
                             self._draw_waveform_polygon
                             if WAVEFORM_USE_POLYGON
                             else self._draw_waveform_bars
                         )
-                        draw_waveform(
-                            painter,
-                            wave_rect,
-                            peaks,
-                            audio_style=self._is_audio_clip,
-                            muted=self._muted,
-                            gain_mult=wave_gain,
-                        )
+                        clip_path = self._waveform_fade_clip_path(wave_rect)
+                        if clip_path is not None:
+                            painter.save()
+                            painter.setClipPath(clip_path, Qt.ClipOperation.IntersectClip)
+                        try:
+                            draw_waveform(
+                                painter,
+                                wave_rect,
+                                peaks,
+                                audio_style=self._is_audio_clip,
+                                muted=self._muted,
+                                gain_mult=wave_gain,
+                            )
+                        finally:
+                            if clip_path is not None:
+                                painter.restore()
                     self._draw_volume_line(painter, wave_rect)
                     self._draw_fade_handles(painter, wave_rect)
 

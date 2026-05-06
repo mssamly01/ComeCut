@@ -7,8 +7,9 @@ from dataclasses import replace
 import json
 import re
 from pathlib import Path
+from time import monotonic
 
-from PySide6.QtCore import QTimer, Qt, Signal  # type: ignore
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal  # type: ignore
 from PySide6.QtGui import QKeySequence  # type: ignore
 from PySide6.QtWidgets import (  # type: ignore
     QAbstractItemView,
@@ -137,6 +138,12 @@ class MainWindow(QMainWindow):
         self._proxy_inflight: set[str] = set()
         self._proxy_source_to_clips: dict[str, list[Clip]] = {}
         self._preview_audio_presence_cache: dict[str, bool] = {}
+        self._preview_active_media_clip: Clip | None = None
+        self._gap_play_timer = QTimer(self)
+        self._gap_play_timer.setInterval(16)
+        self._gap_play_timer.timeout.connect(self._on_gap_play_tick)
+        self._gap_play_active = False
+        self._gap_play_last_ts = 0.0
         self._proxy_ready.connect(self._on_proxy_ready)
 
         self._build_ui()
@@ -144,6 +151,9 @@ class MainWindow(QMainWindow):
         self._reset_timeline_history()
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(t("status.ready"))
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         QTimer.singleShot(0, self._ensure_project_overview_panel)
 
     def _build_ui(self) -> None:
@@ -357,9 +367,7 @@ class MainWindow(QMainWindow):
             return
         media_seconds = ms / 1000.0
         timeline_seconds = media_seconds
-        clip = self._pick_preview_clip_for_time(
-            float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
-        )
+        clip = self._preview_active_media_clip
         if clip is not None and not clip.is_text_clip:
             timeline_seconds = _source_to_timeline_seconds(clip, media_seconds)
         self._apply_preview_audio_state(clip, timeline_seconds)
@@ -564,31 +572,31 @@ class MainWindow(QMainWindow):
 
     def _on_timeline_playpause_requested(self) -> None:
         self._preview_sync_mode = "timeline"
+        want_play = bool(getattr(self.timeline_panel, "_is_playing", False))
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
-        if not self.preview_panel.is_playing():
-            clip = self._pick_preview_clip_for_time(current)
-            if clip is not None:
-                self._set_preview_source_for_clip(clip)
-                track = self._find_track_for_clip(clip)
-                if track is not None and track.kind == "video":
-                    self._apply_preview_video_transform(clip)
-                else:
-                    self._apply_preview_video_transform(None)
-                self._apply_preview_audio_state(clip, current)
-                self.preview_panel.seek(
-                    int(_timeline_to_source_seconds(clip, current) * 1000.0)
-                )
-            else:
-                self._apply_preview_audio_state(None, current)
-        self.preview_panel.toggle_play_pause()
-        self._sync_timeline_audio_for_time(
-            current,
-            playing=self.preview_panel.is_playing(),
-            force_seek=True,
-        )
+        if not want_play:
+            self._stop_gap_playback()
+            self.preview_panel.pause()
+            self._sync_timeline_audio_for_time(
+                current,
+                playing=False,
+                force_seek=False,
+            )
+            return
+        self._start_timeline_playback_at(current)
 
     def _on_preview_playback_state_changed(self, playing: bool) -> None:
         if self._preview_sync_mode != "timeline":
+            return
+        if self._gap_play_active and not bool(playing):
+            # Gap-play mode drives playhead itself, so keep transport in "playing".
+            self.timeline_panel.set_playing_state(True)
+            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+            self._sync_timeline_audio_for_time(
+                current,
+                playing=True,
+                force_seek=False,
+            )
             return
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         self._sync_timeline_audio_for_time(
@@ -602,18 +610,20 @@ class MainWindow(QMainWindow):
             return
 
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
-        ended_clip = self._pick_preview_clip_for_time(max(0.0, current - 1e-4))
+        ended_clip = self._preview_active_media_clip
         if ended_clip is not None:
             current = max(current, self._clip_end_seconds(ended_clip))
 
         next_time = next_playable_time_after(self.project.tracks, current)
         if next_time is None:
+            self._stop_gap_playback()
+            self.timeline_panel.set_playing_state(False)
             self.preview_panel.clear_timeline_audio()
             return
 
         self._on_timeline_seek(next_time)
-        self.preview_panel.play()
-        self._sync_timeline_audio_for_time(next_time, playing=True, force_seek=True)
+        self.timeline_panel.set_playing_state(True)
+        self._start_timeline_playback_at(next_time)
 
     def _set_preview_source(self, path: Path | str, *, force: bool = False) -> None:
         path_str = str(path)
@@ -658,8 +668,89 @@ class MainWindow(QMainWindow):
         return self._source_has_audio_stream(self._clip_preview_path(clip))
 
     def _set_preview_source_for_clip(self, clip: Clip, *, force: bool = False) -> None:
+        self._preview_active_media_clip = clip
         self._set_preview_source(self._clip_preview_path(clip), force=force)
         self.preview_panel.set_playback_rate(float(getattr(clip, "speed", 1.0) or 1.0))
+
+    def _start_gap_playback(self) -> None:
+        self._gap_play_active = True
+        self._gap_play_last_ts = monotonic()
+        if not self._gap_play_timer.isActive():
+            self._gap_play_timer.start()
+        self.timeline_panel.set_playing_state(True)
+
+    def _stop_gap_playback(self) -> None:
+        self._gap_play_active = False
+        self._gap_play_last_ts = 0.0
+        if self._gap_play_timer.isActive():
+            self._gap_play_timer.stop()
+
+    def _start_timeline_playback_at(self, timeline_seconds: float) -> None:
+        s = max(0.0, float(timeline_seconds))
+        clip = self._pick_preview_clip_for_time(s)
+        if clip is None:
+            self._preview_active_media_clip = None
+            self._apply_preview_audio_state(None, s)
+            self._sync_timeline_audio_for_time(
+                s,
+                playing=True,
+                force_seek=True,
+            )
+            self.preview_panel.pause()
+            self._start_gap_playback()
+            return
+
+        self._stop_gap_playback()
+        self._set_preview_source_for_clip(clip)
+        track = self._find_track_for_clip(clip)
+        if track is not None and track.kind == "video":
+            self._apply_preview_video_transform(clip)
+        else:
+            self._apply_preview_video_transform(None)
+        self._apply_preview_audio_state(clip, s)
+        self.preview_panel.seek(int(_timeline_to_source_seconds(clip, s) * 1000.0))
+        self.preview_panel.play()
+        self._sync_timeline_audio_for_time(
+            s,
+            playing=True,
+            force_seek=True,
+        )
+
+    def _on_gap_play_tick(self) -> None:
+        if not self._gap_play_active or self._preview_sync_mode != "timeline":
+            self._stop_gap_playback()
+            return
+        if self.preview_panel.is_playing():
+            self._stop_gap_playback()
+            return
+
+        now = monotonic()
+        if self._gap_play_last_ts <= 0.0:
+            self._gap_play_last_ts = now
+            return
+        dt = now - self._gap_play_last_ts
+        self._gap_play_last_ts = now
+        if dt <= 0.0:
+            return
+        dt = min(dt, 0.2)
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        next_seconds = max(0.0, current + dt)
+        self.timeline_panel.set_playhead(next_seconds)
+        self._sync_timeline_audio_for_time(
+            next_seconds,
+            playing=True,
+            force_seek=False,
+        )
+        self._update_subtitle_overlay(next_seconds)
+        self._auto_select_text_clip_at_playhead()
+        next_clip = self._pick_preview_clip_for_time(next_seconds)
+        if next_clip is not None:
+            self._start_timeline_playback_at(next_seconds)
+            return
+        if next_playable_time_after(self.project.tracks, next_seconds) is None:
+            self._stop_gap_playback()
+            self.timeline_panel.set_playing_state(False)
+            self.preview_panel.clear_timeline_audio()
 
     def _start_proxy_generation_if_needed(
         self,
@@ -807,7 +898,12 @@ class MainWindow(QMainWindow):
                     return clip
         return None
 
-    def _pick_preview_clip_for_time(self, seconds: float) -> Clip | None:
+    def _pick_preview_clip_for_time(
+        self,
+        seconds: float,
+        *,
+        fallback_to_first: bool = False,
+    ) -> Clip | None:
         s = max(0.0, float(seconds))
         video_candidate = self._pick_video_clip_for_time(s)
         if video_candidate is not None:
@@ -816,17 +912,18 @@ class MainWindow(QMainWindow):
         audio_candidate = pick_timeline_audio_clip(
             self.project.tracks,
             s,
-            fallback_to_first=True,
+            fallback_to_first=fallback_to_first,
         )
         if audio_candidate is not None:
             return audio_candidate
 
-        main = self._main_video_track()
-        if main is not None and main.clips:
-            return main.clips[0]
-        for track in self.project.tracks:
-            if track.kind == "video" and track.clips and not self._is_track_hidden(track):
-                return track.clips[0]
+        if fallback_to_first:
+            main = self._main_video_track()
+            if main is not None and main.clips:
+                return main.clips[0]
+            for track in self.project.tracks:
+                if track.kind == "video" and track.clips and not self._is_track_hidden(track):
+                    return track.clips[0]
         return None
 
     def _main_preview_is_audio_clip(self, clip: Clip | None) -> bool:
@@ -915,6 +1012,7 @@ class MainWindow(QMainWindow):
                 throttle=throttle_preview,
             )
         else:
+            self._preview_active_media_clip = None
             self._apply_preview_audio_state(None, float(seconds))
             self.preview_panel.clear_video_transform()
             self.preview_panel.clear()
@@ -1197,8 +1295,52 @@ class MainWindow(QMainWindow):
             self._sync_timeline_audio_for_time(
                 current,
                 playing=True,
-                force_seek=True,
+                force_seek=False,
             )
+
+    @staticmethod
+    def _is_text_entry_focus_widget(widget: object | None) -> bool:
+        current = widget if isinstance(widget, QWidget) else None
+        while current is not None:
+            if isinstance(
+                current,
+                (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox),
+            ):
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _handle_space_play_pause_shortcut(self) -> bool:
+        fw = QApplication.focusWidget()
+        if fw is None:
+            return False
+        if fw.window() is not self:
+            return False
+        if self._is_text_entry_focus_widget(fw):
+            return False
+
+        has_clips = any(len(track.clips) > 0 for track in self.project.tracks)
+        if not has_clips:
+            return True
+
+        want_play = not bool(getattr(self.timeline_panel, "_is_playing", False))
+        self.timeline_panel.set_playing_state(want_play)
+        self._preview_sync_mode = "timeline"
+        self._on_timeline_playpause_requested()
+        return True
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if (
+            event is not None
+            and event.type() == QEvent.Type.KeyPress
+            and self.isActiveWindow()
+            and getattr(event, "key", lambda: None)() == Qt.Key.Key_Space
+            and not bool(getattr(event, "isAutoRepeat", lambda: False)())
+        ):
+            if self._handle_space_play_pause_shortcut():
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
 
     def _on_topbar_project_title_changed(self, title: str) -> None:
         new_name = (title or "").strip() or "Untitled"
@@ -1249,10 +1391,11 @@ class MainWindow(QMainWindow):
                     float(getattr(preview_clip, "speed", 1.0) or 1.0)
                 )
             self._apply_preview_audio_state(preview_clip, current_seconds)
+            is_playing = self.preview_panel.is_playing()
             self._sync_timeline_audio_for_time(
                 current_seconds,
-                playing=self.preview_panel.is_playing(),
-                force_seek=True,
+                playing=is_playing,
+                force_seek=not is_playing,
             )
         if clip is not None:
             try:
@@ -2467,9 +2610,7 @@ class MainWindow(QMainWindow):
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
         ):
             fw = QApplication.focusWidget()
-            if not isinstance(
-                fw, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)
-            ):
+            if not self._is_text_entry_focus_widget(fw):
                 btn = getattr(self.timeline_panel, "_btn_hover_scrub", None)
                 if btn is not None:
                     btn.toggle()
@@ -2481,32 +2622,15 @@ class MainWindow(QMainWindow):
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
         ):
             fw = QApplication.focusWidget()
-            if not isinstance(
-                fw, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)
-            ):
+            if not self._is_text_entry_focus_widget(fw):
                 self._on_caption_add()
                 event.accept()
                 return
 
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            fw = QApplication.focusWidget()
-            if isinstance(
-                fw,
-                (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox),
-            ):
-                super().keyPressEvent(event)
-                return
-            
-            # Prevent playing if timeline is empty
-            has_clips = any(len(track.clips) > 0 for track in self.project.tracks)
-            if not has_clips:
+            if self._handle_space_play_pause_shortcut():
                 event.accept()
                 return
-
-            self._preview_sync_mode = "timeline"
-            self.preview_panel.toggle_play_pause()
-            event.accept()
-            return
         super().keyPressEvent(event)
 
     def _open_project(self) -> None:
@@ -2604,8 +2728,26 @@ class MainWindow(QMainWindow):
         meta = store_save_project(self.project, project_id=self._store_project_id)
         self._store_project_id = meta.project_id
 
+    def _stop_preview_playback(self) -> None:
+        """Stop all preview media immediately (video + timeline audio)."""
+        self._stop_gap_playback()
+        try:
+            self.preview_panel.clear()
+        except Exception:
+            try:
+                self.preview_panel.pause()
+            except Exception:
+                pass
+            try:
+                self.preview_panel.clear_timeline_audio()
+            except Exception:
+                pass
+        self._preview_source_path = None
+        self._preview_active_media_clip = None
+
     def _apply_loaded_project(self, project: Project) -> None:
         from ..core.library_resolver import resolve_project_library
+        self._stop_preview_playback()
         res = resolve_project_library(project)
         missing_flags = res
 
@@ -2625,6 +2767,8 @@ class MainWindow(QMainWindow):
         self.topbar.set_project_title(self.project.name)
         self._start_project_proxy_generation()
         self.timeline_panel.refresh()
+        self._preview_sync_mode = "timeline"
+        self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
         
         # Repopulate library panels with missing state awareness
         self.media_panel.set_imported_entries(
@@ -3399,6 +3543,7 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event) -> None:
+        self._stop_preview_playback()
         try:
             self.save_to_store()
         except Exception:

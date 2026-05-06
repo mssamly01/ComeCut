@@ -11,6 +11,10 @@ import pytest
 
 from comecut_py.core.project import Clip, Project, Track
 from comecut_py.gui.widgets.timeline import (
+    FADE_HANDLE_AUDIO_TOP_OFFSET_PX,
+    apply_fade_endpoint_zero,
+    fade_zone_x_positions,
+    fade_handle_center_y,
     ripple_delete_clips_from_track,
     timeline_snap_times,
     trim_clip_edge,
@@ -245,3 +249,49 @@ def test_trim_clamps_to_minimum_duration():
     assert changed is True
     assert c.out_point == pytest.approx(0.25)
     assert c.timeline_duration == pytest.approx(0.25)
+
+
+def test_fade_handle_center_y_audio_sits_near_wave_top():
+    y = fade_handle_center_y(wave_top=24.0, wave_height=30.0, audio_style=True)
+    assert y == pytest.approx(24.0 + FADE_HANDLE_AUDIO_TOP_OFFSET_PX)
+
+
+def test_fade_handle_center_y_video_stays_centered_in_wave():
+    y = fade_handle_center_y(wave_top=24.0, wave_height=30.0, audio_style=False)
+    assert y == pytest.approx(39.0)
+
+
+def test_fade_zone_x_positions_tracks_fade_durations():
+    x_in, x_out = fade_zone_x_positions(
+        left=10.0,
+        right=210.0,
+        duration_seconds=20.0,
+        fade_in_seconds=2.0,
+        fade_out_seconds=4.0,
+    )
+    assert x_in == pytest.approx(30.0)
+    assert x_out == pytest.approx(170.0)
+
+
+def test_fade_zone_x_positions_collapses_overlap_to_midpoint():
+    x_in, x_out = fade_zone_x_positions(
+        left=0.0,
+        right=100.0,
+        duration_seconds=10.0,
+        fade_in_seconds=9.0,
+        fade_out_seconds=9.0,
+    )
+    assert x_in == pytest.approx(50.0)
+    assert x_out == pytest.approx(50.0)
+
+
+def test_apply_fade_endpoint_zero_zeroes_two_endpoints_when_fade_active():
+    peaks = [0.8, 0.7, 0.6, 0.5, 0.4]
+    out = apply_fade_endpoint_zero(peaks, fade_in_seconds=1.0, fade_out_seconds=1.0)
+    assert out == pytest.approx([0.0, 0.0, 0.6, 0.0, 0.0])
+
+
+def test_apply_fade_endpoint_zero_keeps_peaks_without_fade():
+    peaks = [0.8, 0.7, 0.6]
+    out = apply_fade_endpoint_zero(peaks, fade_in_seconds=0.0, fade_out_seconds=0.0)
+    assert out == pytest.approx([0.8, 0.7, 0.6])

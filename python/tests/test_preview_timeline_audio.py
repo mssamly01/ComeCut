@@ -9,11 +9,30 @@ from comecut_py.core.audio_mixer import (
     track_output_gain,
 )
 from comecut_py.core.project import Clip, Track
+from comecut_py.gui.main_window import MainWindow
 from comecut_py.gui.preview_timeline import (
     clip_fade_multiplier_at_local_time,
     next_playable_time_after,
     pick_timeline_audio_clip,
 )
+
+
+class _PreviewPickerStub:
+    def __init__(self, tracks: list[Track]) -> None:
+        self.project = type("ProjectStub", (), {"tracks": tracks})()
+
+    def _pick_video_clip_for_time(self, _seconds: float):  # pragma: no cover - simple stub
+        return None
+
+    def _main_video_track(self):
+        for track in self.project.tracks:
+            if track.kind == "video":
+                return track
+        return None
+
+    @staticmethod
+    def _is_track_hidden(track: Track) -> bool:
+        return bool(getattr(track, "hidden", False))
 
 
 def test_audio_clip_can_be_picked_without_selection() -> None:
@@ -57,6 +76,14 @@ def test_fallback_to_first_audio_clip() -> None:
     audio = Clip(source="a.wav", start=3.0, in_point=0.0, out_point=2.0)
     tracks = [Track(kind="audio", clips=[audio])]
     assert pick_timeline_audio_clip(tracks, 0.5, fallback_to_first=True) is audio
+
+
+def test_main_window_preview_picker_does_not_fallback_by_default() -> None:
+    audio = Clip(source="a.wav", start=3.0, in_point=0.0, out_point=2.0)
+    stub = _PreviewPickerStub([Track(kind="audio", clips=[audio])])
+
+    assert MainWindow._pick_preview_clip_for_time(stub, 0.5) is None
+    assert MainWindow._pick_preview_clip_for_time(stub, 0.5, fallback_to_first=True) is audio
 
 
 def test_next_playable_time_skips_to_later_audio_clip() -> None:
