@@ -1196,6 +1196,7 @@ class PreviewPanel(QWidget):
         self._timeline_audio_last_seek_ms: int = -1
         self._timeline_audio_last_seek_ts: float = 0.0
         self._media_source_path: str | None = None
+        self._timeline_play_available = False
         self._meter_token = 0
         self._meter_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -1262,8 +1263,9 @@ class PreviewPanel(QWidget):
 
     def _sync_play_icon(self) -> None:
         has_source = not self._player.source().isEmpty()
-        self._play_btn.setEnabled(has_source)
-        if has_source:
+        can_play = has_source or bool(self._timeline_play_available)
+        self._play_btn.setEnabled(can_play)
+        if can_play:
             self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self._play_btn.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1279,6 +1281,10 @@ class PreviewPanel(QWidget):
             size=16,
             fallback=fallback,
         )
+
+    def set_timeline_play_available(self, available: bool) -> None:
+        self._timeline_play_available = bool(available)
+        self._sync_play_icon()
 
     # ---- playback control ----
 

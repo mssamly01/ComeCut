@@ -1,4 +1,4 @@
-"""Bottom panel â€” a ``QGraphicsView``-based timeline.
+"""Bottom panel Ã¢â‚¬â€ a ``QGraphicsView``-based timeline.
 """
 
 from __future__ import annotations
@@ -1304,7 +1304,7 @@ class ClipRect(QGraphicsRectItem):
         painter.drawPath(path)
         self._draw_trim_handles(painter, rect)
 
-        # Speed-issue overlay tint (used by caption filter "Tá»‘c Ä‘á»™ Ä‘á»c")
+        # Speed-issue overlay tint (used by caption filter "TÃ¡Â»â€˜c Ã„â€˜Ã¡Â»â„¢ Ã„â€˜Ã¡Â»Âc")
         issue_ids = getattr(self._panel, "_speed_issue_clip_ids", set())
         if id(self.clip) in issue_ids:
             painter.setBrush(QColor(255, 82, 82, 60))
@@ -2326,7 +2326,7 @@ class TrackHeader(QWidget):
         icons_layout.addWidget(
             _icon_button(
                 lock_icon,
-                "Mở khóa track" if locked else "Khóa track",
+                "Má»Ÿ khÃ³a track" if locked else "KhÃ³a track",
                 on_toggle_lock,
                 active=locked,
                 fallback="L",
@@ -2335,7 +2335,7 @@ class TrackHeader(QWidget):
         icons_layout.addWidget(
             _icon_button(
                 eye_icon,
-                "Hiện track" if hidden else "Ẩn track",
+                "Hiá»‡n track" if hidden else "áº¨n track",
                 on_toggle_hidden,
                 active=hidden,
                 fallback="E",
@@ -2344,7 +2344,7 @@ class TrackHeader(QWidget):
         icons_layout.addWidget(
             _icon_button(
                 audio_icon,
-                "Bật âm thanh track" if muted else "Tắt âm thanh track",
+                "Báº­t Ã¢m thanh track" if muted else "Táº¯t Ã¢m thanh track",
                 on_toggle_mute,
                 active=muted,
                 fallback="A",
@@ -2598,36 +2598,28 @@ class TimelinePanel(QWidget):
         )
         h.addWidget(title)
 
-        self._btn_play = self._make_toolbar_button(
-            "icon-editor-timeline-play",
-            "Phát / Tạm dừng",
-            self._on_playpause_clicked,
-            fallback=">",
-        )
-        h.addWidget(self._btn_play)
-
         self._btn_undo = self._make_toolbar_button(
-            "icon-editor-timeline-undo", "Hoàn tác", self.undo_requested.emit, fallback="U"
+            "icon-editor-timeline-undo", "HoÃ n tÃ¡c", self.undo_requested.emit, fallback="U"
         )
         h.addWidget(self._btn_undo)
 
         self._btn_redo = self._make_toolbar_button(
-            "icon-editor-timeline-redo", "Làm lại", self.redo_requested.emit, fallback=""
+            "icon-editor-timeline-redo", "LÃ m láº¡i", self.redo_requested.emit, fallback=""
         )
         h.addWidget(self._btn_redo)
 
         self._btn_delete = self._make_toolbar_button(
-            "icon-editor-timeline-delete", "Xóa", self.ripple_delete_selected, fallback="D"
+            "icon-editor-timeline-delete", "XÃ³a", self.ripple_delete_selected, fallback="D"
         )
         h.addWidget(self._btn_delete)
 
         self._btn_split = self._make_toolbar_button(
-            "icon-editor-timeline-split", "Cắt", self.split_at_playhead, fallback=""
+            "icon-editor-timeline-split", "Cáº¯t", self.split_at_playhead, fallback=""
         )
         h.addWidget(self._btn_split)
 
         self._btn_save = self._make_toolbar_button(
-            "icon-editor-timeline-save", "Lưu", self.save_requested.emit, fallback="SV"
+            "icon-editor-timeline-save", "LÆ°u", self.save_requested.emit, fallback="SV"
         )
         h.addWidget(self._btn_save)
 
@@ -2635,7 +2627,7 @@ class TimelinePanel(QWidget):
 
         self._btn_snap = self._make_toolbar_button(
             "icon-editor-timeline-snapping",
-            "Bắt dính",
+            "Báº¯t dÃ­nh",
             self._toggle_auto_track_magnet,
             checkable=True,
             checked=self._is_auto_track_magnet,
@@ -2645,13 +2637,13 @@ class TimelinePanel(QWidget):
 
         self._btn_hover_scrub = self._make_toolbar_button(
             "icon-editor-timeline-hoverscrub",
-            "Dính playhead theo chuột (S)",
+            "DÃ­nh playhead theo chuá»™t (S)",
             self._toggle_hover_scrub,
             checkable=True,
             checked=self._hover_scrub_enabled,
             fallback="HS",
         )
-        self._btn_hover_scrub.setToolTip("Bật/Tắt dính Playhead vào chuột (Hover Scrub) - phím tắt: S")
+        self._btn_hover_scrub.setToolTip("Báº­t/Táº¯t dÃ­nh Playhead vÃ o chuá»™t (Hover Scrub) - phÃ­m táº¯t: S")
         h.addWidget(self._btn_hover_scrub)
 
         self._btn_opengl = self._make_toolbar_button(
@@ -2662,7 +2654,7 @@ class TimelinePanel(QWidget):
             checked=self._use_opengl_viewport,
             fallback="GL",
         )
-        self._btn_opengl.setToolTip("Bật/Tắt OpenGL cho timeline (thử nghiệm GPU paint)")
+        self._btn_opengl.setToolTip("Báº­t/Táº¯t OpenGL cho timeline (thá»­ nghiá»‡m GPU paint)")
         h.addWidget(self._btn_opengl)
 
         zoom_divider = QFrame()
@@ -2672,7 +2664,7 @@ class TimelinePanel(QWidget):
 
         self._btn_zoom_out = self._make_toolbar_button(
             "icon-editor-timeline-zoommin",
-            "Thu nhỏ timeline",
+            "Thu nhá» timeline",
             lambda: self._nudge_zoom(-10),
             fallback="-",
         )
@@ -2695,13 +2687,11 @@ class TimelinePanel(QWidget):
 
         self._btn_zoom_in = self._make_toolbar_button(
             "icon-editor-timeline-zoommax",
-            "Phóng to timeline",
+            "PhÃ³ng to timeline",
             lambda: self._nudge_zoom(10),
             fallback="+",
         )
         h.addWidget(self._btn_zoom_in)
-
-        self._refresh_play_icon()
         self._refresh_toggle_icons()
         return bar
 
@@ -2779,17 +2769,18 @@ class TimelinePanel(QWidget):
         btn.setIconSize(QSize(icon_size, icon_size))
 
     def _refresh_play_icon(self) -> None:
+        btn = getattr(self, "_btn_play", None)
+        if btn is None:
+            return
         is_playing = getattr(self, "_is_playing", False)
         symbol_id = "icon-editor-timeline-pause" if is_playing else "icon-editor-timeline-play"
         fallback = "||" if is_playing else ">"
-        self._btn_play.setProperty("symbol_id", symbol_id)
-        self._btn_play.setProperty("fallback_text", fallback)
-        self._apply_button_icon(self._btn_play, active=is_playing)
-
+        btn.setProperty("symbol_id", symbol_id)
+        btn.setProperty("fallback_text", fallback)
+        self._apply_button_icon(btn, active=is_playing)
         # Disable play button if timeline is empty
         has_clips = any(len(track.clips) > 0 for track in self._project.tracks)
-        self._btn_play.setEnabled(has_clips)
-
+        btn.setEnabled(has_clips)
     def _refresh_toggle_icons(self) -> None:
         self._apply_button_icon(self._btn_snap, active=self._is_auto_track_magnet)
         if hasattr(self, "_btn_hover_scrub"):
@@ -2809,13 +2800,11 @@ class TimelinePanel(QWidget):
 
     def _on_playpause_clicked(self) -> None:
         self._is_playing = not self._is_playing
-        self._refresh_play_icon()
         self.playpause_requested.emit()
 
     def set_playing_state(self, playing: bool) -> None:
         was_playing = self._is_playing
         self._is_playing = bool(playing)
-        self._refresh_play_icon()
         if was_playing and not self._is_playing:
             self._schedule_refresh()
 
@@ -2866,9 +2855,9 @@ class TimelinePanel(QWidget):
             finally:
                 del blocker
             if enabled and not ok:
-                tip = "OpenGL timeline: không khả dụng"
+                tip = "OpenGL timeline: khÃ´ng kháº£ dá»¥ng"
             else:
-                tip = f"OpenGL timeline: {'BẬT' if self._use_opengl_viewport else 'TẮT'}"
+                tip = f"OpenGL timeline: {'Báº¬T' if self._use_opengl_viewport else 'Táº®T'}"
             self._btn_opengl.setToolTip(tip)
         self._refresh_toggle_icons()
         self._schedule_refresh()
@@ -4324,7 +4313,6 @@ class TimelinePanel(QWidget):
         finally:
             del blocker
         self._emit_current_selection()
-        self._refresh_play_icon()
 
     def _draw_ruler(self, scene_w: float) -> None:
         self._scene.invalidate(

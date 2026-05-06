@@ -155,6 +155,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        self._sync_preview_play_availability()
         self._reset_timeline_history()
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(t("status.ready"))
@@ -317,7 +318,6 @@ class MainWindow(QMainWindow):
         self.timeline_panel.save_requested.connect(self._save_project)
         self.timeline_panel.undo_requested.connect(self._undo_timeline)
         self.timeline_panel.redo_requested.connect(self._redo_timeline)
-        self.timeline_panel.playpause_requested.connect(self._on_timeline_playpause_requested)
         self.preview_panel.playpause_requested.connect(self._on_preview_playpause_requested)
         self.preview_panel.position_changed.connect(self._on_preview_position_changed)
         self.timeline_panel.seek_requested.connect(self._on_timeline_seek)
@@ -1428,6 +1428,7 @@ class MainWindow(QMainWindow):
         self._set_history_index(0)
 
     def _push_timeline_history(self) -> None:
+        self._sync_preview_play_availability()
         if self._history_replaying:
             return
         snap = self._tracks_snapshot()
@@ -1452,6 +1453,7 @@ class MainWindow(QMainWindow):
         try:
             snapshot = self._history_snapshots[index]
             self._restore_tracks_snapshot(snapshot)
+            self._sync_preview_play_availability()
             self.timeline_panel.refresh()
             self._set_clip_in_inspector(None)
             self.inspector_panel.refresh()
@@ -1466,6 +1468,12 @@ class MainWindow(QMainWindow):
             self._history_replaying = False
         self._set_history_index(index)
 
+    def _timeline_has_any_components(self) -> bool:
+        return any(bool(track.clips) for track in self.project.tracks)
+
+    def _sync_preview_play_availability(self) -> None:
+        self.preview_panel.set_timeline_play_available(self._timeline_has_any_components())
+
     def _undo_timeline(self) -> None:
         if self._history_index <= 0:
             return
@@ -1477,6 +1485,7 @@ class MainWindow(QMainWindow):
         self._apply_history_snapshot(self._history_index + 1)
 
     def _on_timeline_project_mutated(self) -> None:
+        self._sync_preview_play_availability()
         self._update_media_library_added_states()
         self._push_timeline_history()
         self.inspector_panel.refresh()
@@ -2970,6 +2979,7 @@ class MainWindow(QMainWindow):
         self._start_project_proxy_generation()
         QTimer.singleShot(0, self._start_project_audio_proxy_generation)
         self.timeline_panel.refresh()
+        self._sync_preview_play_availability()
         all_clips = [clip for track in self.project.tracks for clip in track.clips]
         self._schedule_timeline_cache_prewarm(all_clips)
         self._preview_sync_mode = "timeline"
