@@ -135,6 +135,21 @@ def test_video_properties_box_updates_clip(qapp):
     box._rotate_dec.click()
     assert box._rotate_spin.value() == 10
 
+    box._effect_brightness_spin.setValue(0.25)
+    box._effect_contrast_spin.setValue(1.5)
+    box._effect_saturation_spin.setValue(0.75)
+    box._effect_blur_spin.setValue(2.0)
+    box._effect_grayscale_cb.setChecked(True)
+    box._effect_hflip_cb.setChecked(True)
+    box._effect_vflip_cb.setChecked(True)
+    assert clip.effects.brightness == pytest.approx(0.25)
+    assert clip.effects.contrast == pytest.approx(1.5)
+    assert clip.effects.saturation == pytest.approx(0.75)
+    assert clip.effects.blur == pytest.approx(2.0)
+    assert clip.effects.grayscale is True
+    assert clip.effects.hflip is True
+    assert clip.effects.vflip is True
+
     box._speed_slider.setValue(250)
     assert clip.speed == pytest.approx(2.5)
     box._speed_inc.click()
@@ -147,6 +162,59 @@ def test_video_properties_box_updates_clip(qapp):
 
     box._pitch_spin.setValue(5.0)
     assert clip.audio_effects.pitch_semitones == pytest.approx(5.0)
+
+
+def test_video_properties_box_reset_buttons(qapp):
+    clip = _video_clip()
+    clip.scale = 1.5
+    clip.scale_x = None
+    clip.scale_y = None
+    clip.pos_x = 120
+    clip.pos_y = -40
+    clip.effects.rotate = 33.0
+    clip.effects.brightness = 0.25
+    clip.effects.contrast = 1.5
+    clip.effects.saturation = 0.75
+    clip.effects.blur = 2.0
+    clip.effects.grayscale = True
+    clip.effects.hflip = True
+    clip.effects.vflip = True
+    clip.speed = 2.0
+    clip.volume = db_to_linear(-12.0)
+
+    box = VideoPropertiesBox()
+    box.set_clip(clip, track_kind="video")
+
+    box._reset_transform_btn.click()
+    assert clip.scale is None
+    assert clip.scale_x is None
+    assert clip.scale_y is None
+    assert clip.pos_x is None
+    assert clip.pos_y is None
+    assert clip.effects.rotate == pytest.approx(0.0)
+    assert box._scale_slider.value() == 100
+    assert box._x_spin.value() == 0
+    assert box._rotate_spin.value() == pytest.approx(0.0)
+
+    clip.effects.rotate = 21.0
+    box.set_clip(clip, track_kind="video")
+    box._reset_effects_btn.click()
+    assert clip.effects.rotate == pytest.approx(21.0)
+    assert clip.effects.brightness == pytest.approx(0.0)
+    assert clip.effects.contrast == pytest.approx(1.0)
+    assert clip.effects.saturation == pytest.approx(1.0)
+    assert clip.effects.blur == pytest.approx(0.0)
+    assert clip.effects.grayscale is False
+    assert clip.effects.hflip is False
+    assert clip.effects.vflip is False
+
+    box._reset_speed_btn.click()
+    assert clip.speed == pytest.approx(1.0)
+    assert box._speed_slider.value() == 100
+
+    box._reset_volume_btn.click()
+    assert clip.volume == pytest.approx(1.0)
+    assert box._volume_slider.value() == 0
 
 
 def test_inspector_routes_video_track_to_video_box(qapp):

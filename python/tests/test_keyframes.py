@@ -11,8 +11,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from comecut_py.core.keyframes import evaluate_clip_keyframes, evaluate_keyframes
 from comecut_py.core.project import Clip, Keyframe, Project, TextOverlay, Track
-from comecut_py.engine.render import _drawtext_filter, _keyframes_to_expr, render_project
+from comecut_py.engine.render import (
+    _clip_keyframes_to_local_expr,
+    _drawtext_filter,
+    _keyframes_to_expr,
+    render_project,
+)
 
 
 # ---- _keyframes_to_expr --------------------------------------------------
@@ -98,6 +104,87 @@ def test_duplicate_keyframe_times_rejected():
 def test_negative_time_rejected():
     with pytest.raises(ValidationError):
         Keyframe(time=-0.5, value=0.0)
+
+
+def test_evaluate_keyframes_interpolates_and_clamps():
+    kfs = [
+        Keyframe(time=1.0, value=0.25),
+        Keyframe(time=3.0, value=1.0),
+    ]
+
+    assert evaluate_keyframes(kfs, 0.0, default=0.5) == pytest.approx(0.25)
+    assert evaluate_keyframes(kfs, 2.0, default=0.5) == pytest.approx(0.625)
+    assert evaluate_keyframes(kfs, 4.0, default=0.5) == pytest.approx(1.0)
+    assert evaluate_keyframes([], 2.0, default=0.5) == pytest.approx(0.5)
+
+
+def test_clip_keyframes_sorted_and_evaluated():
+    clip = Clip(
+        source="a.mp4",
+        in_point=0,
+        out_point=5,
+        volume=1.0,
+        volume_keyframes=[
+            Keyframe(time=3.0, value=0.0),
+            Keyframe(time=1.0, value=1.0),
+        ],
+    )
+
+    assert [kf.time for kf in clip.volume_keyframes] == [1.0, 3.0]
+    assert evaluate_clip_keyframes(clip, "volume", 2.0, default=clip.volume) == pytest.approx(0.5)
+
+
+def test_clip_duplicate_keyframe_times_rejected():
+    with pytest.raises(ValidationError, match="duplicate keyframe time"):
+        Clip(
+            source="a.mp4",
+            in_point=0,
+            out_point=5,
+            opacity_keyframes=[
+                Keyframe(time=1.0, value=0.0),
+                Keyframe(time=1.0, value=1.0),
+            ],
+        )
+
+
+def test_clip_keyframes_roundtrip(tmp_path: Path):
+    p = Project(
+        tracks=[
+            Track(
+                kind="audio",
+                clips=[
+                    Clip(
+                        source="a.wav",
+                        in_point=0,
+                        out_point=5,
+                        volume_keyframes=[
+                            Keyframe(time=0.0, value=1.0),
+                            Keyframe(time=2.0, value=0.25),
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+    f = tmp_path / "clip-kfs.json"
+    p.to_json(f)
+
+    parsed = Project.from_json(f)
+    kfs = parsed.tracks[0].clips[0].volume_keyframes
+    assert [kf.time for kf in kfs] == [0.0, 2.0]
+    assert [kf.value for kf in kfs] == [1.0, 0.25]
+
+
+def test_clip_keyframes_to_local_expr_offsets_global_time():
+    kfs = [
+        Keyframe(time=5.0, value=1.0),
+        Keyframe(time=7.0, value=0.0),
+    ]
+
+    expr = _clip_keyframes_to_local_expr(kfs, clip_start=5.0, default=1.0)
+
+    assert "t-0.0" in expr
+    assert "if(lt(t,2.0)" in expr
 
 
 # ---- _drawtext_filter ----------------------------------------------------

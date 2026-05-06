@@ -14,6 +14,7 @@ import pytest
 from comecut_py.core.project import (
     Clip,
     ClipAudioEffects,
+    Keyframe,
     Project,
     Track,
 )
@@ -53,6 +54,27 @@ def test_audio_chain_default_clip_emits_only_volume():
     chain = _audio_effect_chain(clip)
     # Default clip has volume=1.0 and no audio effects; nothing else fires.
     assert chain == "volume=1.0"
+
+
+def test_audio_chain_volume_keyframes_override_static_volume():
+    clip = Clip(
+        source="in.mp4",
+        in_point=0,
+        out_point=5,
+        start=10.0,
+        volume=0.5,
+        volume_keyframes=[
+            Keyframe(time=10.0, value=1.0),
+            Keyframe(time=12.0, value=0.25),
+        ],
+    )
+
+    chain = _audio_effect_chain(clip)
+
+    assert chain.startswith("volume='if(lt(t")
+    assert ":eval=frame" in chain
+    assert "(1.0+(0.25-1.0)*(t-0.0)/2.0)" in chain
+    assert "volume=0.5" not in chain
 
 
 def test_audio_chain_fade_in_emits_afade_t_in():
@@ -156,6 +178,26 @@ def test_audio_chain_all_effects_roundtrip_through_render_project():
     assert f"rubberband=pitch={2.0 ** (-2.0 / 12.0)}" in fc
     assert "afade=t=in" in fc
     assert "afade=t=out" in fc
+
+
+def test_render_project_applies_track_volume_and_master_limiter():
+    p = Project(
+        tracks=[
+            Track(
+                kind="audio",
+                volume=0.5,
+                role="music",
+                clips=[Clip(source="music.mp3", in_point=0, out_point=5, start=0)],
+            )
+        ]
+    )
+
+    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
+    fc = argv[argv.index("-filter_complex") + 1]
+
+    assert "volume=0.5[a0]" in fc
+    assert "alimiter=limit=0.95[amaster]" in fc
+    assert "[amaster]" in argv
 
 
 def test_audio_effects_roundtrip_through_json():

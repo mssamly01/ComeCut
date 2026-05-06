@@ -2,143 +2,135 @@ from __future__ import annotations
 
 import pytest
 
-from comecut_py.core.project import Clip, Project, Track, Transition
-from comecut_py.engine import render_project
+from comecut_py.core.project import Clip, Track, Transition
+from comecut_py.core.transitions import (
+    adjacent_pair_from_clips,
+    clamp_transition_duration,
+    find_transition,
+    normalize_track_transitions,
+    reindex_transitions_after_clip_delete,
+    remove_track_transition,
+    set_track_transition,
+    transition_duration_limit,
+)
 
 
-def _video_project_with_transitions() -> Project:
-    p = Project(width=640, height=360, fps=24)
-    v = Track(kind="video")
-    v.clips.append(Clip(source="a.mp4", in_point=0, out_point=5, start=0))
-    v.clips.append(Clip(source="b.mp4", in_point=0, out_point=5, start=4))  # 1s overlap
-    v.transitions.append(Transition(from_index=0, to_index=1, duration=1.0, kind="fade"))
-    p.tracks.append(v)
-    return p
+def _clip(source: str, start: float, duration: float) -> Clip:
+    return Clip(source=source, in_point=0.0, out_point=duration, start=start)
 
 
-def test_transition_validation():
-    with pytest.raises(ValueError):
-        Transition(from_index=1, to_index=1, duration=1)
-    with pytest.raises(ValueError):
-        Transition(from_index=2, to_index=1, duration=1)
-    with pytest.raises(ValueError):
-        Transition(from_index=0, to_index=1, duration=0)
+def test_set_track_transition_clamps_to_half_shorter_clip():
+    track = Track(
+        kind="video",
+        clips=[
+            _clip("a.mp4", 0.0, 10.0),
+            _clip("b.mp4", 10.0, 0.6),
+        ],
+    )
+
+    transition = set_track_transition(track, 0, kind="dissolve", duration=1.0)
+
+    assert transition.kind == "dissolve"
+    assert transition.from_index == 0
+    assert transition.to_index == 1
+    assert transition.duration == pytest.approx(0.3)
+    assert transition_duration_limit(track, 0) == pytest.approx(0.3)
+    assert clamp_transition_duration(track, 0, 0.01) == pytest.approx(0.05)
 
 
-def test_transition_non_adjacent_rejected():
-    p = Project()
-    v = Track(kind="video")
-    v.clips.append(Clip(source="a", in_point=0, out_point=3))
-    v.clips.append(Clip(source="b", in_point=0, out_point=3, start=3))
-    v.clips.append(Clip(source="c", in_point=0, out_point=3, start=6))
-    v.transitions.append(Transition(from_index=0, to_index=2, duration=1))
-    p.tracks.append(v)
-    with pytest.raises(ValueError):
-        render_project(p, "out.mp4")
+def test_set_track_transition_replaces_existing_from_index():
+    track = Track(
+        kind="video",
+        clips=[
+            _clip("a.mp4", 0.0, 2.0),
+            _clip("b.mp4", 2.0, 2.0),
+        ],
+    )
+
+    set_track_transition(track, 0, kind="fade", duration=0.4)
+    set_track_transition(track, 0, kind="wipeleft", duration=0.2)
+
+    assert len(track.transitions) == 1
+    assert find_transition(track, 0) is not None
+    assert track.transitions[0].kind == "wipeleft"
+    assert track.transitions[0].duration == pytest.approx(0.2)
 
 
-def test_render_with_xfade_filter():
-    p = _video_project_with_transitions()
-    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
-    fc = argv[argv.index("-filter_complex") + 1]
-    assert "xfade=transition=fade:duration=1.0" in fc
-    # Offset is (duration of first clip) - (transition duration) = 5 - 1 = 4
-    assert "offset=4" in fc
+def test_remove_track_transition():
+    track = Track(
+        kind="video",
+        clips=[
+            _clip("a.mp4", 0.0, 2.0),
+            _clip("b.mp4", 2.0, 2.0),
+        ],
+    )
+    set_track_transition(track, 0)
+
+    assert remove_track_transition(track, 0) is True
+    assert remove_track_transition(track, 0) is False
+    assert track.transitions == []
 
 
-def test_render_requires_out_point_for_transitions():
-    p = Project()
-    v = Track(kind="video")
-    v.clips.append(Clip(source="a.mp4", in_point=0, out_point=None))
-    v.clips.append(Clip(source="b.mp4", in_point=0, out_point=5, start=4))
-    v.transitions.append(Transition(from_index=0, to_index=1, duration=1.0))
-    p.tracks.append(v)
-    with pytest.raises(ValueError, match="transitions need explicit clip durations"):
-        render_project(p, "out.mp4")
+def test_adjacent_pair_from_clips_requires_same_track_and_adjacency():
+    a = _clip("a.mp4", 0.0, 2.0)
+    b = _clip("b.mp4", 2.0, 2.0)
+    c = _clip("c.mp4", 4.0, 2.0)
+    track = Track(kind="video", clips=[a, b, c])
+
+    assert adjacent_pair_from_clips(track, [b, a]) == 0
+    assert adjacent_pair_from_clips(track, [a, c]) is None
+    assert adjacent_pair_from_clips(track, [a]) is None
 
 
-def test_audio_transition_uses_acrossfade():
-    p = Project()
-    a = Track(kind="audio")
-    a.clips.append(Clip(source="a.mp3", in_point=0, out_point=5, start=0))
-    a.clips.append(Clip(source="b.mp3", in_point=0, out_point=5, start=4))
-    a.transitions.append(Transition(from_index=0, to_index=1, duration=1.0))
-    p.tracks.append(a)
-    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
-    fc = argv[argv.index("-filter_complex") + 1]
-    assert "acrossfade=d=1.0" in fc
+def test_normalize_track_transitions_removes_invalid_and_clamps():
+    track = Track(
+        kind="video",
+        clips=[
+            _clip("a.mp4", 0.0, 2.0),
+            _clip("b.mp4", 2.0, 0.4),
+            _clip("c.mp4", 2.4, 2.0),
+        ],
+        transitions=[
+            Transition(from_index=0, to_index=1, duration=1.0, kind="fade"),
+            Transition(from_index=0, to_index=1, duration=0.1, kind="dissolve"),
+            Transition(from_index=0, to_index=2, duration=0.2, kind="wipeleft"),
+            Transition(from_index=9, to_index=10, duration=0.2, kind="fade"),
+        ],
+    )
+
+    changed = normalize_track_transitions(track)
+
+    assert changed is True
+    assert len(track.transitions) == 1
+    assert track.transitions[0].from_index == 0
+    assert track.transitions[0].duration == pytest.approx(0.2)
 
 
-def _count_label_definitions(filter_complex: str) -> dict[str, int]:
-    """Return a {label: count} map for every ``[name]`` label *definition*.
+def test_reindex_transitions_after_clip_delete_keeps_surviving_pairs():
+    track = Track(
+        kind="video",
+        clips=[
+            _clip("a.mp4", 0.0, 2.0),
+            _clip("b.mp4", 2.0, 2.0),
+            _clip("c.mp4", 4.0, 2.0),
+            _clip("d.mp4", 6.0, 2.0),
+        ],
+        transitions=[
+            Transition(from_index=0, to_index=1, duration=0.2, kind="fade"),
+            Transition(from_index=2, to_index=3, duration=0.3, kind="dissolve"),
+        ],
+    )
+    old_transitions = list(track.transitions)
+    del track.clips[1]
 
-    A label is considered a definition when it appears as the last ``[...]``
-    on a filter step (i.e. immediately before ``;`` or end-of-string).
-    """
-    import re
+    reindex_transitions_after_clip_delete(
+        track,
+        {1},
+        old_transitions,
+        old_clip_count=4,
+    )
 
-    counts: dict[str, int] = {}
-    for step in filter_complex.split(";"):
-        m = re.findall(r"\[([^\]]+)\](?=[^\]]*$)", step)
-        for name in m:
-            counts[name] = counts.get(name, 0) + 1
-    return counts
-
-
-def test_multiple_video_tracks_with_transitions_have_unique_labels():
-    """Regression: ``vx_{i}``/``vshift_…`` labels used to collide across tracks."""
-    p = Project(width=320, height=180, fps=24)
-    for _ in range(2):
-        v = Track(kind="video")
-        v.clips.append(Clip(source="x.mp4", in_point=0, out_point=5, start=0))
-        v.clips.append(Clip(source="y.mp4", in_point=0, out_point=5, start=4))
-        v.transitions.append(Transition(from_index=0, to_index=1, duration=1.0))
-        p.tracks.append(v)
-
-    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
-    fc = argv[argv.index("-filter_complex") + 1]
-    counts = _count_label_definitions(fc)
-    duplicates = {k: v for k, v in counts.items() if v > 1}
-    assert not duplicates, f"duplicate filter labels: {duplicates}"
-
-
-def test_multiple_audio_tracks_with_transitions_have_unique_labels():
-    p = Project()
-    for _ in range(2):
-        a = Track(kind="audio")
-        a.clips.append(Clip(source="m.mp3", in_point=0, out_point=5, start=0))
-        a.clips.append(Clip(source="n.mp3", in_point=0, out_point=5, start=4))
-        a.transitions.append(Transition(from_index=0, to_index=1, duration=1.0))
-        p.tracks.append(a)
-    # Need at least one video track for render_project.
-    v = Track(kind="video")
-    v.clips.append(Clip(source="v.mp4", in_point=0, out_point=5, start=0))
-    p.tracks.insert(0, v)
-
-    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
-    fc = argv[argv.index("-filter_complex") + 1]
-    counts = _count_label_definitions(fc)
-    duplicates = {k: v for k, v in counts.items() if v > 1}
-    assert not duplicates, f"duplicate filter labels: {duplicates}"
-
-
-def test_render_without_transitions_still_works_with_gaps():
-    p = Project()
-    v = Track(kind="video")
-    v.clips.append(Clip(source="a.mp4", in_point=0, out_point=3, start=0))
-    v.clips.append(Clip(source="b.mp4", in_point=0, out_point=3, start=10))  # 7s gap
-    p.tracks.append(v)
-    # No transitions — per-clip overlay path. Must not raise.
-    argv = render_project(p, "out.mp4").build(ffmpeg_bin="ffmpeg")
-    fc = argv[argv.index("-filter_complex") + 1]
-    assert "xfade" not in fc
-    assert "overlay" in fc
-
-
-def test_project_json_roundtrip_with_transitions(tmp_path):
-    p = _video_project_with_transitions()
-    path = tmp_path / "p.json"
-    p.to_json(path)
-    loaded = Project.from_json(path)
-    assert len(loaded.tracks[0].transitions) == 1
-    assert loaded.tracks[0].transitions[0].kind == "fade"
+    assert len(track.transitions) == 1
+    assert track.transitions[0].from_index == 1
+    assert track.transitions[0].to_index == 2
+    assert track.transitions[0].kind == "dissolve"

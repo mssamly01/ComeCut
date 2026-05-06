@@ -14,7 +14,10 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+import comecut_py.core.local_presets as local_presets
+from comecut_py.core.subtitle_style_presets import save_subtitle_style_preset
 from comecut_py.cli import app
+from comecut_py.subtitles import SubtitleStyle
 
 
 def _make_subs(tmp_path: Path) -> Path:
@@ -120,6 +123,30 @@ def test_burn_subs_force_style_overrides_typed_flags(tmp_path: Path):
     # in libass (last value for the same key).
     assert fs.endswith("Fontsize=48")
     assert fs.index("Fontsize=20") < fs.index("Fontsize=48")
+
+
+def test_burn_subs_style_preset_is_base_for_typed_and_raw_flags(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(local_presets, "DEFAULT_PRESET_ROOT", tmp_path / "presets")
+    save_subtitle_style_preset(
+        "Mobile Caption",
+        SubtitleStyle(font_name="Verdana", font_size=24, primary_colour="#FFFFFF"),
+    )
+    subs = _make_subs(tmp_path)
+    src = tmp_path / "in.mp4"
+    src.write_bytes(b"fake")
+    dst = tmp_path / "out.mp4"
+
+    result, captured = _capture_burn([
+        "burn-subs", str(src), str(subs), str(dst),
+        "--style-preset", "Mobile Caption",
+        "--font-size", "40",
+        "--force-style", "Fontsize=52",
+    ])
+    assert result.exit_code == 0, result.output
+    fs = captured["force_style"] or ""
+    assert "FontName=Verdana" in fs
+    assert fs.index("Fontsize=24") < fs.index("Fontsize=40")
+    assert fs.endswith("Fontsize=52")
 
 
 def test_burn_subs_no_flags_passes_none_force_style(tmp_path: Path):

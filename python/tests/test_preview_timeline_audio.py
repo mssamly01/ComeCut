@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import pytest
 
+from comecut_py.core.audio_mixer import (
+    audible_audio_tracks,
+    set_track_role,
+    set_track_volume,
+    track_output_gain,
+)
 from comecut_py.core.project import Clip, Track
 from comecut_py.gui.preview_timeline import (
     clip_fade_multiplier_at_local_time,
@@ -26,6 +32,25 @@ def test_hidden_audio_track_is_ignored() -> None:
     audio = Clip(source="a.wav", start=0.0, in_point=0.0, out_point=10.0)
     tracks = [Track(kind="audio", hidden=True, clips=[audio])]
     assert pick_timeline_audio_clip(tracks, 2.0) is None
+
+
+def test_zero_volume_audio_track_is_ignored_by_preview_picker() -> None:
+    audio = Clip(source="a.wav", start=0.0, in_point=0.0, out_point=10.0)
+    tracks = [Track(kind="audio", volume=0.0, clips=[audio])]
+    assert pick_timeline_audio_clip(tracks, 2.0) is None
+
+
+def test_audio_mixer_helpers_clamp_volume_and_role() -> None:
+    track = Track(kind="audio", clips=[Clip(source="a.wav", out_point=1.0)])
+
+    assert set_track_volume(track, "-2") == 0.0
+    assert track_output_gain(track) == 0.0
+    assert audible_audio_tracks([track]) == []
+
+    assert set_track_volume(track, "1.5") == pytest.approx(1.5)
+    assert track_output_gain(track) == pytest.approx(1.5)
+    assert set_track_role(track, "voice") == "voice"
+    assert set_track_role(track, "unknown") == "other"
 
 
 def test_fallback_to_first_audio_clip() -> None:

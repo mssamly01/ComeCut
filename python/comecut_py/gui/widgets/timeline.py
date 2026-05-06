@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (  # type: ignore
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
+    QComboBox,
     QLabel,
     QMenu,
     QSlider,
@@ -47,8 +48,25 @@ try:
 except Exception:  # pragma: no cover - optional dependency on some runtimes
     QSvgRenderer = None
 
+from ...core.audio_mixer import (
+    AUDIO_ROLE_LABELS,
+    set_track_role,
+    set_track_volume,
+    track_output_gain,
+)
 from ...core.ffmpeg_cmd import get_video_duration
 from ...core.project import Clip, Project, Track
+from ...core.transitions import (
+    COMMON_TRANSITION_KINDS,
+    DEFAULT_TRANSITION_DURATION,
+    adjacent_pair_from_clips,
+    find_transition,
+    normalize_track_transitions,
+    reindex_transitions_after_clip_delete,
+    remove_track_transition,
+    set_track_transition,
+    transition_duration_limit,
+)
 from ..preview_timeline import clip_fade_multiplier_at_local_time
 BASE_PIXELS_PER_SECOND = 50.0
 PIXELS_PER_SECOND = BASE_PIXELS_PER_SECOND
@@ -118,6 +136,16 @@ VOLUME_LINE_DB_SPAN = 24.0
 VOLUME_LINE_HIT_PX = 7.0
 FADE_HANDLE_RADIUS_PX = 3.6
 FADE_HANDLE_HIT_PX = 8.0
+TRIM_HANDLE_HIT_PX = 7.0
+MIN_TRIM_TIMELINE_DURATION_SECONDS = 1.0 / 30.0
+TRANSITION_KIND_LABELS = {
+    "fade": "Fade",
+    "dissolve": "Dissolve",
+    "wipeleft": "Wipe Left",
+    "wiperight": "Wipe Right",
+    "slideleft": "Slide Left",
+    "slideright": "Slide Right",
+}
 
 _SYMBOL_RE = re.compile(
     r'<symbol\s+id="(?P<id>[^"]+)"(?P<attrs>[^>]*)>(?P<body>.*?)</symbol>',
@@ -189,6 +217,169 @@ def _timeline_icon(symbol_id: str, color: str = ICON_NORMAL, size: int = 16) -> 
     renderer.render(painter)
     painter.end()
     return QIcon(pix)
+
+
+def _clip_timeline_end(clip: Clip) -> float | None:
+    dur = clip.timeline_duration
+    if dur is None:
+        return None
+    return float(clip.start) + float(dur)
+
+
+def ripple_shift_later_clips(
+    track: Track,
+    *,
+    anchor_seconds: float,
+    delta_seconds: float,
+    exclude_clip: Clip | None = None,
+) -> bool:
+    """Shift clips at/after an edit point by ``delta_seconds`` on one track."""
+    if abs(float(delta_seconds)) <= 1e-6:
+        return False
+    changed = False
+    anchor = float(anchor_seconds)
+    for clip in track.clips:
+        if exclude_clip is not None and clip is exclude_clip:
+            continue
+        if float(clip.start) + 1e-6 < anchor:
+            continue
+        new_start = max(0.0, float(clip.start) + float(delta_seconds))
+        if abs(new_start - float(clip.start)) > 1e-6:
+            clip.start = new_start
+            changed = True
+    if changed:
+        track.clips.sort(key=lambda c: c.start)
+    return changed
+
+
+def trim_clip_edge(
+    track: Track,
+    clip: Clip,
+    edge: str,
+    target_seconds: float,
+    *,
+    ripple: bool = False,
+    min_duration_seconds: float = MIN_TRIM_TIMELINE_DURATION_SECONDS,
+) -> tuple[bool, float]:
+    """Trim one clip edge and optionally ripple clips after the right edge.
+
+    Returns ``(changed, ripple_delta_seconds)``. The ripple delta is non-zero
+    only for right-edge ripple trim so callers/tests can inspect the edit.
+    """
+    if clip not in track.clips:
+        return False, 0.0
+    edge_n = (edge or "").strip().lower()
+    if edge_n not in {"left", "right"}:
+        return False, 0.0
+    if clip.out_point is None:
+        return False, 0.0
+
+    speed = max(1e-6, float(clip.speed or 1.0))
+    original_start = float(clip.start)
+    original_in = float(clip.in_point)
+    original_out = float(clip.out_point)
+    original_duration = float(clip.timeline_duration or 0.0)
+    if original_duration <= 1e-6 or original_out <= original_in:
+        return False, 0.0
+
+    min_duration = max(1e-6, float(min_duration_seconds))
+    min_source_span = min_duration * speed
+    original_end = original_start + original_duration
+    target = max(0.0, float(target_seconds))
+    changed = False
+    ripple_delta = 0.0
+
+    if edge_n == "left":
+        min_start = max(0.0, original_start - (original_in / speed))
+        max_start = original_end - min_duration
+        if max_start < min_start:
+            max_start = min_start
+        new_start = max(min_start, min(max_start, target))
+        new_in = original_in + ((new_start - original_start) * speed)
+        new_in = max(0.0, min(original_out - min_source_span, new_in))
+        if abs(new_start - original_start) > 1e-6:
+            clip.start = new_start
+            changed = True
+        if abs(new_in - original_in) > 1e-6:
+            clip.in_point = new_in
+            changed = True
+    else:
+        min_end = original_start + min_duration
+        new_end = max(min_end, target)
+        new_out = original_in + ((new_end - original_start) * speed)
+        if new_out < original_in + min_source_span:
+            new_out = original_in + min_source_span
+            new_end = original_start + min_duration
+        if abs(new_out - original_out) > 1e-6:
+            clip.out_point = new_out
+            changed = True
+            if ripple:
+                ripple_delta = new_end - original_end
+                ripple_shift_later_clips(
+                    track,
+                    anchor_seconds=original_end,
+                    delta_seconds=ripple_delta,
+                    exclude_clip=clip,
+                )
+
+    if changed:
+        track.clips.sort(key=lambda c: c.start)
+    return changed, ripple_delta
+
+
+def ripple_delete_clips_from_track(track: Track, selected_ids: set[int]) -> bool:
+    """Delete selected clips and close the timeline gap on one track."""
+    if not selected_ids:
+        return False
+    old_clips = list(track.clips)
+    old_transitions = list(track.transitions)
+    removed_indices = {
+        idx for idx, clip in enumerate(old_clips) if id(clip) in selected_ids
+    }
+    removed = [clip for clip in track.clips if id(clip) in selected_ids]
+    if not removed:
+        return False
+    removed.sort(key=lambda c: float(c.start))
+    remaining = [clip for clip in track.clips if id(clip) not in selected_ids]
+    for clip in remaining:
+        shift = 0.0
+        clip_start = float(clip.start)
+        for deleted in removed:
+            if clip_start + 1e-6 >= float(deleted.start):
+                shift += float(deleted.timeline_duration or 0.0)
+        if shift > 0.0:
+            clip.start = max(0.0, clip_start - shift)
+    track.clips = sorted(remaining, key=lambda c: c.start)
+    reindex_transitions_after_clip_delete(
+        track,
+        removed_indices,
+        old_transitions,
+        old_clip_count=len(old_clips),
+    )
+    return True
+
+
+def timeline_snap_times(project: Project, *, exclude_clip: Clip | None = None) -> list[float]:
+    """Return clip edge + beat marker snap anchors in timeline seconds."""
+    times: set[float] = {0.0}
+    for track in project.tracks:
+        for clip in track.clips:
+            if exclude_clip is not None and clip is exclude_clip:
+                continue
+            dur = clip.timeline_duration
+            if dur is None or dur <= 0.0:
+                continue
+            start = max(0.0, float(clip.start))
+            times.add(round(start, 6))
+            times.add(round(start + float(dur), 6))
+    for marker in getattr(project, "beat_markers", []):
+        try:
+            time_s = float(marker.time)
+        except Exception:
+            continue
+        if time_s >= 0.0:
+            times.add(round(time_s, 6))
+    return sorted(times)
 
 
 def _custom_hover_scrub_icon(active: bool = False, size: int = 24) -> QIcon:
@@ -401,6 +592,12 @@ class ClipRect(QGraphicsRectItem):
         self._fade_dragging: str | None = None
         self._fade_drag_changed = False
         self._fade_handle_hover: str | None = None
+        self._trim_dragging: str | None = None
+        self._trim_drag_changed = False
+        self._trim_drag_ripple = False
+        self._trim_handle_hover: str | None = None
+        self._trim_origin_duration = float(clip.timeline_duration or 0.0)
+        self._trim_origin_end = float(clip.start) + self._trim_origin_duration
         self._updating_layout = False
         self._is_text_clip = bool(getattr(clip, "is_text_clip", False))
         self._track_kind = (track_kind or "video").strip().lower()
@@ -556,6 +753,7 @@ class ClipRect(QGraphicsRectItem):
             self.setSelected(False)
             self._set_volume_line_hover(False)
             self._set_fade_handle_hover(None)
+            self._set_trim_handle_hover(None)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not new_locked)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, not new_locked)
         self.update()
@@ -716,7 +914,27 @@ class ClipRect(QGraphicsRectItem):
         y = self._volume_line_y(wave_rect)
         return abs(float(pos.y()) - y) <= VOLUME_LINE_HIT_PX
 
+    def _hit_trim_handle(self, pos: QPointF) -> str | None:
+        if self._locked:
+            return None
+        rect = self.rect()
+        if rect.width() <= 2.0 or rect.height() <= 2.0:
+            return None
+        if not rect.adjusted(-2.0, -2.0, 2.0, 2.0).contains(pos):
+            return None
+        hit_w = min(max(4.0, TRIM_HANDLE_HIT_PX), max(4.0, rect.width() * 0.35))
+        left_dist = abs(float(pos.x()) - float(rect.left()))
+        right_dist = abs(float(rect.right()) - float(pos.x()))
+        if left_dist <= hit_w and left_dist <= right_dist:
+            return "left"
+        if right_dist <= hit_w:
+            return "right"
+        return None
+
     def _sync_interaction_cursor(self) -> None:
+        if self._trim_dragging is not None or self._trim_handle_hover is not None:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            return
         if self._fade_dragging is not None or self._fade_handle_hover is not None:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
             return
@@ -740,6 +958,17 @@ class ClipRect(QGraphicsRectItem):
             which_n = None
         if which_n != self._fade_handle_hover:
             self._fade_handle_hover = which_n
+            self.update()
+        self._sync_interaction_cursor()
+
+    def _set_trim_handle_hover(self, which: str | None) -> None:
+        if self._locked:
+            which = None
+        which_n = (which or "").strip().lower()
+        if which_n not in {"left", "right"}:
+            which_n = None
+        if which_n != self._trim_handle_hover:
+            self._trim_handle_hover = which_n
             self.update()
         self._sync_interaction_cursor()
 
@@ -801,6 +1030,32 @@ class ClipRect(QGraphicsRectItem):
         painter.drawEllipse(p_in, in_r, in_r)
         painter.setBrush(QBrush(out_color))
         painter.drawEllipse(p_out, out_r, out_r)
+        painter.restore()
+
+    def _draw_trim_handles(self, painter: QPainter, rect: QRectF) -> None:
+        if self._locked:
+            return
+        if not (self.isSelected() or self._trim_handle_hover or self._trim_dragging):
+            return
+        strip_w = min(TRIM_HANDLE_HIT_PX, max(2.0, rect.width() * 0.5))
+        if strip_w <= 0.0:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        base = QColor(255, 255, 255, 42)
+        active = QColor("#ffffff")
+        active.setAlpha(120)
+        line = QColor("#ffffff")
+        line.setAlpha(170)
+        for edge in ("left", "right"):
+            is_active = self._trim_handle_hover == edge or self._trim_dragging == edge
+            x = rect.left() if edge == "left" else rect.right() - strip_w
+            handle_rect = QRectF(x, rect.top() + 1.0, strip_w, max(0.0, rect.height() - 2.0))
+            painter.fillRect(handle_rect, active if is_active else base)
+            if is_active:
+                line_x = handle_rect.left() if edge == "left" else handle_rect.right()
+                painter.setPen(QPen(line, 1.0))
+                painter.drawLine(QPointF(line_x, rect.top() + 4.0), QPointF(line_x, rect.bottom() - 4.0))
         painter.restore()
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
@@ -915,6 +1170,7 @@ class ClipRect(QGraphicsRectItem):
         else:
             painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
         painter.drawPath(path)
+        self._draw_trim_handles(painter, rect)
 
         # Speed-issue overlay tint (used by caption filter "Tá»‘c Ä‘á»™ Ä‘á»c")
         issue_ids = getattr(self._panel, "_speed_issue_clip_ids", set())
@@ -1231,6 +1487,8 @@ class ClipRect(QGraphicsRectItem):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
             if self._updating_layout:
                 return value
+            if self._trim_dragging is not None:
+                return self.pos()
             x = max(0.0, float(value.x()))
             start_sec = self._panel.pixels_to_seconds(x)
             snapped_sec = self._panel.apply_clip_snap(self.clip, start_sec)
@@ -1239,7 +1497,61 @@ class ClipRect(QGraphicsRectItem):
             value.setX(self._panel.seconds_to_pixels(snapped_sec))
         return super().itemChange(change, value)
 
+    def _apply_trim_geometry_from_clip(self) -> None:
+        width = max(1.0, self._panel.seconds_to_pixels(float(self.clip.timeline_duration or 5.0)))
+        self._updating_layout = True
+        try:
+            self.setPos(self._panel.seconds_to_pixels(float(self.clip.start)), self._lane_y)
+            self.setRect(0, 0, width, self.rect().height())
+        finally:
+            self._updating_layout = False
+        self._content_signature = self._make_content_signature(self.clip, self._track_kind)
+        self.update()
+
+    def _set_trim_edge_from_scene_x(self, edge: str, scene_x: float) -> bool:
+        loc = self._panel._find_clip_location(self.clip)
+        if loc is None:
+            return False
+        track, _, _ = loc
+        if self._panel._is_track_locked(track):
+            return False
+        target = self._panel.pixels_to_seconds(scene_x)
+        target = self._panel.apply_trim_snap(self.clip, edge, target)
+        changed, _ = trim_clip_edge(track, self.clip, edge, target, ripple=False)
+        if changed:
+            self._apply_trim_geometry_from_clip()
+        return changed
+
     def mouseReleaseEvent(self, event):
+        if self._trim_dragging is not None and event.button() == Qt.MouseButton.LeftButton:
+            edge = self._trim_dragging
+            changed = bool(self._trim_drag_changed)
+            ripple = bool(self._trim_drag_ripple and edge == "right")
+            ripple_anchor = float(self._trim_origin_end)
+            current_end = _clip_timeline_end(self.clip)
+            ripple_delta = 0.0
+            if current_end is not None:
+                ripple_delta = float(current_end) - float(self._trim_origin_end)
+            self._trim_dragging = None
+            self._trim_drag_changed = False
+            self._trim_drag_ripple = False
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self._locked)
+            self.setZValue(0)
+            self.setSelected(True)
+            self._set_trim_handle_hover(self._hit_trim_handle(event.pos()))
+            if changed:
+                clip = self.clip
+                QTimer.singleShot(
+                    0,
+                    lambda c=clip, rp=ripple, anchor=ripple_anchor, delta=ripple_delta, panel=self._panel: panel.handle_clip_trim_change(
+                        c,
+                        ripple=rp,
+                        ripple_anchor_seconds=anchor,
+                        ripple_delta_seconds=delta,
+                    ),
+                )
+            event.accept()
+            return
         if self._fade_dragging is not None and event.button() == Qt.MouseButton.LeftButton:
             self._fade_dragging = None
             self.setZValue(0)
@@ -1333,6 +1645,23 @@ class ClipRect(QGraphicsRectItem):
             self.update()
             event.accept()
             return
+        trim_hit = self._hit_trim_handle(event.pos())
+        if trim_hit is not None:
+            self._trim_dragging = trim_hit
+            self._trim_drag_changed = False
+            self._trim_drag_ripple = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            self._trim_origin_duration = float(self.clip.timeline_duration or 0.0)
+            self._trim_origin_end = float(self.clip.start) + self._trim_origin_duration
+            self._drag_happened = False
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            self.setZValue(2002)
+            self._set_trim_handle_hover(trim_hit)
+            self._set_fade_handle_hover(None)
+            self._set_volume_line_hover(False)
+            if self._set_trim_edge_from_scene_x(trim_hit, float(event.scenePos().x())):
+                self._trim_drag_changed = True
+            event.accept()
+            return
         self._drag_origin_start = self.clip.start
         src_idx = self._panel._track_index_for_clip(self.clip)
         self._drag_origin_track_idx = -1 if src_idx is None else src_idx
@@ -1364,6 +1693,13 @@ class ClipRect(QGraphicsRectItem):
                 self.update()
             event.accept()
             return
+        if self._trim_dragging is not None:
+            self._trim_drag_ripple = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if self._set_trim_edge_from_scene_x(self._trim_dragging, float(event.scenePos().x())):
+                self._trim_drag_changed = True
+            self._set_trim_handle_hover(self._trim_dragging)
+            event.accept()
+            return
         if not (event.buttons() & Qt.MouseButton.LeftButton):
             super().mouseMoveEvent(event)
             return
@@ -1375,18 +1711,22 @@ class ClipRect(QGraphicsRectItem):
         super().mouseMoveEvent(event)
 
     def hoverMoveEvent(self, event) -> None:
-        if not self._volume_dragging and self._fade_dragging is None:
+        if not self._volume_dragging and self._fade_dragging is None and self._trim_dragging is None:
             fade_hit = self._hit_fade_handle(event.pos())
             self._set_fade_handle_hover(fade_hit)
             if fade_hit is None:
-                self._set_volume_line_hover(self._hit_volume_line(event.pos()))
+                volume_hit = self._hit_volume_line(event.pos())
+                self._set_volume_line_hover(volume_hit)
+                self._set_trim_handle_hover(None if volume_hit else self._hit_trim_handle(event.pos()))
             else:
                 self._set_volume_line_hover(False)
+                self._set_trim_handle_hover(None)
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event) -> None:
         self._set_fade_handle_hover(None)
         self._set_volume_line_hover(False)
+        self._set_trim_handle_hover(None)
         super().hoverLeaveEvent(event)
 
     def contextMenuEvent(self, event):
@@ -1731,15 +2071,20 @@ class TrackHeader(QWidget):
         locked: bool = False,
         hidden: bool = False,
         muted: bool = False,
+        volume: float = 1.0,
+        role: str = "other",
         lane_height: float = TRACK_HEIGHT,
         background_color: QColor | str = "#16181d",
         on_toggle_lock: Callable[[], None] | None = None,
         on_toggle_hidden: Callable[[], None] | None = None,
         on_toggle_mute: Callable[[], None] | None = None,
+        on_volume_changed: Callable[[float, bool], None] | None = None,
+        on_role_changed: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self.setFixedWidth(TRACK_HEADER_WIDTH)
         self.setFixedHeight(int(max(20.0, lane_height)))
+        self.setToolTip(name)
         self._background_color = QColor(background_color)
         # HTML parity: controls stay on the header while the lane remains.
         self.setStyleSheet(
@@ -1748,9 +2093,9 @@ class TrackHeader(QWidget):
             """
         )
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 0, 8, 0)
-        layout.setSpacing(0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 3, 8, 3)
+        layout.setSpacing(2)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         def _icon_label(symbol_id: str, fallback: str = "*", size: int = 12) -> QLabel:
@@ -1873,8 +2218,86 @@ class TrackHeader(QWidget):
                 fallback="A",
             )
         )
-        layout.addLayout(icons_layout)
-        layout.addStretch(1)
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(0)
+        top_row.addLayout(icons_layout)
+        top_row.addStretch(1)
+        layout.addLayout(top_row)
+
+        if (kind or "").strip().lower() == "audio" and lane_height >= 46:
+            mixer_row = QHBoxLayout()
+            mixer_row.setContentsMargins(0, 0, 0, 0)
+            mixer_row.setSpacing(5)
+            vol = QSlider(Qt.Orientation.Horizontal, self)
+            vol.setRange(0, 200)
+            vol.setFixedHeight(16)
+            vol.setToolTip("Track volume")
+            vol.setValue(max(0, min(200, int(round(float(volume) * 100.0)))))
+            vol.setStyleSheet(
+                """
+                QSlider::groove:horizontal {
+                    height: 3px;
+                    background: #252b34;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #22d3c5;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    width: 9px;
+                    margin: -4px 0;
+                    border-radius: 4px;
+                    background: #d7fbf7;
+                }
+                """
+            )
+            if on_volume_changed is not None:
+                vol.valueChanged.connect(
+                    lambda v, slider=vol, cb=on_volume_changed: cb(
+                        max(0.0, float(v) / 100.0),
+                        not slider.isSliderDown(),
+                    )
+                )
+                vol.sliderReleased.connect(
+                    lambda slider=vol, cb=on_volume_changed: cb(
+                        max(0.0, float(slider.value()) / 100.0),
+                        True,
+                    )
+                )
+            mixer_row.addWidget(vol, 1)
+
+            role_box = QComboBox(self)
+            role_box.setFixedWidth(58)
+            role_box.setToolTip("Audio role")
+            for role_id, label in AUDIO_ROLE_LABELS.items():
+                role_box.addItem(label, role_id)
+            role_index = role_box.findData((role or "other").strip().lower())
+            role_box.setCurrentIndex(role_index if role_index >= 0 else role_box.findData("other"))
+            role_box.setStyleSheet(
+                """
+                QComboBox {
+                    background: #111318;
+                    border: 1px solid #2a2f38;
+                    border-radius: 4px;
+                    color: #cfd5df;
+                    font-size: 9px;
+                    padding-left: 4px;
+                }
+                QComboBox::drop-down { border: none; width: 10px; }
+                """
+            )
+            if on_role_changed is not None:
+                role_box.currentIndexChanged.connect(
+                    lambda _idx, box=role_box, cb=on_role_changed: cb(
+                        str(box.currentData() or "other")
+                    )
+                )
+            mixer_row.addWidget(role_box)
+            layout.addLayout(mixer_row)
+        else:
+            layout.addStretch(1)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -1937,6 +2360,7 @@ class TimelinePanel(QWidget):
         self._wave_peaks_cache: dict[tuple[str, int, int], list[float] | None] = {}
         self._wave_peaks_inflight: set[tuple[str, int, int]] = set()
         self._wave_upgrade_pending: set[tuple[str, int, int]] = set()
+        self._pending_track_volume_commits: set[int] = set()
         self._thumbnail_ready.connect(self._on_thumbnail_ready)
         self._filmstrip_chunk_ready.connect(self._on_filmstrip_chunk_ready)
         self._waveform_peaks_ready.connect(self._on_waveform_peaks_ready)
@@ -2359,20 +2783,30 @@ class TimelinePanel(QWidget):
                     best_start = max(0.0, edge - clip_duration)
         return best_start
 
+    def apply_trim_snap(self, moving_clip: Clip, edge: str, edge_seconds: float) -> float:
+        raw_edge = max(0.0, float(edge_seconds))
+        if not self._is_auto_track_magnet:
+            return raw_edge
+        edge_n = (edge or "").strip().lower()
+        if edge_n not in {"left", "right"}:
+            return raw_edge
+        snap_t = self._snap_tolerance_seconds()
+        candidates = [0.0, max(0.0, float(self._playhead_seconds))]
+        candidates.extend(self._iter_snap_edges(exclude_clip=moving_clip))
+        snapped = raw_edge
+        best_dist = snap_t + 1.0
+        for cand in candidates:
+            dist = abs(raw_edge - cand)
+            if dist <= snap_t and dist < best_dist:
+                snapped = cand
+                best_dist = dist
+        return snapped
+
     def _snap_tolerance_seconds(self) -> float:
         return SNAP_TOLERANCE_PX / max(1.0, self._pixels_per_second)
 
     def _iter_snap_edges(self, *, exclude_clip: Clip | None = None):
-        for track in self._project.tracks:
-            for clip in track.clips:
-                if exclude_clip is not None and clip is exclude_clip:
-                    continue
-                dur = clip.timeline_duration
-                if dur is None or dur <= 0.0:
-                    continue
-                start = max(0.0, float(clip.start))
-                yield start
-                yield start + float(dur)
+        yield from timeline_snap_times(self._project, exclude_clip=exclude_clip)
 
     def _snap_playhead_time(self, raw_seconds: float) -> float:
         # Ported from editor_app.py::handle_scrub
@@ -2713,6 +3147,35 @@ class TimelinePanel(QWidget):
         self.project_mutated.emit()
         self.seek_requested.emit(float(self._playhead_seconds))
 
+    def handle_clip_trim_change(
+        self,
+        clip: Clip,
+        *,
+        ripple: bool = False,
+        ripple_anchor_seconds: float = 0.0,
+        ripple_delta_seconds: float = 0.0,
+    ) -> None:
+        loc = self._find_clip_location(clip)
+        if loc is None:
+            self.refresh()
+            return
+        track, _, _ = loc
+        if self._is_track_locked(track):
+            self._refresh_and_reselect(clip)
+            return
+        if ripple and abs(float(ripple_delta_seconds)) > 1e-6:
+            ripple_shift_later_clips(
+                track,
+                anchor_seconds=float(ripple_anchor_seconds),
+                delta_seconds=float(ripple_delta_seconds),
+                exclude_clip=clip,
+            )
+        track.clips.sort(key=lambda c: c.start)
+        normalize_track_transitions(track)
+        self._refresh_and_reselect(clip)
+        self.project_mutated.emit()
+        self.seek_requested.emit(float(self._playhead_seconds))
+
     def handle_clip_release_by_clip(
         self,
         clip: Clip,
@@ -2789,6 +3252,9 @@ class TimelinePanel(QWidget):
         if abs(resolved_start - clip.start) > 1e-6:
             clip.start = resolved_start
         final_track.clips.sort(key=lambda c: c.start)
+        normalize_track_transitions(source_track)
+        if final_track is not source_track:
+            normalize_track_transitions(final_track)
 
         changed_track_count = len(self._project.tracks) != original_track_count
         changed_track = final_track is not source_track or target_idx != source_idx
@@ -3490,11 +3956,19 @@ class TimelinePanel(QWidget):
                     locked=self._is_track_locked(track),
                     hidden=self._is_track_hidden(track),
                     muted=self._is_track_muted(track),
+                    volume=track_output_gain(track),
+                    role=str(getattr(track, "role", "other") or "other"),
                     lane_height=lane_h,
                     background_color=lane_color,
                     on_toggle_lock=lambda tr=track: self._toggle_track_lock(tr),
                     on_toggle_hidden=lambda tr=track: self._toggle_track_hidden(tr),
                     on_toggle_mute=lambda tr=track: self._toggle_track_mute(tr),
+                    on_volume_changed=lambda value, commit, tr=track: self._set_track_volume(
+                        tr,
+                        value,
+                        commit=commit,
+                    ),
+                    on_role_changed=lambda role, tr=track: self._set_track_role(tr, role),
                 )
                 self.headers_list_layout.addWidget(header)
 
@@ -3584,6 +4058,8 @@ class TimelinePanel(QWidget):
             if bar.value() > max_scroll:
                 bar.setValue(max_scroll)
             self._draw_ruler(scene_w)
+            self._refresh_beat_markers()
+            self._refresh_transitions(tracks, lane_tops, lane_heights)
             self._refresh_playhead()
 
             for clip_id, item in self._clip_items_by_id.items():
@@ -3598,6 +4074,74 @@ class TimelinePanel(QWidget):
             QRectF(0.0, 0.0, max(1.0, scene_w), RULER_HEIGHT),
             QGraphicsScene.SceneLayer.ForegroundLayer,
         )
+
+    def _refresh_beat_markers(self) -> None:
+        scene_h = max(float(self._scene.height()), RULER_HEIGHT)
+        pen = QPen(QColor("#eab308"), 1, Qt.PenStyle.DashLine)
+        for marker in getattr(self._project, "beat_markers", []):
+            try:
+                seconds = max(0.0, float(marker.time))
+            except Exception:
+                continue
+            x = self.seconds_to_pixels(seconds)
+            line = self._add_transient(
+                self._scene.addLine(x, RULER_HEIGHT, x, scene_h, pen)
+            )
+            line.setZValue(650)
+
+    def _refresh_transitions(
+        self,
+        tracks: list[Track],
+        lane_tops: list[float],
+        lane_heights: list[float],
+    ) -> None:
+        badge_font = QFont("Inter", 7, QFont.Weight.DemiBold)
+        for track_idx, track in enumerate(tracks):
+            if track.kind not in {"video", "audio"}:
+                continue
+            if track_idx >= len(lane_tops) or track_idx >= len(lane_heights):
+                continue
+            lane_top = float(lane_tops[track_idx])
+            lane_h = float(lane_heights[track_idx])
+            for transition in track.transitions:
+                from_index = int(transition.from_index)
+                if int(transition.to_index) != from_index + 1:
+                    continue
+                if from_index < 0 or from_index + 1 >= len(track.clips):
+                    continue
+                if transition_duration_limit(track, from_index) <= 0.0:
+                    continue
+                left = track.clips[from_index]
+                left_end = _clip_timeline_end(left)
+                if left_end is None:
+                    continue
+                width = max(34.0, min(96.0, self.seconds_to_pixels(float(transition.duration)) * 2.0))
+                height = 18.0
+                x = self.seconds_to_pixels(left_end) - (width * 0.5)
+                y = lane_top + max(4.0, (lane_h - height) * 0.5)
+                rect = QRectF(x, y, width, height)
+                path = QPainterPath()
+                path.addRoundedRect(rect, 5.0, 5.0)
+                badge = self._add_transient(
+                    self._scene.addPath(
+                        path,
+                        QPen(QColor("#f8fafc"), 1.0),
+                        QBrush(QColor(34, 211, 197, 190)),
+                    )
+                )
+                badge.setZValue(620)
+                label = TRANSITION_KIND_LABELS.get(
+                    str(transition.kind),
+                    str(transition.kind).title(),
+                )
+                text = self._add_transient(self._scene.addSimpleText(label, badge_font))
+                text.setBrush(QBrush(QColor("#071317")))
+                text_rect = text.boundingRect()
+                text.setPos(
+                    rect.center().x() - text_rect.width() * 0.5,
+                    rect.center().y() - text_rect.height() * 0.5 - 0.5,
+                )
+                text.setZValue(621)
 
     def _refresh_playhead(self) -> None:
         self._remove_transient_item(self._playhead_item)
@@ -3755,6 +4299,26 @@ class TimelinePanel(QWidget):
         act_split = menu.addAction("Split At Playhead")
         act_split.triggered.connect(self.split_at_playhead)
 
+        menu.addSeparator()
+        transition_target = self._transition_target_from_selection_or_clip(clip)
+        add_transition_menu = menu.addMenu("Add Transition")
+        add_transition_menu.setEnabled(transition_target is not None)
+        for kind in COMMON_TRANSITION_KINDS:
+            label = TRANSITION_KIND_LABELS.get(kind, str(kind).title())
+            action = add_transition_menu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, k=kind, c=clip: self.add_transition_for_selection_or_clip(
+                    c,
+                    kind=k,
+                )
+            )
+        remove_target = self._transition_remove_target_from_selection_or_clip(clip)
+        act_remove_transition = menu.addAction("Remove Nearby Transition")
+        act_remove_transition.setEnabled(remove_target is not None)
+        act_remove_transition.triggered.connect(
+            lambda checked=False, c=clip: self.remove_transition_for_selection_or_clip(c)
+        )
+
         menu.exec(screen_pos)
 
     def _toggle_track_lock(self, track: Track) -> None:
@@ -3773,6 +4337,33 @@ class TimelinePanel(QWidget):
         self.refresh()
         self.project_mutated.emit()
         self.seek_requested.emit(float(self._playhead_seconds))
+
+    def _set_track_volume(self, track: Track, volume: float, *, commit: bool) -> None:
+        old = track_output_gain(track)
+        new = set_track_volume(track, volume)
+        changed = abs(new - old) > 1e-6
+        track_id = id(track)
+        if not commit:
+            if changed:
+                self._pending_track_volume_commits.add(track_id)
+                self.seek_requested.emit(float(self._playhead_seconds))
+            return
+
+        had_pending = track_id in self._pending_track_volume_commits
+        self._pending_track_volume_commits.discard(track_id)
+        if not changed and not had_pending:
+            return
+        self.refresh()
+        self.project_mutated.emit()
+        self.seek_requested.emit(float(self._playhead_seconds))
+
+    def _set_track_role(self, track: Track, role: str) -> None:
+        old = str(getattr(track, "role", "other") or "other")
+        new = set_track_role(track, role)
+        if new == old:
+            return
+        self.refresh()
+        self.project_mutated.emit()
 
     def handle_external_media_drop(self, path: Path, view_pos: QPoint) -> bool:
         if not self._project.tracks:
@@ -3902,6 +4493,97 @@ class TimelinePanel(QWidget):
     def delete_right_of_selected_clip(self) -> None:
         self._delete_side_clips("right")
 
+    def _transition_pair_from_selection(self) -> tuple[Track, int] | None:
+        selected = self.selected_clips()
+        if len(selected) != 2:
+            return None
+        locs = [self._find_clip_location(clip) for clip in selected]
+        if locs[0] is None or locs[1] is None:
+            return None
+        track = locs[0][0]
+        if locs[1][0] is not track:
+            return None
+        if track.kind not in {"video", "audio"} or self._is_track_locked(track):
+            return None
+        from_index = adjacent_pair_from_clips(track, selected)
+        if from_index is None:
+            return None
+        return track, from_index
+
+    def _transition_target_from_selection_or_clip(self, clip: Clip) -> tuple[Track, int] | None:
+        selected_pair = self._transition_pair_from_selection()
+        if selected_pair is not None:
+            track, from_index = selected_pair
+            if transition_duration_limit(track, from_index) >= 0.05:
+                return selected_pair
+            return None
+        loc = self._find_clip_location(clip)
+        if loc is None:
+            return None
+        track, _, clip_idx = loc
+        if track.kind not in {"video", "audio"} or self._is_track_locked(track):
+            return None
+        candidates = []
+        if clip_idx < len(track.clips) - 1:
+            candidates.append(clip_idx)
+        if clip_idx > 0:
+            candidates.append(clip_idx - 1)
+        for from_index in candidates:
+            if transition_duration_limit(track, from_index) >= 0.05:
+                return track, from_index
+        return None
+
+    def _transition_remove_target_from_selection_or_clip(self, clip: Clip) -> tuple[Track, int] | None:
+        selected_pair = self._transition_pair_from_selection()
+        if selected_pair is not None:
+            track, from_index = selected_pair
+            return selected_pair if find_transition(track, from_index) is not None else None
+        loc = self._find_clip_location(clip)
+        if loc is None:
+            return None
+        track, _, clip_idx = loc
+        if track.kind not in {"video", "audio"} or self._is_track_locked(track):
+            return None
+        for from_index in (clip_idx, clip_idx - 1):
+            if from_index < 0:
+                continue
+            if find_transition(track, from_index) is not None:
+                return track, from_index
+        return None
+
+    def add_transition_for_selection_or_clip(self, clip: Clip, *, kind: str = "fade") -> None:
+        target = self._transition_target_from_selection_or_clip(clip)
+        if target is None:
+            return
+        track, from_index = target
+        try:
+            set_track_transition(
+                track,
+                from_index,
+                kind=kind,  # type: ignore[arg-type]
+                duration=DEFAULT_TRANSITION_DURATION,
+            )
+        except ValueError:
+            return
+        pair = track.clips[from_index : from_index + 2]
+        self.refresh()
+        self.select_clips(pair)
+        self.project_mutated.emit()
+        self.seek_requested.emit(float(self._playhead_seconds))
+
+    def remove_transition_for_selection_or_clip(self, clip: Clip) -> None:
+        target = self._transition_remove_target_from_selection_or_clip(clip)
+        if target is None:
+            return
+        track, from_index = target
+        pair = track.clips[from_index : from_index + 2]
+        if not remove_track_transition(track, from_index):
+            return
+        self.refresh()
+        self.select_clips(pair)
+        self.project_mutated.emit()
+        self.seek_requested.emit(float(self._playhead_seconds))
+
     def _delete_side_clips(self, side: str) -> None:
         selected_items = self._selected_clip_items()
         if not selected_items:
@@ -3913,14 +4595,24 @@ class TimelinePanel(QWidget):
         track, _, clip_idx = loc
         if self._is_track_locked(track):
             return
+        old_clips = list(track.clips)
+        old_transitions = list(track.transitions)
         if side == "left":
             if clip_idx <= 0:
                 return
+            removed_indices = set(range(0, clip_idx))
             del track.clips[:clip_idx]
         else:
             if clip_idx >= len(track.clips) - 1:
                 return
+            removed_indices = set(range(clip_idx + 1, len(old_clips)))
             del track.clips[clip_idx + 1 :]
+        reindex_transitions_after_clip_delete(
+            track,
+            removed_indices,
+            old_transitions,
+            old_clip_count=len(old_clips),
+        )
         self._auto_clean_empty_tracks()
         self._refresh_and_reselect(selected)
         self.project_mutated.emit()
@@ -3948,6 +4640,7 @@ class TimelinePanel(QWidget):
         right = clip.model_copy(update={"in_point": cut_out, "start": t_sec})
         track.clips[clip_idx : clip_idx + 1] = [left, right]
         track.clips.sort(key=lambda c: c.start)
+        normalize_track_transitions(track)
         self._auto_clean_empty_tracks()
         self._refresh_and_reselect(right)
         self.project_mutated.emit()
@@ -3960,9 +4653,7 @@ class TimelinePanel(QWidget):
         for track in self._project.tracks:
             if self._is_track_locked(track):
                 continue
-            before = len(track.clips)
-            track.clips = [clip for clip in track.clips if id(clip) not in selected_ids]
-            if len(track.clips) != before:
+            if ripple_delete_clips_from_track(track, selected_ids):
                 changed = True
         if not changed:
             return
@@ -3978,5 +4669,5 @@ class TimelinePanel(QWidget):
         super().showEvent(event)
         self._schedule_refresh()
 
-__all__ = ["TimelinePanel"]
+__all__ = ["TimelinePanel", "timeline_snap_times"]
 

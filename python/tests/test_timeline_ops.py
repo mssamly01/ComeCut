@@ -10,6 +10,13 @@ from __future__ import annotations
 import pytest
 
 from comecut_py.core.project import Clip, Project, Track
+from comecut_py.gui.widgets.timeline import (
+    ripple_delete_clips_from_track,
+    timeline_snap_times,
+    trim_clip_edge,
+)
+from comecut_py.core.beat_markers import add_beat_marker
+from comecut_py.core.transitions import set_track_transition
 
 
 def _split_at(project: Project, t: float) -> None:
@@ -38,11 +45,7 @@ def _ripple_delete(project: Project, target: Clip) -> None:
     for track in project.tracks:
         if target not in track.clips:
             continue
-        d = target.timeline_duration or 0.0
-        idx = track.clips.index(target)
-        track.clips.pop(idx)
-        for later in track.clips[idx:]:
-            later.start = max(0.0, later.start - d)
+        ripple_delete_clips_from_track(track, {id(target)})
         return
 
 
@@ -122,6 +125,25 @@ def test_ripple_delete_non_negative_start():
     assert v.clips[0].start == pytest.approx(0.0)
 
 
+def test_ripple_delete_reindexes_surviving_transitions():
+    v = Track(kind="video")
+    c1 = Clip(source="a", in_point=0, out_point=2, start=0)
+    c2 = Clip(source="b", in_point=0, out_point=2, start=2)
+    c3 = Clip(source="c", in_point=0, out_point=2, start=4)
+    c4 = Clip(source="d", in_point=0, out_point=2, start=6)
+    v.clips.extend([c1, c2, c3, c4])
+    set_track_transition(v, 0, duration=0.2)
+    set_track_transition(v, 2, kind="dissolve", duration=0.3)
+
+    ripple_delete_clips_from_track(v, {id(c2)})
+
+    assert [c.source for c in v.clips] == ["a", "c", "d"]
+    assert len(v.transitions) == 1
+    assert v.transitions[0].from_index == 1
+    assert v.transitions[0].to_index == 2
+    assert v.transitions[0].kind == "dissolve"
+
+
 def test_snap_candidates_include_zero_and_clip_edges():
     """The snap helper is pure arithmetic, so test it via a minimal stand-in."""
     from comecut_py.gui.widgets.timeline import PIXELS_PER_SECOND, SNAP_TOLERANCE_PX
@@ -142,3 +164,84 @@ def test_snap_candidates_include_zero_and_clip_edges():
     assert snap(400) == 400
     # Near zero — snap to zero.
     assert snap(3) == 0
+
+
+def test_timeline_snap_times_include_beat_markers_and_exclude_moving_clip():
+    p = Project()
+    moving = Clip(source="a", in_point=0, out_point=2, start=0)
+    other = Clip(source="b", in_point=0, out_point=1, start=5)
+    p.tracks.append(Track(kind="video", clips=[moving, other]))
+    add_beat_marker(p, 3.5, label="Beat")
+
+    assert timeline_snap_times(p, exclude_clip=moving) == [0.0, 3.5, 5.0, 6.0]
+
+
+def test_trim_left_updates_start_and_in_point():
+    v = Track(kind="video")
+    c = Clip(source="a.mp4", in_point=2, out_point=12, start=5)
+    v.clips.append(c)
+
+    changed, ripple_delta = trim_clip_edge(v, c, "left", 7.0)
+
+    assert changed is True
+    assert ripple_delta == pytest.approx(0.0)
+    assert c.start == pytest.approx(7.0)
+    assert c.in_point == pytest.approx(4.0)
+    assert c.out_point == pytest.approx(12.0)
+    assert c.timeline_duration == pytest.approx(8.0)
+
+
+def test_trim_left_respects_speed():
+    v = Track(kind="video")
+    c = Clip(source="a.mp4", in_point=2, out_point=12, start=5, speed=2.0)
+    v.clips.append(c)
+
+    changed, _ = trim_clip_edge(v, c, "left", 6.0)
+
+    assert changed is True
+    assert c.start == pytest.approx(6.0)
+    assert c.in_point == pytest.approx(4.0)
+    assert c.timeline_duration == pytest.approx(4.0)
+
+
+def test_trim_right_updates_out_point():
+    v = Track(kind="video")
+    c = Clip(source="a.mp4", in_point=0, out_point=10, start=0)
+    v.clips.append(c)
+
+    changed, ripple_delta = trim_clip_edge(v, c, "right", 6.0)
+
+    assert changed is True
+    assert ripple_delta == pytest.approx(0.0)
+    assert c.start == pytest.approx(0.0)
+    assert c.in_point == pytest.approx(0.0)
+    assert c.out_point == pytest.approx(6.0)
+    assert c.timeline_duration == pytest.approx(6.0)
+
+
+def test_trim_right_ripple_shifts_later_clips():
+    v = Track(kind="video")
+    c1 = Clip(source="a.mp4", in_point=0, out_point=10, start=0)
+    c2 = Clip(source="b.mp4", in_point=0, out_point=3, start=10)
+    c3 = Clip(source="c.mp4", in_point=0, out_point=2, start=13)
+    v.clips.extend([c1, c2, c3])
+
+    changed, ripple_delta = trim_clip_edge(v, c1, "right", 6.0, ripple=True)
+
+    assert changed is True
+    assert ripple_delta == pytest.approx(-4.0)
+    assert c1.out_point == pytest.approx(6.0)
+    assert c2.start == pytest.approx(6.0)
+    assert c3.start == pytest.approx(9.0)
+
+
+def test_trim_clamps_to_minimum_duration():
+    v = Track(kind="video")
+    c = Clip(source="a.mp4", in_point=0, out_point=10, start=0)
+    v.clips.append(c)
+
+    changed, _ = trim_clip_edge(v, c, "right", 0.0, min_duration_seconds=0.25)
+
+    assert changed is True
+    assert c.out_point == pytest.approx(0.25)
+    assert c.timeline_duration == pytest.approx(0.25)
