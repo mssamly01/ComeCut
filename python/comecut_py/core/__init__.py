@@ -2,9 +2,44 @@
 
 from .capcut_exporter import export_to_capcut
 from .capcut_importer import import_capcut_draft, is_capcut_format
+from .audio_mixer import (
+    AUDIO_ROLE_LABELS,
+    audible_audio_tracks,
+    clamp_track_volume,
+    is_audio_track_enabled,
+    set_track_role,
+    set_track_volume,
+    track_output_gain,
+)
+from .auto_ducking import (
+    AutoDuckingConfig,
+    apply_auto_ducking_to_tracks,
+    build_ducking_keyframes_for_clip,
+    collect_role_intervals,
+    merge_ducking_intervals,
+    merge_volume_keyframes,
+)
+from .beat_markers import (
+    add_beat_marker,
+    beat_marker_times,
+    remove_near_beat_marker,
+    sorted_beat_markers,
+)
+from .effect_presets import (
+    apply_effect_payload,
+    apply_effect_preset,
+    clip_effects_from_payload,
+    copy_clip_effects,
+    effect_payload_from_clip,
+    list_effect_presets,
+    load_effect_preset,
+    load_effects_from_preset,
+    save_effect_preset,
+)
 from .ffmpeg_cmd import FFmpegCommand, ensure_ffmpeg, ensure_ffprobe
 from .media_probe import MediaInfo, probe
 from .project import (
+    BeatMarker,
     ChromaKey,
     Clip,
     ClipAudioEffects,
@@ -16,6 +51,14 @@ from .project import (
     TextOverlay,
     Track,
 )
+from .project_templates import (
+    list_project_templates,
+    load_project_template,
+    new_project_from_template,
+    project_from_template_payload,
+    project_template_payload_from_project,
+    save_project_template,
+)
 from .library_resolver import (
     collect_search_dirs,
     resolve_entry,
@@ -23,10 +66,32 @@ from .library_resolver import (
 )
 from .project_draft_adapter import is_v2_format, project_to_v2, v2_to_project
 from .project_schema_v2 import ProjectV2
+from .text_style_presets import (
+    apply_text_style_payload,
+    apply_text_style_preset,
+    copy_text_style,
+    list_text_style_presets,
+    save_text_style_preset,
+    text_style_payload_from_clip,
+)
 from .time_utils import format_timecode, parse_timecode
+from .transitions import (
+    COMMON_TRANSITION_KINDS,
+    DEFAULT_TRANSITION_DURATION,
+    MIN_TRANSITION_DURATION,
+    adjacent_pair_from_clips,
+    clamp_transition_duration,
+    find_transition,
+    normalize_track_transitions,
+    reindex_transitions_after_clip_delete,
+    remove_track_transition,
+    set_track_transition,
+    transition_duration_limit,
+)
 
 __all__ = [
     "ChromaKey",
+    "BeatMarker",
     "Clip",
     "ClipAudioEffects",
     "ClipEffects",
@@ -37,7 +102,30 @@ __all__ = [
     "ProjectV2",
     "TextOverlay",
     "Track",
+    "AUDIO_ROLE_LABELS",
+    "AutoDuckingConfig",
+    "COMMON_TRANSITION_KINDS",
+    "DEFAULT_TRANSITION_DURATION",
+    "MIN_TRANSITION_DURATION",
+    "add_beat_marker",
+    "adjacent_pair_from_clips",
+    "apply_text_style_payload",
+    "apply_text_style_preset",
+    "apply_auto_ducking_to_tracks",
+    "apply_effect_payload",
+    "apply_effect_preset",
+    "audible_audio_tracks",
+    "beat_marker_times",
+    "build_ducking_keyframes_for_clip",
+    "clip_effects_from_payload",
+    "clamp_transition_duration",
+    "clamp_track_volume",
     "collect_search_dirs",
+    "collect_role_intervals",
+    "copy_clip_effects",
+    "copy_text_style",
+    "effect_payload_from_clip",
+    "find_transition",
     "resolve_entry",
     "resolve_project_library",
     "ensure_ffmpeg",
@@ -47,8 +135,34 @@ __all__ = [
     "import_capcut_draft",
     "is_v2_format",
     "is_capcut_format",
+    "is_audio_track_enabled",
+    "list_effect_presets",
+    "list_project_templates",
+    "list_text_style_presets",
+    "load_effect_preset",
+    "load_effects_from_preset",
+    "load_project_template",
+    "merge_ducking_intervals",
+    "merge_volume_keyframes",
+    "new_project_from_template",
+    "normalize_track_transitions",
     "parse_timecode",
     "probe",
+    "project_from_template_payload",
+    "project_template_payload_from_project",
     "project_to_v2",
+    "remove_near_beat_marker",
+    "remove_track_transition",
+    "reindex_transitions_after_clip_delete",
+    "set_track_role",
+    "set_track_transition",
+    "set_track_volume",
+    "sorted_beat_markers",
+    "save_effect_preset",
+    "save_project_template",
+    "save_text_style_preset",
+    "text_style_payload_from_clip",
+    "track_output_gain",
+    "transition_duration_limit",
     "v2_to_project",
 ]

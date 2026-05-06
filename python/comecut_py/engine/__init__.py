@@ -6,6 +6,14 @@ list for a dry-run / logging.
 """
 
 from .audio import adjust_volume, extract_audio
+from .audio_levels import (
+    AudioLevelStats,
+    amplitude_to_dbfs,
+    analyze_audio_levels,
+    audio_clipping_warning,
+    build_audio_level_command,
+    parse_pcm_s16le_levels,
+)
 from .concat import concat
 from .cut import cut
 from .ducking import duck
@@ -13,15 +21,25 @@ from .freeze_frame import freeze_frame
 from .loudnorm import loudnorm_twopass
 from .overlay_text import burn_bilingual_subtitles, burn_subtitles, overlay_text
 from .presets import PRESETS, ExportPreset, preset_output_args
-from .render import render_project, render_project_twopass
+from .render import (
+    render_project,
+    render_project_audio_only,
+    render_project_still_frame,
+    render_project_twopass,
+)
 from .stabilize import stabilize
 from .trim import trim
 from .zoompan import zoompan_image
 
 __all__ = [
     "PRESETS",
+    "AudioLevelStats",
     "ExportPreset",
     "adjust_volume",
+    "amplitude_to_dbfs",
+    "analyze_audio_levels",
+    "audio_clipping_warning",
+    "build_audio_level_command",
     "burn_bilingual_subtitles",
     "burn_subtitles",
     "concat",
@@ -31,8 +49,11 @@ __all__ = [
     "freeze_frame",
     "loudnorm_twopass",
     "overlay_text",
+    "parse_pcm_s16le_levels",
     "preset_output_args",
     "render_project",
+    "render_project_audio_only",
+    "render_project_still_frame",
     "render_project_twopass",
     "stabilize",
     "trim",

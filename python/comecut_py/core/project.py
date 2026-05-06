@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, NonNegativeFloat, PositiveInt, field_vali
 
 TrackKind = Literal["video", "audio", "text"]
 TextDisplayMode = Literal["main", "second", "bilingual"]
+AudioRole = Literal["voice", "music", "sfx", "ambience", "other"]
 
 TransitionKind = Literal[
     "fade",
@@ -204,6 +205,29 @@ class ClipEffects(BaseModel):
     )
 
 
+class Keyframe(BaseModel):
+    """A single ``(time, value)`` sample on an animated property.
+
+    ``time`` is measured in seconds relative to the project's global clock.
+    ``value`` is a plain float; per-property semantics (pixels, opacity,
+    gain multipliers, etc.) are documented on the owning field.
+    """
+
+    time: NonNegativeFloat
+    value: float
+
+
+def _validate_keyframes(kfs: list[Keyframe]) -> list[Keyframe]:
+    """Ensure keyframes are sorted by time and have strictly unique times."""
+    if len(kfs) <= 1:
+        return kfs
+    ordered = sorted(kfs, key=lambda k: k.time)
+    for a, b in zip(ordered, ordered[1:], strict=False):
+        if a.time == b.time:
+            raise ValueError(f"duplicate keyframe time: {a.time}")
+    return ordered
+
+
 class Clip(BaseModel):
     """A single media clip placed on a track."""
 
@@ -226,6 +250,15 @@ class Clip(BaseModel):
     )
     start: NonNegativeFloat = Field(0.0, description="Timeline start position (s).")
     volume: float = Field(1.0, ge=0.0, description="Audio gain multiplier.")
+    opacity: float = Field(1.0, ge=0.0, le=1.0, description="Video opacity multiplier.")
+    volume_keyframes: list[Keyframe] = Field(
+        default_factory=list,
+        description="Audio gain keyframes over global timeline time. Empty = use static volume.",
+    )
+    opacity_keyframes: list[Keyframe] = Field(
+        default_factory=list,
+        description="Video opacity keyframes over global timeline time. Empty = use static opacity.",
+    )
     speed: float = Field(1.0, gt=0.0, description="Playback speed multiplier.")
     reverse: bool = Field(
         False, description="Play the clip backwards (video + audio are both reversed)."
@@ -297,6 +330,11 @@ class Clip(BaseModel):
             raise ValueError(f"out_point ({v}) must be greater than in_point ({in_point})")
         return v
 
+    @field_validator("volume_keyframes", "opacity_keyframes")
+    @classmethod
+    def _check_keyframes(cls, v: list[Keyframe]):
+        return _validate_keyframes(v)
+
     @property
     def source_duration(self) -> float | None:
         """Duration consumed from the source (``None`` if open-ended)."""
@@ -315,30 +353,6 @@ class Clip(BaseModel):
     @property
     def is_text_clip(self) -> bool:
         return self.clip_type == "text"
-
-
-class Keyframe(BaseModel):
-    """A single ``(time, value)`` sample on an animated property.
-
-    ``time`` is measured in seconds **relative to the project's global clock**
-    — the same unit as :attr:`TextOverlay.start`. ``value`` is a plain float;
-    per-property semantics (pixels, 0..1 opacity, pixel offsets, etc.) are
-    documented on the owning field.
-    """
-
-    time: NonNegativeFloat
-    value: float
-
-
-def _validate_keyframes(kfs: list[Keyframe]) -> list[Keyframe]:
-    """Ensure keyframes are sorted by time and have strictly unique times."""
-    if len(kfs) <= 1:
-        return kfs
-    ordered = sorted(kfs, key=lambda k: k.time)
-    for a, b in zip(ordered, ordered[1:], strict=False):
-        if a.time == b.time:
-            raise ValueError(f"duplicate keyframe time: {a.time}")
-    return ordered
 
 
 class TextOverlay(BaseModel):
@@ -426,6 +440,19 @@ class Track(BaseModel):
     locked: bool = False
     hidden: bool = False
     muted: bool = False
+    volume: float = Field(1.0, ge=0.0, description="Track gain multiplier for mixer/render.")
+    role: AudioRole = Field("other", description="Audio mixer role used by ducking/presets.")
+
+
+class BeatMarker(BaseModel):
+    """A local timeline beat/snap marker."""
+
+    time: NonNegativeFloat = Field(..., description="Timeline position in seconds.")
+    label: str = Field("Beat", description="User-visible marker label.")
+    source: Literal["manual", "detected"] = Field(
+        "manual",
+        description="Whether the marker was placed by the user or generated locally.",
+    )
 
 
 class LibraryEntry(BaseModel):
@@ -467,6 +494,10 @@ class Project(BaseModel):
     fps: float = Field(30.0, gt=0)
     sample_rate: PositiveInt = 48_000
     tracks: list[Track] = Field(default_factory=list)
+    beat_markers: list[BeatMarker] = Field(
+        default_factory=list,
+        description="Local beat markers used as timeline snap anchors.",
+    )
 
     # ---- library --------------------------------------------------------
     # Stored in legacy current.json only; V2 round-trip is informational.
@@ -554,6 +585,8 @@ __all__ = [
     "TextDisplayMode",
     "Track",
     "TrackKind",
+    "AudioRole",
+    "BeatMarker",
     "Transition",
     "TransitionKind",
 ]

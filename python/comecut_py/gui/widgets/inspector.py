@@ -20,8 +20,10 @@ from PySide6.QtWidgets import (  # type: ignore
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -39,6 +41,13 @@ from PySide6.QtWidgets import (  # type: ignore
 )
 
 from ...core.project import Clip, Project, Track
+from ...core.text_style_presets import (
+    apply_text_style_payload,
+    apply_text_style_preset,
+    list_text_style_presets,
+    save_text_style_preset,
+    text_style_payload_from_clip,
+)
 from ...subtitles.cue import Cue, CueList
 from .inspector_audio import AudioPropertiesBox
 from .inspector_video import VideoPropertiesBox
@@ -1172,6 +1181,20 @@ class _ProjectInfoTab(QWidget):
         stroke_layout.addWidget(self._text_stroke_width, 1)
         text_form.addRow("Stroke", stroke_row)
 
+        # Local text style presets
+        preset_row = QWidget()
+        preset_layout = QHBoxLayout(preset_row)
+        preset_layout.setContentsMargins(0, 0, 0, 0)
+        preset_layout.setSpacing(6)
+        self._text_preset_combo = QComboBox()
+        self._text_preset_combo.setMinimumContentsLength(14)
+        self._btn_apply_text_preset = QPushButton("Apply")
+        self._btn_save_text_preset = QPushButton("Save")
+        preset_layout.addWidget(self._text_preset_combo, 1)
+        preset_layout.addWidget(self._btn_apply_text_preset)
+        preset_layout.addWidget(self._btn_save_text_preset)
+        text_form.addRow("Preset", preset_row)
+
         # Apply track style
         apply_row = QWidget()
         apply_layout = QHBoxLayout(apply_row)
@@ -1318,8 +1341,11 @@ class _ProjectInfoTab(QWidget):
         self._stroke_color_btn.clicked.connect(self._pick_stroke_color)
         self._main_translate_btn.clicked.connect(self._on_translate_clicked)
         self._second_translate_btn.clicked.connect(self._on_translate_clicked)
+        self._btn_apply_text_preset.clicked.connect(self._apply_selected_text_preset)
+        self._btn_save_text_preset.clicked.connect(self._save_current_text_preset)
         self._btn_apply_style.clicked.connect(self._apply_style_to_track)
 
+        self._refresh_text_preset_combo()
         self.set_clip(None)
 
     # ---- public API -----------------------------------------------------
@@ -1442,6 +1468,7 @@ class _ProjectInfoTab(QWidget):
                 self._set_display_buttons(c.text_display)
                 self._refresh_display_visibility(c.text_display)
                 self._refresh_text_row_backgrounds()
+                self._refresh_text_preset_combo()
             else:
                 self._text_box.setVisible(False)
                 if resolved_track_kind == "audio":
@@ -1551,6 +1578,9 @@ class _ProjectInfoTab(QWidget):
             self._stroke_color_btn,
             self._main_translate_btn,
             self._second_translate_btn,
+            self._text_preset_combo,
+            self._btn_apply_text_preset,
+            self._btn_save_text_preset,
             self._btn_apply_style,
         )
         for w in controls:
@@ -1559,6 +1589,7 @@ class _ProjectInfoTab(QWidget):
             w.setEnabled(enabled)
             if not block and hasattr(w, "blockSignals"):
                 w.blockSignals(False)
+        self._update_text_preset_button_state()
 
     def _reset_text_defaults(self) -> None:
         self._transform_x.setValue(0)
@@ -1581,6 +1612,7 @@ class _ProjectInfoTab(QWidget):
         self._set_display_buttons("main")
         self._refresh_display_visibility("main")
         self._refresh_text_row_backgrounds()
+        self._refresh_text_preset_combo()
         self._btn_apply_style.setChecked(False)
         self._btn_apply_style.setText("[ ] Apply the style to this track")
         self._btn_transform_toggle.setChecked(True)
@@ -1738,6 +1770,70 @@ class _ProjectInfoTab(QWidget):
             "[x] Apply the style to this track" if active else "[ ] Apply the style to this track"
         )
 
+    def _refresh_text_preset_combo(self, select_name: str | None = None) -> None:
+        if not hasattr(self, "_text_preset_combo"):
+            return
+        current = select_name or str(self._text_preset_combo.currentData() or "")
+        self._text_preset_combo.blockSignals(True)
+        self._text_preset_combo.clear()
+        presets = list_text_style_presets()
+        if not presets:
+            self._text_preset_combo.addItem("No presets yet", None)
+        else:
+            for preset in presets:
+                self._text_preset_combo.addItem(preset.name, preset.name)
+        if current:
+            index = self._text_preset_combo.findData(current)
+            if index >= 0:
+                self._text_preset_combo.setCurrentIndex(index)
+        self._text_preset_combo.blockSignals(False)
+        self._update_text_preset_button_state()
+
+    def _update_text_preset_button_state(self) -> None:
+        if not hasattr(self, "_btn_apply_text_preset"):
+            return
+        has_clip = self._clip is not None and self._clip.is_text_clip
+        has_preset = bool(self._text_preset_combo.currentData())
+        self._text_preset_combo.setEnabled(has_clip)
+        self._btn_save_text_preset.setEnabled(has_clip)
+        self._btn_apply_text_preset.setEnabled(has_clip and has_preset)
+
+    def _save_current_text_preset(self) -> None:
+        c = self._clip
+        if c is None or not c.is_text_clip:
+            return
+        default_name = ((c.text_main or "").strip().splitlines() or ["Text Style"])[0]
+        default_name = default_name[:40].strip() or "Text Style"
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save text style preset",
+            "Preset name:",
+            text=default_name,
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        try:
+            save_text_style_preset(name, c)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            QMessageBox.warning(self, "Save preset failed", str(exc))
+            return
+        self._refresh_text_preset_combo(select_name=name)
+
+    def _apply_selected_text_preset(self) -> None:
+        c = self._clip
+        name = str(self._text_preset_combo.currentData() or "")
+        if c is None or not c.is_text_clip or not name:
+            return
+        try:
+            apply_text_style_preset(c, name)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            QMessageBox.warning(self, "Apply preset failed", str(exc))
+            return
+        track_kind = self._track_kind
+        self.set_clip(c, track_kind=track_kind)
+        self._emit_clip_changed()
+
     def _pick_text_color(self, *, second: bool) -> None:
         if self._clip is None or not self._clip.is_text_clip:
             return
@@ -1786,18 +1882,11 @@ class _ProjectInfoTab(QWidget):
             self._btn_apply_style.setChecked(False)
             return
 
+        payload = text_style_payload_from_clip(c)
         for clip in owner.clips:
             if clip is c or not clip.is_text_clip:
                 continue
-            # Keep content (text_main/text_second), copy style/display only.
-            clip.text_display = c.text_display
-            clip.text_font_family = c.text_font_family
-            clip.text_font_size = c.text_font_size
-            clip.text_color = c.text_color
-            clip.text_second_font_size = c.text_second_font_size
-            clip.text_second_color = c.text_second_color
-            clip.text_stroke_color = c.text_stroke_color
-            clip.text_stroke_width = c.text_stroke_width
+            apply_text_style_payload(clip, payload)
 
         self._style_anchor_clip_id = id(c)
         self._style_anchor_signature = self._current_style_signature()

@@ -40,12 +40,24 @@ from PySide6.QtWidgets import (  # type: ignore
 
 from ..core.ffmpeg_cmd import get_video_duration
 from ..core.media_probe import probe
+from ..core.auto_ducking import (
+    AutoDuckingConfig,
+    apply_auto_ducking_to_tracks,
+    collect_role_intervals,
+)
+from ..core.beat_markers import add_beat_marker, remove_near_beat_marker
+from ..core.audio_mixer import track_output_gain
+from ..core.project_templates import (
+    list_project_templates,
+    new_project_from_template,
+    save_project_template,
+)
 from ..core.time_utils import format_timecode
 from ..core.project import Clip, Project, Track
 from ..core.store import load_project as store_load_project
 from ..core.store import save_project as store_save_project
 from ..engine.proxy import make_proxy, proxy_path
-from ..engine import render_project
+from ..engine import render_project, render_project_audio_only, render_project_still_frame
 from ..i18n import t
 from ..subtitles.ass import parse_ass, write_ass
 from ..subtitles.cue import Cue, CueList
@@ -772,6 +784,7 @@ class MainWindow(QMainWindow):
             self.preview_panel.set_audio_gain(0.0)
             return
         base = max(0.0, float(getattr(clip, "volume", 1.0) or 0.0))
+        base *= track_output_gain(track)
         gain = base * self._preview_fade_multiplier(clip, timeline_seconds)
         self.preview_panel.set_audio_gain(gain)
 
@@ -850,6 +863,7 @@ class MainWindow(QMainWindow):
 
         source_ms = int(_timeline_to_source_seconds(audio_clip, timeline_seconds) * 1000.0)
         gain = max(0.0, float(audio_clip.volume or 0.0))
+        gain *= track_output_gain(track)
         gain *= self._preview_fade_multiplier(audio_clip, timeline_seconds)
         self.preview_panel.sync_timeline_audio(
             self._clip_preview_path(audio_clip),
@@ -1728,6 +1742,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(t("action.add_media"), self._add_media)
         file_menu.addAction(t("menu.file.export"), self._export_video)
+        file_menu.addAction("Export Still Frame...", self._export_still_frame)
         file_menu.addAction("Export Subtitles...", self._export_subtitles_manual)
         file_menu.addSeparator()
         file_menu.addAction(t("menu.file.quit"), self.close)
@@ -1744,6 +1759,30 @@ class MainWindow(QMainWindow):
             "Batch Translate Subtitle Track...", self._translate_selected_subtitle_track_batch
         )
 
+        # Templates Menu
+        templates_menu = menu.addMenu("Templates")
+        templates_menu.addAction(
+            "Save Project as Template...",
+            self._save_project_as_template,
+        )
+        templates_menu.addAction(
+            "New Project from Template...",
+            self._new_project_from_template,
+        )
+
+        # Audio Menu
+        audio_menu = menu.addMenu("Audio")
+        audio_menu.addAction(
+            "Auto Duck Music Under Voice",
+            self._auto_duck_music_under_voice,
+        )
+        audio_menu.addSeparator()
+        audio_menu.addAction("Add Beat Marker at Playhead", self._add_beat_marker_at_playhead)
+        audio_menu.addAction(
+            "Remove Beat Marker Near Playhead",
+            self._remove_beat_marker_near_playhead,
+        )
+
         # Help Menu
         help_menu = menu.addMenu(t("menu.help"))
         help_menu.addAction("Plugin Manager...", self._open_plugin_manager)
@@ -1751,6 +1790,142 @@ class MainWindow(QMainWindow):
 
         self._topbar_menu = menu
         self.topbar.menu_btn.clicked.connect(self._show_topbar_menu)
+
+    def _save_project_as_template(self) -> None:
+        default_name = (self.project.name or "Project Template").strip() or "Project Template"
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save project template",
+            "Template name:",
+            text=default_name,
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        try:
+            path = save_project_template(name, self.project)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save template failed", str(exc))
+            return
+        self.statusBar().showMessage(f"Project template saved: {path}", 5000)
+
+    def _new_project_from_template(self) -> None:
+        templates = list_project_templates()
+        if not templates:
+            QMessageBox.information(
+                self,
+                "Project templates",
+                "No project templates found. Save the current project layout as a template first.",
+            )
+            return
+        names = [preset.name for preset in templates]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "New project from template",
+            "Template:",
+            names,
+            0,
+            False,
+        )
+        if not accepted or not selected:
+            return
+        has_content = any(track.clips or track.overlays or track.image_overlays for track in self.project.tracks)
+        if has_content:
+            result = QMessageBox.question(
+                self,
+                "Replace current project?",
+                "This will replace the current timeline with a new empty project from the template. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            project = new_project_from_template(str(selected), project_name=str(selected))
+        except Exception as exc:
+            QMessageBox.warning(self, "Load template failed", str(exc))
+            return
+        self._apply_loaded_project(project)
+        self._store_project_id = None
+        self.statusBar().showMessage(f"New project created from template: {selected}", 5000)
+
+    def _auto_duck_music_under_voice(self) -> None:
+        voice_intervals = collect_role_intervals(self.project.tracks, ("voice",))
+        if not voice_intervals:
+            QMessageBox.information(
+                self,
+                "Auto duck",
+                "No audible Voice track found. Set an audio track role to Voice first.",
+            )
+            return
+
+        music_clip_count = sum(
+            len(track.clips)
+            for track in self.project.tracks
+            if track.kind == "audio"
+            and str(getattr(track, "role", "other") or "other").strip().lower() == "music"
+            and not bool(getattr(track, "hidden", False))
+            and not bool(getattr(track, "muted", False))
+        )
+        if music_clip_count <= 0:
+            QMessageBox.information(
+                self,
+                "Auto duck",
+                "No audible Music track found. Set a music track role to Music first.",
+            )
+            return
+
+        changed = apply_auto_ducking_to_tracks(
+            self.project.tracks,
+            config=AutoDuckingConfig(),
+            replace_existing=True,
+        )
+        if changed <= 0:
+            QMessageBox.information(
+                self,
+                "Auto duck",
+                "No overlapping Music clips were found under the Voice track.",
+            )
+            return
+
+        self.timeline_panel.refresh()
+        self.inspector_panel.refresh()
+        self._push_timeline_history()
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        self._on_timeline_seek(current)
+        self.statusBar().showMessage(
+            f"Auto ducked {changed} music clip(s) under voice.",
+            5000,
+        )
+
+    def _add_beat_marker_at_playhead(self) -> None:
+        seconds = max(0.0, float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
+        marker = add_beat_marker(
+            self.project,
+            seconds,
+            label=f"Beat {len(self.project.beat_markers) + 1}",
+            source="manual",
+        )
+        self.timeline_panel.refresh()
+        self._push_timeline_history()
+        self.statusBar().showMessage(
+            f"Beat marker added at {format_timecode(float(marker.time))}.",
+            4000,
+        )
+
+    def _remove_beat_marker_near_playhead(self) -> None:
+        seconds = max(0.0, float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
+        removed = remove_near_beat_marker(self.project, seconds, tolerance=0.08)
+        if not removed:
+            QMessageBox.information(
+                self,
+                "Beat marker",
+                "No beat marker found near the playhead.",
+            )
+            return
+        self.timeline_panel.refresh()
+        self._push_timeline_history()
+        self.statusBar().showMessage("Beat marker removed.", 4000)
 
     def _add_media(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, t("action.add_media"))
@@ -2615,8 +2790,9 @@ class MainWindow(QMainWindow):
         if dlg.exec() != ExportDialog.Accepted:
             return
         opts = dlg.get_options()
-        out_path = opts.output_path()
+        out_path = opts.video_output_path()
         video_ok = False
+        audio_ok = False
 
         if opts.video_enabled:
             try:
@@ -2632,9 +2808,28 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Export failed", str(e))
                 return
 
+        audio_path = opts.audio_output_path()
+        if opts.audio_enabled:
+            try:
+                cmd = render_project_audio_only(
+                    self.project,
+                    str(audio_path),
+                    audio_format=opts.audio_format,
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Audio export failed", str(e))
+                return
+            try:
+                self.statusBar().showMessage("Exporting audio...")
+                cmd.run(check=True)
+                audio_ok = True
+            except Exception as e:
+                QMessageBox.critical(self, "Audio export failed", str(e))
+                return
+
         subtitle_msg = ""
         if opts.subs_enabled:
-            sub_path = out_path.with_suffix(f".{opts.subs_format}")
+            sub_path = opts.subtitle_output_path()
             try:
                 count = self._write_subtitles_file(
                     sub_path,
@@ -2646,16 +2841,53 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Subtitle export failed", str(e))
                 return
 
-        if video_ok:
-            self.statusBar().showMessage(f"{t('status.done')} -> {out_path}{subtitle_msg}", 5000)
+        if video_ok or audio_ok:
+            parts: list[str] = []
+            if video_ok:
+                parts.append(f"video: {out_path.name}")
+            if audio_ok:
+                parts.append(f"audio: {audio_path.name}")
+            self.statusBar().showMessage(
+                f"{t('status.done')} -> {', '.join(parts)}{subtitle_msg}",
+                5000,
+            )
         elif subtitle_msg:
             self.statusBar().showMessage(f"Subtitle export done{subtitle_msg}", 5000)
         else:
             QMessageBox.information(
                 self,
                 "Export",
-                "Both Video and Subtitles are disabled. Nothing to export.",
+                "Video, Audio and Subtitles are disabled. Nothing to export.",
             )
+
+    def _export_still_frame(self) -> None:
+        playhead = max(0.0, float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", self.project.name or "frame").strip("._")
+        safe_name = safe_name or "frame"
+        default_path = Path.home() / "Pictures" / f"{safe_name}_{int(playhead * 1000):06d}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export still frame",
+            str(default_path),
+            "Images (*.png *.jpg *.jpeg *.webp)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(".png")
+        try:
+            cmd = render_project_still_frame(
+                self.project,
+                str(target),
+                at_seconds=playhead,
+            )
+            self.statusBar().showMessage("Exporting still frame...")
+            cmd.run(check=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Still frame export failed", str(e))
+            return
+        self.statusBar().showMessage(f"Still frame exported: {target}", 5000)
 
     def _open_plugin_manager(self, initial_tab: int = 0, *, modal: bool = True) -> None:
         """Open Plugin Manager.

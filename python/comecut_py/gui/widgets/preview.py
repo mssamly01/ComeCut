@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import re
@@ -33,6 +34,8 @@ from PySide6.QtWidgets import (  # type: ignore
     QWidget,
 )
 
+from ...engine.audio_levels import AudioLevelStats, analyze_audio_levels, audio_clipping_warning
+
 try:
     from PySide6.QtSvg import QSvgRenderer  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -42,6 +45,7 @@ ICON_NORMAL = "#8c93a0"
 ICON_ACTIVE = "#22d3c5"
 PREVIEW_PLAY_SEEK_INTERVAL_MS = 45
 PREVIEW_SCRUB_SEEK_INTERVAL_MS = 70
+PREVIEW_METER_WINDOW_SECONDS = 12.0
 
 _SYMBOL_RE = re.compile(
     r'<symbol\s+id="(?P<id>[^"]+)"(?P<attrs>[^>]*)>(?P<body>.*?)</symbol>',
@@ -133,6 +137,20 @@ def compute_preview_rects(
             max(project_rect.top(), min(video_rect.top(), project_rect.bottom() - video_rect.height() + 1))
         )
     return project_rect, video_rect
+
+
+def _inset_rect_by_ratio(rect: QRect, ratio: float) -> QRect:
+    if rect.isEmpty():
+        return QRect()
+    r = max(0.0, min(0.45, float(ratio)))
+    dx = int(round(rect.width() * r))
+    dy = int(round(rect.height() * r))
+    return rect.adjusted(dx, dy, -dx, -dy)
+
+
+def preview_safe_area_rects(project_rect: QRect) -> tuple[QRect, QRect]:
+    """Return action-safe and title-safe rectangles for the preview canvas."""
+    return _inset_rect_by_ratio(project_rect, 0.05), _inset_rect_by_ratio(project_rect, 0.10)
 
 
 # ---------------------------------------------------------------------------
@@ -269,12 +287,15 @@ class _VideoCanvas(QWidget):
             
             painter.drawImage(self._video_rect, img)
             painter.restore()
+
+            self._draw_canvas_guides(painter)
             
             if self._subtitle_main or self._subtitle_second:
                 self._draw_subtitles(painter, self._project_rect)
         else:
             self._project_rect = self.rect()
             self._video_rect = self.rect()
+            self._draw_canvas_guides(painter)
             # No frame - draw subtitle bar only if needed
             if self._subtitle_main or self._subtitle_second:
                 self._draw_subtitles(painter, self._project_rect)
@@ -303,6 +324,37 @@ class _VideoCanvas(QWidget):
         # Convert to a format QPainter handles well
         self._current_image = img.convertToFormat(QImage.Format.Format_RGB32)
         return self._current_image
+
+    def _draw_canvas_guides(self, painter: QPainter) -> None:
+        if not self._video_transform_enabled:
+            return
+        project_rect = self.project_rect
+        if project_rect.isEmpty() or project_rect.width() <= 2 or project_rect.height() <= 2:
+            return
+
+        action_safe, title_safe = preview_safe_area_rects(project_rect)
+        center = project_rect.center()
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        center_pen = QPen(QColor(255, 255, 255, 72), 1)
+        center_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(center_pen)
+        painter.drawLine(center.x(), project_rect.top(), center.x(), project_rect.bottom())
+        painter.drawLine(project_rect.left(), center.y(), project_rect.right(), center.y())
+
+        action_pen = QPen(QColor(34, 211, 197, 62), 1)
+        action_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(action_pen)
+        painter.drawRect(action_safe)
+
+        title_pen = QPen(QColor(255, 255, 255, 42), 1)
+        title_pen.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(title_pen)
+        painter.drawRect(title_safe)
+
+        painter.restore()
 
     def _subtitle_lines(self) -> list[str]:
         return [line for line in (self._subtitle_main, self._subtitle_second) if line]
@@ -906,6 +958,31 @@ def _fmt_time(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def _fmt_dbfs(value: float) -> str:
+    if not math.isfinite(value):
+        return "-inf dBFS"
+    return f"{value:.1f} dBFS"
+
+
+def format_audio_meter_summary(label: str, stats: AudioLevelStats | None) -> tuple[str, str, bool]:
+    """Return (short text, detailed text, warning) for preview meter UI."""
+    if stats is None or stats.total_samples <= 0:
+        return f"{label}: no audio", f"{label}: no analyzable audio in this window.", False
+
+    warning = audio_clipping_warning(stats)
+    short = f"{label}: Pk {_fmt_dbfs(stats.peak_dbfs)}"
+    detail = (
+        f"{label}\n"
+        f"Peak: {_fmt_dbfs(stats.peak_dbfs)}\n"
+        f"RMS: {_fmt_dbfs(stats.rms_dbfs)}\n"
+        f"Clipped samples: {stats.clipped_samples} "
+        f"({stats.clipped_ratio * 100.0:.3f}%)"
+    )
+    if warning:
+        detail += f"\nWarning: {warning}"
+    return short, detail, warning is not None
+
+
 def _load_preview_symbols() -> dict[str, tuple[str, str]]:
     global _SYMBOL_CACHE
     if _SYMBOL_CACHE is not None:
@@ -958,6 +1035,7 @@ class PreviewPanel(QWidget):
     ocr_cancelled = Signal()
     transform_changed = Signal(float, int, int, float)  # scale, x, y, rotate
     transform_finished = Signal()
+    _meter_result_ready = Signal(int, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1045,7 +1123,25 @@ class PreviewPanel(QWidget):
         self._meter_btn.setFixedSize(26, 26)
         self._meter_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._meter_btn.setToolTip("Preview meter")
+        self._meter_btn.clicked.connect(self._request_meter_analysis)
         right_layout.addWidget(self._meter_btn)
+
+        self._meter_badge = QLabel("")
+        self._meter_badge.setVisible(False)
+        self._meter_badge.setMinimumWidth(92)
+        self._meter_badge.setStyleSheet(
+            """
+            QLabel {
+                background: #111318;
+                border: 1px solid #27303a;
+                border-radius: 4px;
+                color: #a7f3d0;
+                font-size: 10px;
+                padding: 3px 6px;
+            }
+            """
+        )
+        right_layout.addWidget(self._meter_badge)
 
         self._aspect = QComboBox()
         self._aspect.addItems(["16:9", "9:16", "1:1", "4:3", "21:9"])
@@ -1096,6 +1192,12 @@ class PreviewPanel(QWidget):
             pass
         self._timeline_audio_source_path: str | None = None
         self._timeline_audio_last_seek_ms: int = -1
+        self._media_source_path: str | None = None
+        self._meter_token = 0
+        self._meter_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="preview-meter",
+        )
 
         self._duration_ms = 0
         self._pending_seek_ms: int | None = None
@@ -1114,6 +1216,7 @@ class PreviewPanel(QWidget):
         self._player.positionChanged.connect(self._on_position)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
         self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self._meter_result_ready.connect(self._on_meter_result_ready)
 
         self._apply_footer_icons()
         self._sync_play_icon()
@@ -1183,6 +1286,8 @@ class PreviewPanel(QWidget):
         self._pending_seek_ms = None
         self._last_seek_ms = -1
         self._seek_on_load_ms = 0
+        self._media_source_path = str(path)
+        self._clear_meter_status()
         self._player.pause()
         self._player.setSource(QUrl.fromLocalFile(str(path)))
         self.seek(0)
@@ -1196,6 +1301,8 @@ class PreviewPanel(QWidget):
         self._seek_on_load_ms = None
         self._last_seek_ms = -1
         self._duration_ms = 0
+        self._media_source_path = None
+        self._clear_meter_status()
         self._player.stop()
         self._player.setSource(QUrl())
         self.clear_timeline_audio()
@@ -1369,6 +1476,123 @@ class PreviewPanel(QWidget):
         self._timeline_audio_player.setSource(QUrl())
         self._timeline_audio_source_path = None
         self._timeline_audio_last_seek_ms = -1
+
+    def _meter_sources(self) -> list[tuple[str, str, float]]:
+        sources: list[tuple[str, str, float]] = []
+        if self._media_source_path:
+            sources.append(
+                (
+                    "Main preview",
+                    self._media_source_path,
+                    max(0.0, float(self._player.position()) / 1000.0),
+                )
+            )
+        if (
+            self._timeline_audio_source_path
+            and self._timeline_audio_source_path != self._media_source_path
+        ):
+            sources.append(
+                (
+                    "Timeline audio",
+                    self._timeline_audio_source_path,
+                    max(0.0, float(self._timeline_audio_player.position()) / 1000.0),
+                )
+            )
+        return sources
+
+    def _set_meter_status(self, text: str, detail: str, *, warning: bool = False) -> None:
+        self._meter_badge.setText(text)
+        self._meter_badge.setToolTip(detail)
+        self._meter_badge.setVisible(True)
+        self._meter_btn.setToolTip(detail)
+        color = "#fecaca" if warning else "#a7f3d0"
+        border = "#7f1d1d" if warning else "#27303a"
+        self._meter_badge.setStyleSheet(
+            f"""
+            QLabel {{
+                background: #111318;
+                border: 1px solid {border};
+                border-radius: 4px;
+                color: {color};
+                font-size: 10px;
+                padding: 3px 6px;
+            }}
+            """
+        )
+
+    def _clear_meter_status(self) -> None:
+        if not hasattr(self, "_meter_badge"):
+            return
+        self._meter_badge.setVisible(False)
+        self._meter_badge.setText("")
+        self._meter_badge.setToolTip("")
+        self._meter_btn.setToolTip("Preview meter")
+
+    def _request_meter_analysis(self) -> None:
+        sources = self._meter_sources()
+        if not sources:
+            self._set_meter_status("No source", "Load a preview source before using the meter.")
+            return
+
+        self._meter_token += 1
+        token = self._meter_token
+        self._set_meter_status(
+            "Analyzing...",
+            f"Analyzing {PREVIEW_METER_WINDOW_SECONDS:.0f}s around the current playhead.",
+        )
+
+        def _job() -> None:
+            result: list[tuple[str, float, AudioLevelStats | None]] = []
+            for label, path, start in sources:
+                try:
+                    stats = analyze_audio_levels(
+                        path,
+                        start=start,
+                        duration=PREVIEW_METER_WINDOW_SECONDS,
+                        timeout=20.0,
+                    )
+                except Exception:
+                    stats = None
+                result.append((label, start, stats))
+            try:
+                self._meter_result_ready.emit(token, result)
+            except RuntimeError:
+                return
+
+        self._meter_executor.submit(_job)
+
+    def _on_meter_result_ready(self, token: int, payload: object) -> None:
+        if token != self._meter_token or not isinstance(payload, list):
+            return
+        details: list[str] = []
+        short_items: list[str] = []
+        has_warning = False
+        analyzed_any = False
+        for item in payload:
+            if not isinstance(item, tuple) or len(item) != 3:
+                continue
+            label, start, stats = item
+            label_s = f"{label} @{float(start):.1f}s"
+            short, detail, warning = format_audio_meter_summary(
+                label_s,
+                stats if isinstance(stats, AudioLevelStats) else None,
+            )
+            analyzed_any = analyzed_any or isinstance(stats, AudioLevelStats)
+            details.append(detail)
+            short_items.append(short)
+            has_warning = has_warning or warning
+
+        if not details:
+            self._set_meter_status("No audio", "No analyzable audio found.")
+            return
+
+        if has_warning:
+            short_text = "CLIPPING"
+        elif analyzed_any and short_items:
+            short_text = short_items[0].split(": ", 1)[-1]
+        else:
+            short_text = "No audio"
+        self._set_meter_status(short_text, "\n\n".join(details), warning=has_warning)
 
     def play(self) -> None:
         self._cancel_prime_frame(keep_playing=True)
@@ -1795,6 +2019,13 @@ class PreviewPanel(QWidget):
     def _on_ocr_cancelled(self) -> None:
         self.ocr_cancelled.emit()
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self._meter_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def _update_time(self, pos: int) -> None:
         cur = _fmt_time(pos)
         total = _fmt_time(self._duration_ms)
@@ -1804,4 +2035,4 @@ class PreviewPanel(QWidget):
         )
 
 
-__all__ = ["PreviewPanel"]
+__all__ = ["PreviewPanel", "format_audio_meter_summary"]

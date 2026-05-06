@@ -11,11 +11,14 @@ from PySide6.QtGui import QIcon, QPainter, QPixmap, QTransform, QColor, QPen  # 
 from PySide6.QtWidgets import (  # type: ignore
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -26,7 +29,12 @@ from PySide6.QtWidgets import (  # type: ignore
     QDial,
 )
 
-from ...core.project import Clip
+from ...core.effect_presets import (
+    apply_effect_preset,
+    list_effect_presets,
+    save_effect_preset,
+)
+from ...core.project import Clip, ClipEffects
 
 try:
     from PySide6.QtSvg import QSvgRenderer  # type: ignore
@@ -101,6 +109,34 @@ def _section_label(text: str) -> QLabel:
         "color: #d0d5de; font-size: 12px; margin-top: 4px; margin-bottom: 2px;"
     )
     return label
+
+
+def _make_reset_button(text: str = "Reset") -> QPushButton:
+    btn = QPushButton(text)
+    btn.setFixedHeight(26)
+    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    btn.setStyleSheet(
+        """
+        QPushButton {
+            background: #1c1f24;
+            color: #a6acb8;
+            border: 1px solid #2a2f38;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        QPushButton:hover {
+            color: #ffffff;
+            border-color: #22d3c5;
+        }
+        QPushButton:disabled {
+            color: #555b66;
+            border-color: #252932;
+        }
+        """
+    )
+    return btn
 
 
 def _sep() -> QFrame:
@@ -719,6 +755,70 @@ class VideoPropertiesBox(QWidget):
         
         outer.addLayout(rotate_row)
 
+        reset_transform_row = QHBoxLayout()
+        reset_transform_row.setContentsMargins(0, 0, 0, 0)
+        reset_transform_row.addStretch(1)
+        self._reset_transform_btn = _make_reset_button("Reset transform")
+        reset_transform_row.addWidget(self._reset_transform_btn)
+        outer.addLayout(reset_transform_row)
+
+        # Gap after Rotate to Effects
+        outer.addSpacing(20)
+
+        effect_header = QHBoxLayout()
+        effect_header.setContentsMargins(0, 0, 0, 0)
+        effect_header.addWidget(_section_label("Effects"))
+        effect_header.addStretch(1)
+        self._reset_effects_btn = _make_reset_button("Reset filters")
+        effect_header.addWidget(self._reset_effects_btn)
+        outer.addLayout(effect_header)
+
+        effect_preset_row = QHBoxLayout()
+        effect_preset_row.setContentsMargins(0, 0, 0, 0)
+        effect_preset_row.setSpacing(6)
+        self._effect_preset_combo = QComboBox()
+        self._effect_preset_combo.setMinimumContentsLength(12)
+        self._btn_apply_effect_preset = QPushButton("Apply")
+        self._btn_save_effect_preset = QPushButton("Save")
+        effect_preset_row.addWidget(self._effect_preset_combo, 1)
+        effect_preset_row.addWidget(self._btn_apply_effect_preset)
+        effect_preset_row.addWidget(self._btn_save_effect_preset)
+        outer.addLayout(effect_preset_row)
+
+        effect_knobs = QWidget()
+        effect_knob_layout = QVBoxLayout(effect_knobs)
+        effect_knob_layout.setContentsMargins(0, 0, 0, 0)
+        effect_knob_layout.setSpacing(6)
+
+        def add_effect_spin(label: str, minimum: float, maximum: float, step: float) -> QDoubleSpinBox:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            row.addWidget(QLabel(label))
+            spin = _make_dspin(minimum, maximum, step=step)
+            spin.setDecimals(2)
+            row.addWidget(spin, 1)
+            effect_knob_layout.addLayout(row)
+            return spin
+
+        self._effect_brightness_spin = add_effect_spin("Brightness", -1.0, 1.0, 0.05)
+        self._effect_contrast_spin = add_effect_spin("Contrast", 0.0, 4.0, 0.05)
+        self._effect_saturation_spin = add_effect_spin("Saturation", 0.0, 3.0, 0.05)
+        self._effect_blur_spin = add_effect_spin("Blur", 0.0, 20.0, 0.5)
+
+        effect_toggle_row = QHBoxLayout()
+        effect_toggle_row.setContentsMargins(0, 0, 0, 0)
+        effect_toggle_row.setSpacing(10)
+        self._effect_grayscale_cb = QCheckBox("Grayscale")
+        self._effect_hflip_cb = QCheckBox("Flip H")
+        self._effect_vflip_cb = QCheckBox("Flip V")
+        effect_toggle_row.addWidget(self._effect_grayscale_cb)
+        effect_toggle_row.addWidget(self._effect_hflip_cb)
+        effect_toggle_row.addWidget(self._effect_vflip_cb)
+        effect_toggle_row.addStretch(1)
+        effect_knob_layout.addLayout(effect_toggle_row)
+        outer.addWidget(effect_knobs)
+
         # Gap after Rotate to Speed
         outer.addSpacing(20)
         self._speed_row_container = QWidget()
@@ -731,6 +831,8 @@ class VideoPropertiesBox(QWidget):
         speed_lbl.setFixedWidth(80)
         speed_header.addWidget(speed_lbl)
         speed_header.addStretch(1)
+        self._reset_speed_btn = _make_reset_button("Reset")
+        speed_header.addWidget(self._reset_speed_btn)
 
         speed_value = QWidget()
         speed_value_layout = QHBoxLayout(speed_value)
@@ -765,6 +867,8 @@ class VideoPropertiesBox(QWidget):
         vol_lbl.setFixedWidth(80)
         vol_header.addWidget(vol_lbl)
         vol_header.addStretch(1)
+        self._reset_volume_btn = _make_reset_button("Reset")
+        vol_header.addWidget(self._reset_volume_btn)
 
         vol_value = QWidget()
         vol_value_layout = QHBoxLayout(vol_value)
@@ -806,15 +910,32 @@ class VideoPropertiesBox(QWidget):
         self._rotate_spin.valueChanged.connect(self._on_rotate_spin_changed)
         self._rotate_inc.clicked.connect(self._rotate_spin.stepUp)
         self._rotate_dec.clicked.connect(self._rotate_spin.stepDown)
+        self._reset_transform_btn.clicked.connect(self._reset_transform_group)
+        self._effect_preset_combo.currentIndexChanged.connect(
+            self._update_effect_preset_button_state
+        )
+        self._btn_apply_effect_preset.clicked.connect(self._apply_selected_effect_preset)
+        self._btn_save_effect_preset.clicked.connect(self._save_current_effect_preset)
+        self._reset_effects_btn.clicked.connect(self._reset_effects_group)
+        self._effect_brightness_spin.valueChanged.connect(self._on_effect_brightness_changed)
+        self._effect_contrast_spin.valueChanged.connect(self._on_effect_contrast_changed)
+        self._effect_saturation_spin.valueChanged.connect(self._on_effect_saturation_changed)
+        self._effect_blur_spin.valueChanged.connect(self._on_effect_blur_changed)
+        self._effect_grayscale_cb.toggled.connect(self._on_effect_grayscale_toggled)
+        self._effect_hflip_cb.toggled.connect(self._on_effect_hflip_toggled)
+        self._effect_vflip_cb.toggled.connect(self._on_effect_vflip_toggled)
         self._speed_slider.valueChanged.connect(self._on_speed_changed)
         self._speed_spin.valueChanged.connect(self._on_speed_spin_changed)
         self._speed_dec.clicked.connect(self._speed_spin.stepDown)
         self._speed_inc.clicked.connect(self._speed_spin.stepUp)
+        self._reset_speed_btn.clicked.connect(self._reset_speed_group)
         self._volume_slider.valueChanged.connect(self._on_volume_changed)
         self._volume_spin.valueChanged.connect(self._on_volume_spin_changed)
         self._volume_dec.clicked.connect(self._volume_spin.stepDown)
         self._volume_inc.clicked.connect(self._volume_spin.stepUp)
+        self._reset_volume_btn.clicked.connect(self._reset_volume_group)
         self._sync_uniform_scale_ui()
+        self._refresh_effect_preset_combo()
 
     def _build_voice_page(self) -> None:
         from .voice_preset_grid import VoicePresetGrid
@@ -922,14 +1043,28 @@ class VideoPropertiesBox(QWidget):
                 self._rotate_spin,
                 self._rotate_inc,
                 self._rotate_dec,
+                self._reset_transform_btn,
+                self._effect_preset_combo,
+                self._btn_apply_effect_preset,
+                self._btn_save_effect_preset,
+                self._reset_effects_btn,
+                self._effect_brightness_spin,
+                self._effect_contrast_spin,
+                self._effect_saturation_spin,
+                self._effect_blur_spin,
+                self._effect_grayscale_cb,
+                self._effect_hflip_cb,
+                self._effect_vflip_cb,
                 self._speed_slider,
                 self._speed_container,
                 self._speed_inc,
                 self._speed_dec,
+                self._reset_speed_btn,
                 self._volume_slider,
                 self._volume_container,
                 self._volume_inc,
                 self._volume_dec,
+                self._reset_volume_btn,
                 self._pitch_spin,
             )
             for widget in controls:
@@ -952,9 +1087,17 @@ class VideoPropertiesBox(QWidget):
                 self._volume_spin.setValue(0.0)
                 self._rotate_spin.setValue(0.0)
                 self._rotate_dial.setValue(0)
+                self._effect_brightness_spin.setValue(0.0)
+                self._effect_contrast_spin.setValue(1.0)
+                self._effect_saturation_spin.setValue(1.0)
+                self._effect_blur_spin.setValue(0.0)
+                self._effect_grayscale_cb.setChecked(False)
+                self._effect_hflip_cb.setChecked(False)
+                self._effect_vflip_cb.setChecked(False)
                 self._pitch_spin.setValue(0.0)
                 if hasattr(self, "_voice_grid"):
                     self._voice_grid.set_active("none")
+                self._update_effect_preset_button_state()
                 return
 
             uniform = clip.scale_x is None and clip.scale_y is None
@@ -981,6 +1124,14 @@ class VideoPropertiesBox(QWidget):
                 dial_val += 360
             self._rotate_dial.setValue(dial_val)
 
+            self._effect_brightness_spin.setValue(float(clip.effects.brightness))
+            self._effect_contrast_spin.setValue(float(clip.effects.contrast))
+            self._effect_saturation_spin.setValue(float(clip.effects.saturation))
+            self._effect_blur_spin.setValue(float(clip.effects.blur))
+            self._effect_grayscale_cb.setChecked(bool(clip.effects.grayscale))
+            self._effect_hflip_cb.setChecked(bool(clip.effects.hflip))
+            self._effect_vflip_cb.setChecked(bool(clip.effects.vflip))
+
             speed_val = float(clip.speed or 1.0)
             self._speed_slider.setValue(int(round(speed_val * 100.0)))
             self._speed_spin.setValue(speed_val)
@@ -997,11 +1148,108 @@ class VideoPropertiesBox(QWidget):
                 self._voice_grid.set_active(detect_preset_id(self._clip.audio_effects))
         finally:
             self._binding = False
+        self._update_effect_preset_button_state()
 
     def _emit(self) -> None:
         if self._binding:
             return
         self.clip_changed.emit("")
+
+    def _refresh_effect_preset_combo(self, select_name: str | None = None) -> None:
+        if not hasattr(self, "_effect_preset_combo"):
+            return
+        current = select_name or str(self._effect_preset_combo.currentData() or "")
+        self._effect_preset_combo.blockSignals(True)
+        self._effect_preset_combo.clear()
+        presets = list_effect_presets()
+        if not presets:
+            self._effect_preset_combo.addItem("No presets yet", None)
+        else:
+            for preset in presets:
+                self._effect_preset_combo.addItem(preset.name, preset.name)
+        if current:
+            index = self._effect_preset_combo.findData(current)
+            if index >= 0:
+                self._effect_preset_combo.setCurrentIndex(index)
+        self._effect_preset_combo.blockSignals(False)
+        self._update_effect_preset_button_state()
+
+    def _update_effect_preset_button_state(self, *_args) -> None:
+        if not hasattr(self, "_btn_apply_effect_preset"):
+            return
+        has_clip = self._clip is not None
+        has_preset = bool(self._effect_preset_combo.currentData())
+        self._effect_preset_combo.setEnabled(has_clip)
+        self._btn_save_effect_preset.setEnabled(has_clip)
+        self._btn_apply_effect_preset.setEnabled(has_clip and has_preset)
+
+    def _save_current_effect_preset(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        default_name = Path(self._clip.source or "Effect").stem.strip() or "Effect"
+        name, accepted = QInputDialog.getText(
+            self,
+            "Save effect preset",
+            "Preset name:",
+            text=f"{default_name} Effects",
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        try:
+            save_effect_preset(name, self._clip)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            QMessageBox.warning(self, "Save preset failed", str(exc))
+            return
+        self._refresh_effect_preset_combo(select_name=name)
+
+    def _apply_selected_effect_preset(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        name = str(self._effect_preset_combo.currentData() or "")
+        if not name:
+            return
+        try:
+            apply_effect_preset(self._clip, name)
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            QMessageBox.warning(self, "Apply preset failed", str(exc))
+            return
+        self.set_clip(self._clip, track_kind=self._track_kind)
+        self._emit()
+
+    def _reset_transform_group(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.scale = None
+        self._clip.scale_x = None
+        self._clip.scale_y = None
+        self._clip.pos_x = None
+        self._clip.pos_y = None
+        self._clip.effects.rotate = 0.0
+        self.set_clip(self._clip, track_kind=self._track_kind)
+        self._emit()
+
+    def _reset_effects_group(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        rotate = self._clip.effects.rotate
+        self._clip.effects = ClipEffects(rotate=rotate)
+        self.set_clip(self._clip, track_kind=self._track_kind)
+        self._emit()
+
+    def _reset_speed_group(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.speed = 1.0
+        self.set_clip(self._clip, track_kind=self._track_kind)
+        self.clip_changed.emit("video_speed")
+
+    def _reset_volume_group(self) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.volume = 1.0
+        self.set_clip(self._clip, track_kind=self._track_kind)
+        self._emit()
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
@@ -1149,6 +1397,48 @@ class VideoPropertiesBox(QWidget):
         self._rotate_dial.setValue(dial_val)
         self._rotate_dial.blockSignals(False)
         
+        self._emit()
+
+    def _on_effect_brightness_changed(self, value: float) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.brightness = max(-1.0, min(1.0, float(value)))
+        self._emit()
+
+    def _on_effect_contrast_changed(self, value: float) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.contrast = max(0.0, min(4.0, float(value)))
+        self._emit()
+
+    def _on_effect_saturation_changed(self, value: float) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.saturation = max(0.0, min(3.0, float(value)))
+        self._emit()
+
+    def _on_effect_blur_changed(self, value: float) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.blur = max(0.0, min(20.0, float(value)))
+        self._emit()
+
+    def _on_effect_grayscale_toggled(self, checked: bool) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.grayscale = bool(checked)
+        self._emit()
+
+    def _on_effect_hflip_toggled(self, checked: bool) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.hflip = bool(checked)
+        self._emit()
+
+    def _on_effect_vflip_toggled(self, checked: bool) -> None:
+        if self._binding or self._clip is None:
+            return
+        self._clip.effects.vflip = bool(checked)
         self._emit()
 
     def _on_speed_changed(self, value: int) -> None:

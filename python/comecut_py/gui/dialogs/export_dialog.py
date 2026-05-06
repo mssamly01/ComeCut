@@ -62,7 +62,20 @@ class ExportOptions:
     subs_display: str  # "main" | "second" | "bilingual"
 
     def output_path(self) -> Path:
+        if self.video_enabled:
+            return self.video_output_path()
+        if self.audio_enabled:
+            return self.audio_output_path()
+        return self.subtitle_output_path()
+
+    def video_output_path(self) -> Path:
         return self.save_dir / f"{self.file_name}.{self.video_format}"
+
+    def audio_output_path(self) -> Path:
+        return self.save_dir / f"{self.file_name}.{self.audio_format}"
+
+    def subtitle_output_path(self) -> Path:
+        return self.save_dir / f"{self.file_name}.{self.subs_format}"
 
 
 class ExportDialog(QDialog):

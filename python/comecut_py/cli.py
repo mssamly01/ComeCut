@@ -123,6 +123,11 @@ def burn_subs_cmd(
     src: Path,
     subs: Path,
     dst: Path,
+    style_preset: str | None = typer.Option(
+        None,
+        "--style-preset",
+        help="Load a local subtitle style preset before applying typed flags.",
+    ),
     font_name: str | None = typer.Option(None, "--font-name", help="Font family name (e.g. 'Arial')."),
     font_size: int | None = typer.Option(None, "--font-size", help="Font size in points."),
     color: str | None = typer.Option(
@@ -172,6 +177,10 @@ def burn_subs_cmd(
     flags, so a key in ``--force-style`` overrides the same key set by a
     flag (libass takes the last value).
     """
+    from .core.subtitle_style_presets import (
+        load_subtitle_style_from_preset,
+        merge_subtitle_force_styles,
+    )
     from .subtitles import SubtitleStyle
 
     if border_style is not None and border_style not in (1, 3):
@@ -197,13 +206,16 @@ def burn_subs_cmd(
         margin_v=margin_v,
     )
 
-    typed = style.to_force_style()
-    if typed and force_style:
-        merged: str | None = f"{typed},{force_style}"
-    elif typed:
-        merged = typed
-    else:
-        merged = force_style or None
+    try:
+        preset_style = (
+            load_subtitle_style_from_preset(style_preset)
+            if style_preset
+            else None
+        )
+        merged = merge_subtitle_force_styles(preset_style, style, force_style)
+    except (OSError, ValueError, TypeError) as e:
+        console.print(f"[red]error:[/red] {e}")
+        raise typer.Exit(code=2) from e
 
     try:
         cmd = burn_subtitles(src, subs, dst, force_style=merged)

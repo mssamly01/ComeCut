@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..core.audio_mixer import audible_audio_tracks
 from ..core.project import Clip, Track
 
 _EPS = 1e-3
@@ -54,14 +55,7 @@ def clip_fade_multiplier(clip: Clip, timeline_seconds: float) -> float:
 
 
 def visible_audio_tracks(tracks: list[Track]) -> list[Track]:
-    return [
-        track
-        for track in tracks
-        if track.kind == "audio"
-        and track.clips
-        and not bool(getattr(track, "hidden", False))
-        and not bool(getattr(track, "muted", False))
-    ]
+    return audible_audio_tracks(tracks)
 
 
 def pick_timeline_audio_clip(

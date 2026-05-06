@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..core.audio_mixer import track_output_gain
 from ..core.ffmpeg_cmd import FFmpegCommand
+from ..core.keyframes import evaluate_keyframes
 from ..core.project import (
     Clip,
     Keyframe,
@@ -28,6 +30,16 @@ from ..core.project import (
 )
 from .overlay_text import _escape_drawtext
 from .presets import PRESETS, ExportPreset, preset_output_args
+
+
+_AUDIO_EXPORT_CODECS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "aac": ("aac", ("-b:a", "192k")),
+    "m4a": ("aac", ("-b:a", "192k")),
+    "mp3": ("libmp3lame", ("-b:a", "192k")),
+    "wav": ("pcm_s16le", ()),
+    "flac": ("flac", ()),
+    "ogg": ("libvorbis", ("-q:a", "5")),
+}
 
 
 def _clip_trim_args(clip: Clip) -> list[str]:
@@ -146,7 +158,15 @@ def _clip_overlay_pos(clip: Clip, W: int, H: int) -> tuple[str, str]:
 
 def _audio_effect_chain(clip: Clip) -> str:
     """Build the filter chain applied to a clip's audio track."""
-    parts: list[str] = [f"volume={clip.volume}"]
+    if clip.volume_keyframes:
+        expr = _clip_keyframes_to_local_expr(
+            clip.volume_keyframes,
+            clip_start=float(clip.start),
+            default=float(clip.volume),
+        )
+        parts: list[str] = [f"volume='{expr}':eval=frame"]
+    else:
+        parts = [f"volume={clip.volume}"]
     if clip.reverse:
         parts.append("areverse")
     # atempo accepts 0.5..2.0 per invocation — chain multiple copies for
@@ -229,6 +249,32 @@ def _audio_effect_chain(clip: Clip) -> str:
             st = max(0.0, dur - d)
             parts.append(f"afade=t=out:st={st}:d={d}")
     return ",".join(parts)
+
+
+def _clip_keyframes_to_local_expr(
+    kfs: list[Keyframe],
+    *,
+    clip_start: float,
+    default: float = 0.0,
+) -> str:
+    """Compile global timeline keyframes for a per-clip ffmpeg stream."""
+    if not kfs:
+        return f"{default}"
+    start = max(0.0, float(clip_start))
+    local_kfs = [
+        Keyframe(time=max(0.0, float(kf.time) - start), value=float(kf.value))
+        for kf in kfs
+        if float(kf.time) >= start
+    ]
+    if not local_kfs or local_kfs[0].time > 0.0:
+        local_kfs.insert(
+            0,
+            Keyframe(
+                time=0.0,
+                value=evaluate_keyframes(kfs, start, default=default),
+            ),
+        )
+    return _keyframes_to_expr(local_kfs, default=default)
 
 
 def _keyframes_to_expr(kfs: list[Keyframe], *, default: float = 0.0) -> str:
@@ -472,6 +518,171 @@ def _clip_input_path(clip: Clip, *, use_proxies: bool) -> str:
     return str(clip.source)
 
 
+def _audio_export_args(
+    dst: str | Path,
+    *,
+    audio_format: str | None,
+    sample_rate: int,
+) -> list[str]:
+    fmt = (audio_format or Path(dst).suffix.lstrip(".") or "m4a").strip().lower()
+    codec, extra = _AUDIO_EXPORT_CODECS.get(fmt, _AUDIO_EXPORT_CODECS["m4a"])
+    args = ["-vn", "-c:a", codec, "-ar", str(int(sample_rate))]
+    args.extend(extra)
+    return args
+
+
+def _still_frame_preset(dst: str | Path) -> ExportPreset:
+    ext = Path(dst).suffix.lower().lstrip(".")
+    if ext in {"jpg", "jpeg"}:
+        return ExportPreset(
+            name="still-jpeg",
+            vcodec="mjpeg",
+            acodec=None,
+            crf=None,
+            x264_preset=None,
+            profile=None,
+            pix_fmt="",
+            container="jpg",
+            extra_args=("-q:v", "2", "-frames:v", "1"),
+        )
+    if ext == "webp":
+        return ExportPreset(
+            name="still-webp",
+            vcodec="libwebp",
+            acodec=None,
+            crf=None,
+            x264_preset=None,
+            profile=None,
+            pix_fmt="",
+            container="webp",
+            extra_args=("-lossless", "1", "-frames:v", "1"),
+        )
+    return ExportPreset(
+        name="still-png",
+        vcodec="png",
+        acodec=None,
+        crf=None,
+        x264_preset=None,
+        profile=None,
+        pix_fmt="",
+        container="png",
+        extra_args=("-frames:v", "1"),
+    )
+
+
+def render_project_audio_only(
+    project: Project,
+    dst: str | Path,
+    *,
+    use_proxies: bool = False,
+    audio_format: str | None = None,
+) -> FFmpegCommand:
+    """Build an audio-only export command from audible timeline audio tracks."""
+    if not project.tracks:
+        raise ValueError("Project has no tracks.")
+
+    audio_tracks = [
+        t
+        for t in project.tracks
+        if t.kind == "audio" and not getattr(t, "hidden", False)
+    ]
+    cmd = FFmpegCommand()
+    input_idx = 0
+    clip_inputs: dict[int, int] = {}
+    for track in audio_tracks:
+        for clip in track.clips:
+            cmd.add_input(
+                _clip_input_path(clip, use_proxies=use_proxies),
+                *_clip_trim_args(clip),
+            )
+            clip_inputs[id(clip)] = input_idx
+            input_idx += 1
+
+    filters: list[str] = []
+    audio_streams: list[str] = []
+    for i, track in enumerate(audio_tracks):
+        if track.muted or not track.clips:
+            continue
+        track_gain = track_output_gain(track)
+        if track.transitions:
+            afilters, alabel, astart = _build_audio_chain(
+                track,
+                clip_inputs,
+                track_tag=f"ao{i}",
+            )
+            filters.extend(afilters)
+            delayed = f"aod_{i}"
+            delay_ms = round(astart * 1000)
+            if delay_ms > 0:
+                filters.append(f"[{alabel}]adelay={delay_ms}|{delay_ms}[{delayed}]")
+                stream_label = delayed
+            else:
+                stream_label = alabel
+            if abs(track_gain - 1.0) > 1e-9:
+                gained = f"aog_{i}"
+                filters.append(f"[{stream_label}]volume={track_gain}[{gained}]")
+                stream_label = gained
+            audio_streams.append(stream_label)
+        else:
+            for clip in track.clips:
+                idx = clip_inputs[id(clip)]
+                label = f"ao{idx}"
+                delay_ms = round(clip.start * 1000)
+                afx = _audio_effect_chain(clip)
+                track_gain_suffix = (
+                    f",volume={track_gain}" if abs(track_gain - 1.0) > 1e-9 else ""
+                )
+                filters.append(
+                    f"[{idx}:a]{afx},adelay={delay_ms}|{delay_ms}{track_gain_suffix}[{label}]"
+                )
+                audio_streams.append(label)
+
+    if not audio_streams:
+        raise ValueError("Project has no audible audio clips to export.")
+    if len(audio_streams) == 1:
+        audio_out = f"[{audio_streams[0]}]"
+    else:
+        joined = "".join(f"[{stream}]" for stream in audio_streams)
+        filters.append(
+            f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0[aout]"
+        )
+        audio_out = "[aout]"
+    filters.append(f"{audio_out}alimiter=limit=0.95[amaster]")
+
+    cmd.set_filter_complex(";".join(filters))
+    cmd.map("[amaster]")
+    cmd.out(
+        dst,
+        *_audio_export_args(
+            dst,
+            audio_format=audio_format,
+            sample_rate=int(project.sample_rate),
+        ),
+    )
+    return cmd
+
+
+def render_project_still_frame(
+    project: Project,
+    dst: str | Path,
+    *,
+    at_seconds: float = 0.0,
+    use_proxies: bool = False,
+) -> FFmpegCommand:
+    """Build a one-frame still-image export command for the composed timeline."""
+    frame_step = 1.0 / max(1.0, float(project.fps or 30.0))
+    start = max(0.0, float(at_seconds))
+    if project.duration > 0.0:
+        start = min(start, max(0.0, project.duration - frame_step))
+    return render_project(
+        project,
+        dst,
+        use_proxies=use_proxies,
+        preset=_still_frame_preset(dst),
+        export_range=(start, start + frame_step),
+    )
+
+
 def render_project(
     project: Project,
     dst: str | Path,
@@ -697,6 +908,7 @@ def render_project(
     for i, track in enumerate(audio_tracks):
         if track.muted or not track.clips:
             continue
+        track_gain = track_output_gain(track)
         if track.transitions:
             afilters, alabel, astart = _build_audio_chain(
                 track, clip_inputs, track_tag=f"at{i}"
@@ -706,17 +918,25 @@ def render_project(
             delay_ms = round(astart * 1000)
             if delay_ms > 0:
                 filters.append(f"[{alabel}]adelay={delay_ms}|{delay_ms}[{delayed}]")
-                audio_streams.append(delayed)
+                stream_label = delayed
             else:
-                audio_streams.append(alabel)
+                stream_label = alabel
+            if abs(track_gain - 1.0) > 1e-9:
+                gained = f"atg_{i}"
+                filters.append(f"[{stream_label}]volume={track_gain}[{gained}]")
+                stream_label = gained
+            audio_streams.append(stream_label)
         else:
             for clip in track.clips:
                 idx = clip_inputs[id(clip)]
                 label = f"a{idx}"
                 delay_ms = round(clip.start * 1000)
                 afx = _audio_effect_chain(clip)
+                track_gain_suffix = (
+                    f",volume={track_gain}" if abs(track_gain - 1.0) > 1e-9 else ""
+                )
                 filters.append(
-                    f"[{idx}:a]{afx},adelay={delay_ms}|{delay_ms}[{label}]"
+                    f"[{idx}:a]{afx},adelay={delay_ms}|{delay_ms}{track_gain_suffix}[{label}]"
                 )
                 audio_streams.append(label)
 
@@ -729,6 +949,9 @@ def render_project(
             f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0[aout]"
         )
         audio_out = "[aout]"
+    if audio_out:
+        filters.append(f"{audio_out}alimiter=limit=0.95[amaster]")
+        audio_out = "[amaster]"
 
     # Append a final scale+pad stage to fit the composition canvas into
     # the preset's target resolution (only when the preset's output
@@ -840,4 +1063,9 @@ def render_project_twopass(
     return pass1, pass2
 
 
-__all__ = ["render_project", "render_project_twopass"]
+__all__ = [
+    "render_project",
+    "render_project_audio_only",
+    "render_project_still_frame",
+    "render_project_twopass",
+]
