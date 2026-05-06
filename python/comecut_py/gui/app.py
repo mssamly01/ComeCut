@@ -188,9 +188,18 @@ def run() -> int:
             _log_line(traceback.format_exc())
             return
         windows.append(editor)
+        launch_geom = home.geometry()
+        if home.isMaximized():
+            normal_geom = home.normalGeometry()
+            if normal_geom.isValid() and normal_geom.width() > 0 and normal_geom.height() > 0:
+                launch_geom = normal_geom
+        if launch_geom.isValid() and launch_geom.width() > 0 and launch_geom.height() > 0:
+            editor.setGeometry(launch_geom)
         home.hide()
         editor.closed.connect(lambda e=editor: _show_home(e))
-        editor.show()
+        editor.showMaximized()
+        editor.raise_()
+        editor.activateWindow()
 
     home.new_project_requested.connect(open_editor)
     home.open_project_requested.connect(open_editor)

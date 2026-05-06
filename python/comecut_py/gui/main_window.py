@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
         self._audio_proxy_inflight: set[str] = set()
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
+        self._suspend_text_autoselect = False
         self._gap_play_timer = QTimer(self)
         self._gap_play_timer.setInterval(16)
         self._gap_play_timer.timeout.connect(self._on_gap_play_tick)
@@ -468,6 +469,13 @@ class MainWindow(QMainWindow):
         info = self.inspector_panel._info
         selected_clip = self.inspector_panel.current_clip()
         selected_timeline_clips = self.timeline_panel.selected_clips()
+        side_idx = int(self.side_stack.currentIndex())
+        left_tab_key = TAB_TEXT if side_idx == 1 else TAB_MEDIA
+        inspector_title = ""
+        try:
+            inspector_title = str(info.current_title())
+        except Exception:
+            inspector_title = ""
         caption_neutral = bool(
             info._btn_text_tab_caption.isChecked()
             and selected_clip is None
@@ -485,9 +493,13 @@ class MainWindow(QMainWindow):
         except Exception:
             caption_scroll = 0
         return {
-            "side_stack": int(self.side_stack.currentIndex()),
+            "side_stack": side_idx,
             "sub_nav_stack": int(self.sub_nav_stack.currentIndex()),
+            "left_tab_key": left_tab_key,
             "inspector_stack": int(self.inspector_panel._stack.currentIndex()),
+            "inspector_title": inspector_title,
+            "is_project_properties": inspector_title == "PROJECT PROPERTIES" and selected_clip is None,
+            "is_text_properties_neutral": inspector_title == "TEXT PROPERTIES" and selected_clip is None,
             "text_tab_index": int(info._text_tab_stack.currentIndex()),
             "tab_caption_checked": bool(info._btn_text_tab_caption.isChecked()),
             "tab_text_checked": bool(info._btn_text_tab_text.isChecked()),
@@ -507,12 +519,10 @@ class MainWindow(QMainWindow):
 
     def _restore_window_toggle_state(self, snap: dict[str, object]) -> None:
         side_idx = int(snap.get("side_stack", 0))
-        if 0 <= side_idx < self.side_stack.count():
-            self.side_stack.setCurrentIndex(side_idx)
-
-        sub_idx = int(snap.get("sub_nav_stack", 0))
-        if 0 <= sub_idx < self.sub_nav_stack.count():
-            self.sub_nav_stack.setCurrentIndex(sub_idx)
+        left_tab_key = snap.get("left_tab_key")
+        if left_tab_key not in (TAB_MEDIA, TAB_TEXT):
+            left_tab_key = TAB_TEXT if side_idx == 1 else TAB_MEDIA
+        self._set_left_tab(left_tab_key)
 
         inspector_idx = int(snap.get("inspector_stack", 0))
         if 0 <= inspector_idx < self.inspector_panel._stack.count():
@@ -545,10 +555,14 @@ class MainWindow(QMainWindow):
 
         restore_caption_neutral = bool(snap.get("caption_neutral", False))
         want_caption_tab = bool(snap.get("tab_caption_checked", False))
+        was_project_properties = bool(snap.get("is_project_properties", False))
+        was_text_properties_neutral = bool(snap.get("is_text_properties_neutral", False))
         has_only_text_selection = bool(selected_clips) and all(
             bool(getattr(c, "is_text_clip", False)) for c in selected_clips
         )
-        if want_caption_tab and (restore_caption_neutral or has_only_text_selection or clip is None):
+        if was_project_properties:
+            self._set_clip_in_inspector(None)
+        elif was_text_properties_neutral or (restore_caption_neutral and has_only_text_selection):
             self.inspector_panel.show_caption_list_neutral()
         elif (
             want_caption_tab
@@ -562,6 +576,7 @@ class MainWindow(QMainWindow):
         info = self.inspector_panel._info
         if (
             (clip is not None and bool(getattr(clip, "is_text_clip", False)))
+            or was_text_properties_neutral
             or (restore_caption_neutral and has_only_text_selection)
         ):
             text_tab_index = int(snap.get("text_tab_index", 0))
@@ -1236,6 +1251,8 @@ class MainWindow(QMainWindow):
 
     def _auto_select_text_clip_at_playhead(self) -> None:
         """Auto-select active text clip when playhead overlaps it."""
+        if self._suspend_text_autoselect:
+            return
         if bool(getattr(self.timeline_panel, "_is_playing", False)):
             return
         active_clip = getattr(self, "_preview_active_text_clip", None)
@@ -1383,7 +1400,12 @@ class MainWindow(QMainWindow):
             info._text_second_size.blockSignals(False)
 
     def _on_tab_changed(self, key: str) -> None:
-        idx = {TAB_MEDIA: 0, TAB_TEXT: 1}.get(key, 0)
+        self._set_left_tab(key)
+
+    def _set_left_tab(self, key: str) -> None:
+        safe_key = key if key in (TAB_MEDIA, TAB_TEXT) else TAB_MEDIA
+        idx = {TAB_MEDIA: 0, TAB_TEXT: 1}.get(safe_key, 0)
+        self.left_rail.set_active(safe_key)
         self.side_stack.setCurrentIndex(idx)
         self.sub_nav_stack.setCurrentIndex(idx)
 
@@ -1974,6 +1996,7 @@ class MainWindow(QMainWindow):
     def _toggle_maximize(self) -> None:
         snap = self._snapshot_window_toggle_state()
         self._suspend_timeline_selection_sync = True
+        self._suspend_text_autoselect = True
         state = self.windowState()
         if state & Qt.WindowState.WindowMaximized:
             self.setWindowState(state & ~Qt.WindowState.WindowMaximized)
@@ -1988,6 +2011,7 @@ class MainWindow(QMainWindow):
             finally:
                 if pass_index >= 2:
                     self._suspend_timeline_selection_sync = False
+                    self._suspend_text_autoselect = False
                 else:
                     QTimer.singleShot(80, lambda: _restore_after_toggle(pass_index + 1))
 
