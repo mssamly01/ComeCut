@@ -14,6 +14,7 @@ from .render import render_project_audio_only
 
 
 _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
+_AUDIO_PROXY_RENDER_VERSION = 2
 
 
 def _cache_dir() -> Path:
@@ -144,6 +145,7 @@ def timeline_audio_proxy_path(
     has_audio: Callable[[Clip], bool] = clip_source_has_audio,
 ) -> Path:
     payload = {
+        "render_version": _AUDIO_PROXY_RENDER_VERSION,
         "sample_rate": int(project.sample_rate),
         "tracks": [
             {

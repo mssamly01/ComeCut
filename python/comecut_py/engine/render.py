@@ -644,7 +644,7 @@ def render_project_audio_only(
     else:
         joined = "".join(f"[{stream}]" for stream in audio_streams)
         filters.append(
-            f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0[aout]"
+            f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0:normalize=0[aout]"
         )
         audio_out = "[aout]"
     filters.append(f"{audio_out}alimiter=limit=0.95[amaster]")
@@ -946,7 +946,7 @@ def render_project(
     elif audio_streams:
         joined = "".join(f"[{s}]" for s in audio_streams)
         filters.append(
-            f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0[aout]"
+            f"{joined}amix=inputs={len(audio_streams)}:duration=longest:dropout_transition=0:normalize=0[aout]"
         )
         audio_out = "[aout]"
     if audio_out:

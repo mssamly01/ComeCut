@@ -87,6 +87,7 @@ def test_rendered_timeline_audio_mix_has_adjacent_video_segments() -> None:
     assert "adelay=0|0" in fc
     assert "adelay=3000|3000" in fc
     assert "amix=inputs=2" in fc
+    assert "normalize=0" in fc
 
 
 def test_timeline_audio_proxy_path_changes_when_clip_timing_changes(
