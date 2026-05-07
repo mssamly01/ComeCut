@@ -22,3 +22,21 @@ def test_media_cache_invalidates_when_mtime_changes(tmp_path: Path) -> None:
 
     source.write_bytes(b"second version")
     assert cache.get(source) is None
+
+
+def test_media_cache_debounces_writes_until_flush(tmp_path: Path) -> None:
+    first = tmp_path / "first.mp3"
+    second = tmp_path / "second.mp3"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    index = tmp_path / "media-index.json"
+    cache = MediaCache(index, save_interval=999.0)
+
+    cache.put(first, CachedMediaInfo(source=str(first), duration=1.0, has_audio=True))
+    first_size = index.stat().st_size
+    cache.put(second, CachedMediaInfo(source=str(second), duration=2.0, has_audio=True))
+
+    assert cache.get(second).duration == 2.0
+    assert index.stat().st_size == first_size
+    cache.flush()
+    assert index.stat().st_size > first_size

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 from PySide6.QtCore import QObject, Signal  # type: ignore
 
@@ -31,29 +33,47 @@ class MediaIngestService(QObject):
         self.cache = cache or MediaCache()
         self._probe_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-probe")
         self._decode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-decode")
+        self._inflight_lock = Lock()
         self._inflight_probe: set[str] = set()
         self._inflight_decode: set[str] = set()
 
     def enqueue(self, path: Path | str) -> None:
         path_obj = Path(path)
-        key = self._key(path_obj)
-        if key in self._inflight_probe:
-            return
+        key = self._fast_key(path_obj)
+        with self._inflight_lock:
+            if key in self._inflight_probe:
+                return
+            self._inflight_probe.add(key)
+        self._probe_executor.submit(self._dispatch_one, path_obj, key)
 
-        cached = self.cache.get(path_obj)
-        if cached is not None and cached.status == "ready":
-            self.metadata_ready.emit(path_obj, cached)
-            self._emit_cached_assets(path_obj, cached)
-            self._maybe_enqueue_decode(path_obj, cached)
-            return
-
-        self._inflight_probe.add(key)
-        self.status_changed.emit(path_obj, "Analyzing...")
-        self._probe_executor.submit(self._probe_job, path_obj)
+    def enqueue_many(self, paths: Iterable[Path | str]) -> None:
+        accepted: list[Path] = []
+        keys: list[str] = []
+        with self._inflight_lock:
+            for raw in paths:
+                if raw is None:
+                    continue
+                path_obj = Path(raw)
+                key = self._fast_key(path_obj)
+                if key in self._inflight_probe:
+                    continue
+                self._inflight_probe.add(key)
+                accepted.append(path_obj)
+                keys.append(key)
+        if accepted:
+            self._probe_executor.submit(self._dispatch_batch, accepted, keys)
 
     def close(self) -> None:
         self._probe_executor.shutdown(wait=False, cancel_futures=True)
         self._decode_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.cache.flush()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fast_key(path: Path) -> str:
+        return str(path).lower()
 
     @staticmethod
     def _key(path: Path) -> str:
@@ -61,6 +81,37 @@ class MediaIngestService(QObject):
             return str(path.resolve()).lower()
         except Exception:
             return str(path).lower()
+
+    def _dispatch_one(self, path: Path, fast_key: str) -> None:
+        try:
+            self._dispatch_path(path, fast_key)
+        except Exception:
+            with self._inflight_lock:
+                self._inflight_probe.discard(fast_key)
+
+    def _dispatch_batch(self, paths: list[Path], fast_keys: list[str]) -> None:
+        for path, fast_key in zip(paths, fast_keys):
+            try:
+                self._dispatch_path(path, fast_key)
+            except Exception:
+                with self._inflight_lock:
+                    self._inflight_probe.discard(fast_key)
+
+    def _dispatch_path(self, path: Path, fast_key: str) -> None:
+        cached = None
+        try:
+            cached = self.cache.get(path)
+        except Exception:
+            cached = None
+        if cached is not None and cached.status == "ready":
+            with self._inflight_lock:
+                self._inflight_probe.discard(fast_key)
+            self.metadata_ready.emit(path, cached)
+            self._emit_cached_assets(path, cached)
+            self._maybe_enqueue_decode(path, cached)
+            return
+        self.status_changed.emit(path, "Analyzing...")
+        self._probe_job(path, fast_key=fast_key)
 
     @staticmethod
     def should_make_video_proxy(info: CachedMediaInfo) -> bool:
@@ -81,8 +132,9 @@ class MediaIngestService(QObject):
         duration = float(info.duration or 0.0)
         return ext != ".wav" or codec in {"mp3", "aac", "opus", "vorbis"} or duration >= 300.0
 
-    def _probe_job(self, path: Path) -> None:
-        key = self._key(path)
+    def _probe_job(self, path: Path, *, fast_key: str | None = None) -> None:
+        if fast_key is None:
+            fast_key = self._fast_key(path)
         try:
             ext = path.suffix.lower()
             if ext in _SUBTITLE_EXTS:
@@ -97,11 +149,15 @@ class MediaIngestService(QObject):
             self._maybe_enqueue_decode(path, info)
         except Exception as exc:
             msg = str(exc)
-            self.cache.update(path, status="failed", error=msg)
+            try:
+                self.cache.update(path, status="failed", error=msg)
+            except Exception:
+                pass
             self.metadata_ready.emit(path, msg)
             self.status_changed.emit(path, "Analyze failed")
         finally:
-            self._inflight_probe.discard(key)
+            with self._inflight_lock:
+                self._inflight_probe.discard(fast_key)
 
     def _emit_cached_assets(self, path: Path, info: CachedMediaInfo) -> None:
         if info.thumbnail_path and Path(info.thumbnail_path).exists():
@@ -116,8 +172,9 @@ class MediaIngestService(QObject):
         if ext in _SUBTITLE_EXTS or ext in _IMAGE_EXTS:
             return
         key = self._key(path)
-        if key in self._inflight_decode:
-            return
+        with self._inflight_lock:
+            if key in self._inflight_decode:
+                return
         needs_thumbnail = info.has_video and not (info.thumbnail_path and Path(info.thumbnail_path).exists())
         needs_video_proxy = self.should_make_video_proxy(info) and not (
             info.video_proxy_path and Path(info.video_proxy_path).exists()
@@ -127,7 +184,10 @@ class MediaIngestService(QObject):
         )
         if not (needs_thumbnail or needs_video_proxy or needs_audio_proxy):
             return
-        self._inflight_decode.add(key)
+        with self._inflight_lock:
+            if key in self._inflight_decode:
+                return
+            self._inflight_decode.add(key)
         self._decode_executor.submit(self._decode_job, path, info)
 
     def _decode_job(self, path: Path, info: CachedMediaInfo) -> None:
@@ -189,7 +249,8 @@ class MediaIngestService(QObject):
             self.cache.update(path, status="failed", error=str(exc))
             self.status_changed.emit(path, "Cache failed")
         finally:
-            self._inflight_decode.discard(key)
+            with self._inflight_lock:
+                self._inflight_decode.discard(key)
 
 
 __all__ = ["MediaIngestService"]

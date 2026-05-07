@@ -194,6 +194,13 @@ class MainWindow(QMainWindow):
         self._preview_active_media_clip: Clip | None = None
         self._media_ingest = MediaIngestService()
         self._duration_placeholder_clip_ids: set[int] = set()
+        self._duration_placeholder_by_source_key: dict[str, list[Clip]] = {}
+        self._pending_ingest_metadata: list[tuple[Path, CachedMediaInfo]] = []
+        self._pending_ingest_failures: list[Path] = []
+        self._ingest_flush_timer = QTimer(self)
+        self._ingest_flush_timer.setSingleShot(True)
+        self._ingest_flush_timer.setInterval(120)
+        self._ingest_flush_timer.timeout.connect(self._flush_pending_ingest_metadata)
         self._suspend_text_autoselect = False
         self._voice_match_worker: _VoiceMatchWorker | None = None
         self._voice_match_original_project: Project | None = None
@@ -881,6 +888,24 @@ class MainWindow(QMainWindow):
                     return duration, False
                 break
         return max(0.001, float(fallback)), True
+
+    def _register_placeholder_clip(self, clip: Clip) -> None:
+        self._duration_placeholder_clip_ids.add(id(clip))
+        source_key = self._source_key_for_path(clip.source)
+        self._duration_placeholder_by_source_key.setdefault(source_key, []).append(clip)
+
+    def _unregister_placeholder_clip(self, clip: Clip) -> None:
+        self._duration_placeholder_clip_ids.discard(id(clip))
+        source_key = self._source_key_for_path(clip.source)
+        bucket = self._duration_placeholder_by_source_key.get(source_key)
+        if bucket is None:
+            return
+        try:
+            bucket.remove(clip)
+        except ValueError:
+            pass
+        if not bucket:
+            self._duration_placeholder_by_source_key.pop(source_key, None)
 
     def _audio_proxy_for_source_path(self, path: Path | str) -> Path | None:
         key = self._source_key_for_path(path)
@@ -3286,76 +3311,109 @@ class MainWindow(QMainWindow):
 
     def _on_ingest_metadata_ready(self, path_obj: object, info_obj: object) -> None:
         path = Path(str(path_obj))
-        if not isinstance(info_obj, CachedMediaInfo):
+        if isinstance(info_obj, CachedMediaInfo):
+            self._pending_ingest_metadata.append((path, info_obj))
+        else:
+            self._pending_ingest_failures.append(path)
+        if not self._ingest_flush_timer.isActive():
+            self._ingest_flush_timer.start()
+
+    def _flush_pending_ingest_metadata(self) -> None:
+        failures = self._pending_ingest_failures
+        items = self._pending_ingest_metadata
+        self._pending_ingest_failures = []
+        self._pending_ingest_metadata = []
+
+        for path in failures:
             self.media_panel.update_media_status(path, "Analyze failed")
+
+        if not items:
             return
 
-        info = info_obj
-        source_key = self._source_key_for_path(path)
-        self._preview_audio_presence_cache[source_key] = bool(info.has_audio)
-
         changed_library = False
-        norm = self._norm_lib_path(path)
-        for entry in self.project.library_media:
-            if self._norm_lib_path(entry.source) != norm:
-                continue
-            duration = info.duration if info.duration and info.duration > 0.0 else getattr(entry, "duration", None)
+        placeholder_updates: dict[int, tuple[Clip, float]] = {}
+        for path, info in items:
+            source_key = self._source_key_for_path(path)
+            self._preview_audio_presence_cache[source_key] = bool(info.has_audio)
+
+            norm = self._norm_lib_path(path)
+            for entry in self.project.library_media:
+                if self._norm_lib_path(entry.source) != norm:
+                    continue
+                duration = info.duration if info.duration and info.duration > 0.0 else getattr(entry, "duration", None)
+                try:
+                    entry.duration = duration
+                    entry.size = info.size or getattr(entry, "size", None)
+                    if info.mtime_ns:
+                        entry.mtime = float(info.mtime_ns) / 1_000_000_000.0
+                    changed_library = True
+                except Exception:
+                    pass
+                break
+
             try:
-                entry.duration = duration
-                entry.size = info.size or getattr(entry, "size", None)
-                entry.mtime = Path(path).stat().st_mtime
-                changed_library = True
+                new_duration = float(info.duration or 0.0)
             except Exception:
-                pass
-            break
+                new_duration = 0.0
+            if new_duration > 0.0:
+                for clip in self._duration_placeholder_by_source_key.get(source_key, ()):
+                    placeholder_updates[id(clip)] = (clip, new_duration)
 
-        changed_timeline = self._apply_ingest_duration_to_placeholder_clips(path, info.duration)
-        if changed_library or changed_timeline:
-            self._save_to_store_safe()
-        self.media_panel.update_media_status(path, "Ready")
+            self.media_panel.update_media_status(path, "Ready")
 
-    def _apply_ingest_duration_to_placeholder_clips(
-        self,
-        path: Path,
-        duration: float | None,
-    ) -> bool:
-        try:
-            new_duration = float(duration or 0.0)
-        except Exception:
-            new_duration = 0.0
-        if new_duration <= 0.0:
-            return False
-        source_key = self._source_key_for_path(path)
-        changed = False
         changed_clips: list[Clip] = []
-        for track in self.project.tracks:
-            for clip in track.clips:
-                if id(clip) not in self._duration_placeholder_clip_ids:
+        affected_track_ids: set[int] = set()
+        has_video_track_change = False
+        if placeholder_updates:
+            target_ids = set(placeholder_updates)
+            clip_track_by_id: dict[int, Track] = {}
+            for track in self.project.tracks:
+                for clip in track.clips:
+                    clip_id = id(clip)
+                    if clip_id in target_ids:
+                        clip_track_by_id[clip_id] = track
+
+            for clip_id, (clip, duration) in placeholder_updates.items():
+                track = clip_track_by_id.get(clip_id)
+                if track is None:
+                    self._unregister_placeholder_clip(clip)
                     continue
-                if self._source_key_for_path(clip.source) != source_key:
-                    continue
-                clip.out_point = float(clip.in_point) + max(0.001, new_duration)
-                self._duration_placeholder_clip_ids.discard(id(clip))
-                changed = True
+                clip.out_point = float(clip.in_point) + max(0.001, duration)
+                self._unregister_placeholder_clip(clip)
                 changed_clips.append(clip)
-            if changed:
+                affected_track_ids.add(id(track))
+                if track.kind == "video":
+                    has_video_track_change = True
+
+        for track in self.project.tracks:
+            if id(track) in affected_track_ids:
                 track.clips.sort(key=lambda c: float(c.start))
-        if not changed:
-            return False
+
+        if not changed_library and not changed_clips:
+            return
+
         try:
             self.timeline_panel.refresh()
-            self._prewarm_timeline_cache_for_clips(changed_clips)
-            if changed_clips and self._find_track_for_clip(changed_clips[0]) is not None:
-                track = self._find_track_for_clip(changed_clips[0])
-                if track is not None and track.kind == "video":
-                    self.timeline_panel.auto_zoom_to_duration(max(1.0, self.project.duration + 5.0))
         except Exception:
             pass
-        self.inspector_panel.refresh()
+        if changed_clips:
+            try:
+                self._prewarm_timeline_cache_for_clips(changed_clips)
+            except Exception:
+                pass
+        if has_video_track_change:
+            try:
+                self.timeline_panel.auto_zoom_to_duration(max(1.0, self.project.duration + 5.0))
+            except Exception:
+                pass
+        try:
+            self.inspector_panel.refresh()
+        except Exception:
+            pass
         self._invalidate_timeline_audio_mix(clear_player=False)
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         self._sync_preview_for_timeline_clock(current, playing=False, force_seek=False)
-        return True
+        self._save_to_store_safe()
 
     def _on_ingest_thumbnail_ready(self, path_obj: object, thumbnail_obj: object) -> None:
         path = Path(str(path_obj))
@@ -3458,8 +3516,9 @@ class MainWindow(QMainWindow):
                 f"({len(subtitle_clips)})."
             )
 
-        track = self._get_or_create_track("audio", None)
+        primary = self._get_or_create_track("audio", None)
         touched_tracks: list[Track] = []
+        track_end: dict[int, float] = {}
 
         def _register_touched(target: Track) -> None:
             for existing in touched_tracks:
@@ -3467,19 +3526,33 @@ class MainWindow(QMainWindow):
                     return
             touched_tracks.append(target)
 
-        def _has_clip_overlap(target: Track, start: float, duration: float) -> bool:
-            end = float(start) + float(duration)
-            if duration <= 0.0:
-                return False
+        def _track_end(target: Track) -> float:
+            cached = track_end.get(id(target))
+            if cached is not None:
+                return cached
+            max_end = 0.0
             for existing in target.clips:
                 existing_duration = float(existing.timeline_duration or 0.0)
                 if existing_duration <= 0.0:
                     continue
                 existing_start = float(existing.start)
-                existing_end = existing_start + existing_duration
-                if start < existing_end and end > existing_start:
-                    return True
-            return False
+                max_end = max(max_end, existing_start + existing_duration)
+            track_end[id(target)] = max_end
+            return max_end
+
+        def _candidate_tracks() -> list[Track]:
+            candidates: list[Track] = []
+            if not self._is_track_locked(primary):
+                candidates.append(primary)
+            for existing_track in self.project.tracks:
+                if existing_track.kind != "audio":
+                    continue
+                if existing_track is primary:
+                    continue
+                if self._is_track_locked(existing_track):
+                    continue
+                candidates.append(existing_track)
+            return candidates
 
         def _new_audio_track() -> Track:
             insert_idx = len(self.project.tracks)
@@ -3493,32 +3566,17 @@ class MainWindow(QMainWindow):
             )
 
         def _pick_target_track(start: float, duration: float) -> Track:
-            candidates: list[Track] = []
-            if not self._is_track_locked(track):
-                candidates.append(track)
-            for existing_track in self.project.tracks:
-                if existing_track.kind != "audio":
-                    continue
-                if existing_track is track:
-                    continue
-                if self._is_track_locked(existing_track):
-                    continue
-                candidates.append(existing_track)
-            for candidate in candidates:
-                if not _has_clip_overlap(candidate, start, duration):
+            for candidate in _candidate_tracks():
+                if float(start) >= _track_end(candidate):
                     return candidate
-            return _new_audio_track()
+            new_track = _new_audio_track()
+            track_end[id(new_track)] = 0.0
+            return new_track
 
         created: list[Clip] = []
         sequential_start = 0.0
         if not subtitle_clips:
-            for existing_clip in track.clips:
-                existing_duration = float(existing_clip.timeline_duration or 0.0)
-                if existing_duration > 0.0:
-                    sequential_start = max(
-                        sequential_start,
-                        float(existing_clip.start) + existing_duration,
-                    )
+            sequential_start = _track_end(primary)
 
         for index, audio_path in enumerate(audio_files):
             target_start = sequential_start
@@ -3540,19 +3598,28 @@ class MainWindow(QMainWindow):
                 out_point=float(duration),
             )
             target_track.clips.append(clip)
+            track_end[id(target_track)] = max(
+                _track_end(target_track),
+                float(target_start) + float(duration),
+            )
             if duration_is_placeholder:
-                self._duration_placeholder_clip_ids.add(id(clip))
+                self._register_placeholder_clip(clip)
             _register_touched(target_track)
             created.append(clip)
-            try:
-                self._media_ingest.enqueue(audio_path)
-            except Exception:
-                pass
             if not subtitle_clips:
                 sequential_start = float(target_start) + float(clip.timeline_duration or duration)
 
         for touched in touched_tracks:
             touched.clips.sort(key=lambda c: float(c.start))
+        try:
+            enqueue_many = getattr(self._media_ingest, "enqueue_many")
+            enqueue_many(audio_files)
+        except Exception:
+            for audio_path in audio_files:
+                try:
+                    self._media_ingest.enqueue(audio_path)
+                except Exception:
+                    pass
         return created
 
     def _open_voice_folder_picker(self) -> None:
@@ -3572,13 +3639,17 @@ class MainWindow(QMainWindow):
 
         self.timeline_panel.refresh()
         if created:
-            self.timeline_panel.select_clips(created)
+            large_import = len(created) > 250
+            if large_import:
+                self.timeline_panel.select_clip(created[0])
+            else:
+                self.timeline_panel.select_clips(created)
             ready_created = [
                 clip for clip in created
                 if id(clip) not in self._duration_placeholder_clip_ids
             ]
             try:
-                if ready_created:
+                if ready_created and not large_import:
                     self.timeline_panel.prewarm_track_clips(ready_created)
             except Exception:
                 pass
@@ -4067,7 +4138,7 @@ class MainWindow(QMainWindow):
             start = self._resolve_non_overlapping_start(track, start, dur)
         clip = Clip(source=str(path), start=start, in_point=0.0, out_point=dur)
         if duration_is_placeholder:
-            self._duration_placeholder_clip_ids.add(id(clip))
+            self._register_placeholder_clip(clip)
         try:
             self._media_ingest.enqueue(path)
         except Exception:
@@ -5141,6 +5212,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_preview_playback()
+        try:
+            if self._ingest_flush_timer.isActive():
+                self._ingest_flush_timer.stop()
+            if self._pending_ingest_metadata or self._pending_ingest_failures:
+                self._flush_pending_ingest_metadata()
+        except Exception:
+            pass
         try:
             self.save_to_store()
         except Exception:

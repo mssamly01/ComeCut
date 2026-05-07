@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 from threading import RLock
+import time
 
 from .media_probe import MediaInfo
 
@@ -100,11 +101,19 @@ def media_source_key(path: str | Path) -> str:
 
 
 class MediaCache:
-    def __init__(self, index_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        index_path: Path | None = None,
+        *,
+        save_interval: float = 0.5,
+    ) -> None:
         self._index_path = index_path or (user_cache_root() / "media-index.json")
         self._lock = RLock()
         self._index: dict[str, dict[str, object]] = {}
         self._loaded = False
+        self._save_interval = max(0.0, float(save_interval))
+        self._last_save_ts = 0.0
+        self._dirty = False
 
     def _load(self) -> None:
         if self._loaded:
@@ -117,7 +126,7 @@ class MediaCache:
             return
         self._index = data if isinstance(data, dict) else {}
 
-    def _save(self) -> None:
+    def _write_index_to_disk(self) -> None:
         self._index_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._index_path.with_suffix(".tmp")
         tmp.write_text(
@@ -125,6 +134,24 @@ class MediaCache:
             "utf-8",
         )
         tmp.replace(self._index_path)
+        self._last_save_ts = time.monotonic()
+        self._dirty = False
+
+    def _save(self, *, force: bool = False) -> None:
+        if not force:
+            if self._save_interval <= 0.0:
+                self._write_index_to_disk()
+                return
+            now = time.monotonic()
+            if (now - self._last_save_ts) < self._save_interval:
+                self._dirty = True
+                return
+        self._write_index_to_disk()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._write_index_to_disk()
 
     def get(self, path: str | Path) -> CachedMediaInfo | None:
         key = media_source_key(path)
@@ -151,6 +178,7 @@ class MediaCache:
         with self._lock:
             self._load()
             self._index[key] = asdict(info)
+            self._dirty = True
             self._save()
         return info
 

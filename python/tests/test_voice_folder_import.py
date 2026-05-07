@@ -19,6 +19,8 @@ class _VoiceImportHarness:
     _get_or_create_track = MainWindow._get_or_create_track
     _cached_media_info_for_path = MainWindow._cached_media_info_for_path
     _duration_for_insert = MainWindow._duration_for_insert
+    _register_placeholder_clip = MainWindow._register_placeholder_clip
+    _unregister_placeholder_clip = MainWindow._unregister_placeholder_clip
     _voice_target_subtitle_clips = MainWindow._voice_target_subtitle_clips
     _voice_audio_files_from_folder = MainWindow._voice_audio_files_from_folder
     _add_voice_folder_to_timeline = MainWindow._add_voice_folder_to_timeline
@@ -43,9 +45,15 @@ class _VoiceImportHarness:
         def __init__(self, durations: dict[str, float] | None = None) -> None:
             self.cache = _VoiceImportHarness._Cache(durations)
             self.enqueued: list[Path] = []
+            self.enqueue_many_calls = 0
 
         def enqueue(self, path: Path | str) -> None:
             self.enqueued.append(Path(path))
+
+        def enqueue_many(self, paths: list[Path] | tuple[Path, ...]) -> None:
+            self.enqueue_many_calls += 1
+            for path in paths:
+                self.enqueued.append(Path(path))
 
     def __init__(self, project: Project, durations: dict[str, float] | None = None) -> None:
         from comecut_py.gui.main_window import MainWindow
@@ -54,6 +62,7 @@ class _VoiceImportHarness:
         self._natural_voice_sort_key = MainWindow._natural_voice_sort_key
         self._media_ingest = self._Ingest(durations)
         self._duration_placeholder_clip_ids: set[int] = set()
+        self._duration_placeholder_by_source_key: dict[str, list[Clip]] = {}
         self.audio_proxy_started: list[Clip] = []
 
     def _start_audio_proxy_generation_if_needed(self, clip: Clip) -> None:
@@ -92,6 +101,7 @@ def test_add_voice_folder_without_subtitles_adds_sequential_audio(
     assert [clip.start for clip in created] == [0.0, 1.0, 3.5]
     assert [clip.out_point for clip in created] == [1.0, 2.5, 3.0]
     assert [path.name for path in harness._media_ingest.enqueued] == ["1.mp3", "2.mp3", "10.mp3"]
+    assert harness._media_ingest.enqueue_many_calls == 1
     assert harness.project.library_media == []
 
 
@@ -160,6 +170,7 @@ def test_add_voice_folder_matches_mp3_to_subtitle_timestamps(
     assert audio_tracks[0].clips == created
     assert harness.audio_proxy_started == []
     assert [path.name for path in harness._media_ingest.enqueued] == ["1.mp3", "2.mp3", "10.mp3"]
+    assert harness._media_ingest.enqueue_many_calls == 1
 
 
 def test_add_voice_folder_falls_back_to_subtitle_duration_when_probe_fails(
