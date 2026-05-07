@@ -9,8 +9,10 @@ import copy
 import bisect
 import uuid
 import time
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Any
+import shutil
+import subprocess
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 import pysrt
@@ -183,34 +185,66 @@ class CapCutDraftGenerator:
             'audio_mapping': audio_mapping
         }
     
+    def _find_ffprobe(self) -> str:
+        """Find ffprobe from PATH or common bundled ComeCut locations."""
+        for name in ("ffprobe", "ffprobe.exe"):
+            executable = shutil.which(name)
+            if executable:
+                return executable
+
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            repo_root / "python" / "ffmpeg",
+            repo_root / "ffmpeg",
+            repo_root / "capcut_generator" / "ffmpeg",
+        ]
+        for directory in candidates:
+            for name in ("ffprobe", "ffprobe.exe"):
+                executable = directory / name
+                if executable.exists():
+                    return str(executable)
+
+        raise RuntimeError("FFprobe executable not found. Please ensure FFmpeg is installed or bundled with ComeCut.")
+
     def get_media_duration(self, media_path: str) -> int:
-        """Get media duration using ffmpeg-python with fallback"""
+        """Get media duration using ffprobe."""
         try:
-            # Check if file exists first
             if not os.path.exists(media_path):
                 raise FileNotFoundError(f"Video file not found: {media_path}")
-            
-            # Check file size
+
             file_size = os.path.getsize(media_path)
             if file_size == 0:
                 raise ValueError(f"Video file is empty: {media_path}")
-                
-            import ffmpeg
-            
-            # Try to probe the file
+
+            ffprobe = self._find_ffprobe()
+
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    media_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
             try:
-                probe = ffmpeg.probe(media_path)
-                duration = float(probe['format']['duration'])
-                return int(duration * 1000000)  # Convert to microseconds
-            except ffmpeg.Error as e:
-                # FFmpeg specific error
-                logger.error(f"FFmpeg error for {os.path.basename(media_path)}: {e}")
-                raise Exception(f"FFmpeg could not process video file: {os.path.basename(media_path)}")
-            except Exception as e:
-                # Other errors (like subprocess not found)
-                logger.error(f"Subprocess/FFmpeg not found: {e}")
-                raise Exception(f"FFmpeg executable not found. Please ensure FFmpeg is properly bundled with the application.")
-            
+                duration = float(result.stdout.strip())
+            except ValueError as e:
+                raise ValueError(f"Invalid media duration for {media_path}: {result.stdout.strip()}") from e
+
+            return int(duration * 1000000)
+
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            logger.error(f"FFprobe error for {os.path.basename(media_path)}: {stderr}")
+            raise Exception(f"FFprobe could not process media file: {os.path.basename(media_path)}")
         except FileNotFoundError as e:
             logger.error(f"File not found: {media_path}")
             raise e
@@ -224,10 +258,24 @@ class CapCutDraftGenerator:
             raise Exception(f"Could not get video duration from {os.path.basename(media_path)}: {str(e)}")
     
     def get_video_dimensions(self, media_path: str) -> Tuple[int, int]:
-        """Get video width and height using ffmpeg-python."""
+        """Get video width and height using ffprobe."""
         try:
-            import ffmpeg
-            probe = ffmpeg.probe(media_path)
+            ffprobe = self._find_ffprobe()
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_streams",
+                    media_path,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            probe = json.loads(result.stdout or "{}")
             video_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'video']
             if not video_streams:
                 raise ValueError("No video stream found")
@@ -1880,7 +1928,6 @@ class CapCutDraftGenerator:
 
     def _save_project(self, draft_content: dict, output_json_path: str):
         """Automatically detects 8.20+ Timelines structure and saves project correctly"""
-        import os, json
         project_root = os.path.dirname(output_json_path)
         timelines_dir = os.path.join(project_root, "Timelines")
         
