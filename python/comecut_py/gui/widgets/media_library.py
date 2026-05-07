@@ -376,6 +376,7 @@ class MediaLibraryPanel(QWidget):
     media_add_requested = Signal(Path)
     files_imported = Signal(list)  # list[Path]
     files_removed = Signal(list)  # list[Path]
+    voice_folder_import_requested = Signal(Path)
     relink_requested = Signal(Path)  # ← NEW: emitted when user double-clicks a missing card
     media_selection_changed = Signal(object)  # Path | None
 
@@ -422,7 +423,21 @@ class MediaLibraryPanel(QWidget):
         )
         self.import_btn.clicked.connect(self._on_browse)
         self.import_btn.hide()
-        header_layout.addWidget(self.import_btn)
+
+        self.add_voice_btn = QToolButton()
+        self.add_voice_btn.setText("Thêm Voice")
+        self.add_voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_voice_btn.setFixedHeight(24)
+        self.add_voice_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.add_voice_btn.setStyleSheet(self.import_btn.styleSheet())
+        self.add_voice_btn.clicked.connect(self._on_add_voice_folder)
+
+        action_col = QVBoxLayout()
+        action_col.setContentsMargins(0, 0, 0, 0)
+        action_col.setSpacing(4)
+        action_col.addWidget(self.import_btn)
+        self.add_voice_btn.hide()
+        header_layout.addLayout(action_col)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search name...")
@@ -533,6 +548,8 @@ class MediaLibraryPanel(QWidget):
         layout.addWidget(self.stack)
 
         # Bottom bar removed; actions are available from the drop zone and browser.
+        self._update_import_button()
+
     def _on_context_menu(self, pos) -> None:
         item = self.list_widget.itemAt(pos)
         if not item:
@@ -566,6 +583,11 @@ class MediaLibraryPanel(QWidget):
         )
         if files:
             self._add_many([Path(f) for f in files])
+
+    def _on_add_voice_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Chọn folder voice")
+        if folder:
+            self.voice_folder_import_requested.emit(Path(folder))
 
     @staticmethod
     def _normalize_path(path: Path | str) -> str:
@@ -655,7 +677,8 @@ class MediaLibraryPanel(QWidget):
     def _update_import_button(self) -> None:
         has_items = self.list_widget.count() > 0
         self.import_btn.setVisible(has_items)
-        self.header_container.setVisible(has_items)
+        self.add_voice_btn.setVisible(False)
+        self.header_container.setVisible(True)
 
     def _refresh_selection_visuals(self) -> None:
         for i in range(self.list_widget.count()):
@@ -716,4 +739,3 @@ class MediaLibraryPanel(QWidget):
 
 
 __all__ = ["MediaLibraryPanel"]
-

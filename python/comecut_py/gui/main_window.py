@@ -174,6 +174,9 @@ class MainWindow(QMainWindow):
         self._preview_active_media_clip: Clip | None = None
         self._suspend_text_autoselect = False
         self._voice_match_worker: _VoiceMatchWorker | None = None
+        self._voice_match_original_project: Project | None = None
+        self._voice_match_matched_project: Project | None = None
+        self._voice_match_view_state: str | None = None
         self._gap_play_timer = QTimer(self)
         self._gap_play_timer.setInterval(16)
         self._gap_play_timer.timeout.connect(self._on_gap_play_tick)
@@ -252,6 +255,18 @@ class MainWindow(QMainWindow):
         media_label.setStyleSheet("color: #22d3c5; font-size: 11px; font-weight: normal; padding: 6px 12px; background: #22262d; border-radius: 2px;")
         media_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         media_sub_layout.addWidget(media_label)
+
+        self.media_voice_nav_label = QLabel("Thêm Voice")
+        self.media_voice_nav_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.media_voice_nav_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.media_voice_nav_label.setStyleSheet(
+            "color: #8c93a0; font-size: 11px; font-weight: normal; "
+            "padding: 6px 8px; background: transparent; border-radius: 2px;"
+        )
+        self.media_voice_nav_label.mousePressEvent = (
+            lambda e: self._open_voice_folder_picker()
+        )
+        media_sub_layout.addWidget(self.media_voice_nav_label)
         self.sub_nav_stack.addWidget(self.media_sub_nav)
 
         # --- Page 2: Text Sub-Nav ---
@@ -326,6 +341,7 @@ class MainWindow(QMainWindow):
 
         self.left_rail.tab_selected.connect(self._on_tab_changed)
         self.media_panel.files_imported.connect(self._on_media_files_imported)
+        self.media_panel.voice_folder_import_requested.connect(self._on_add_voice_folder_requested)
         self.media_panel.files_removed.connect(self._on_media_files_removed)
         self.media_panel.media_double_clicked.connect(self._on_add_clip)
         self.media_panel.media_add_requested.connect(self._on_add_clip_from_card)
@@ -335,6 +351,8 @@ class MainWindow(QMainWindow):
         self.text_panel.subtitle_files_removed.connect(self._on_subtitle_files_removed)
         self.voice_match_panel.generate_requested.connect(self._on_voice_match_generate_requested)
         self.voice_match_panel.import_requested.connect(self._on_voice_match_import_requested)
+        self.voice_match_panel.show_original_requested.connect(self._on_voice_match_show_original)
+        self.voice_match_panel.show_matched_requested.connect(self._on_voice_match_show_matched)
         self.timeline_panel.media_drop_requested.connect(self._on_drop_add_clip)
         self.media_panel.relink_requested.connect(self._on_relink_media)
         self.text_panel.relink_subtitle_requested.connect(self._on_relink_subtitle)
@@ -361,6 +379,9 @@ class MainWindow(QMainWindow):
         )
         self.preview_panel.media_ended.connect(self._on_preview_media_ended)
         self.text_panel.template_chosen.connect(self._on_subtitle_template)
+        self.timeline_panel.user_pause_requested.connect(
+            self._pause_timeline_playback_for_user_action
+        )
         self.timeline_panel.project_mutated.connect(self._on_timeline_project_mutated)
         # OCR connections
         self.text_panel.start_ocr_requested.connect(self._on_start_ocr_button_clicked)
@@ -642,6 +663,22 @@ class MainWindow(QMainWindow):
             self.timeline_panel._view.horizontalScrollBar().setValue(max(0, timeline_hscroll))
         except Exception:
             pass
+
+    def _pause_timeline_playback_for_user_action(self) -> bool:
+        if not bool(getattr(self.timeline_panel, "_is_playing", False)):
+            return False
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        self._stop_gap_playback()
+        self.timeline_panel.set_playing_state(False)
+        self.preview_panel.pause()
+        self.preview_panel.set_timeline_playing_override(False)
+        self._set_preview_timeline_time_display(current)
+        self._sync_timeline_audio_for_time(
+            current,
+            playing=False,
+            force_seek=False,
+        )
+        return True
 
     def _on_timeline_playpause_requested(self) -> None:
         self._preview_sync_mode = "timeline"
@@ -1340,6 +1377,12 @@ class MainWindow(QMainWindow):
             throttle_preview = self.timeline_panel.take_last_seek_request_was_scrub()
         except Exception:
             throttle_preview = False
+        try:
+            is_user_scrub = bool(throttle_preview or self.timeline_panel.is_playhead_scrubbing())
+        except Exception:
+            is_user_scrub = bool(throttle_preview)
+        if is_user_scrub:
+            self._pause_timeline_playback_for_user_action()
         self._sync_preview_for_timeline_clock(
             float(seconds),
             playing=bool(getattr(self.timeline_panel, "_is_playing", False)),
@@ -1439,6 +1482,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_overlay_position_changed(self, x: int, y: int) -> None:
+        self._pause_timeline_playback_for_user_action()
         clip = self._overlay_target_clip()
         if clip is None or not bool(getattr(clip, "is_text_clip", False)):
             return
@@ -1460,6 +1504,7 @@ class MainWindow(QMainWindow):
             info._transform_y.blockSignals(False)
 
     def _on_overlay_transform_changed(self, scale: float, x: int, y: int, rotate: float) -> None:
+        self._pause_timeline_playback_for_user_action()
         clip = self.inspector_panel.current_clip()
         if clip is None or clip.is_text_clip:
             return
@@ -1512,6 +1557,7 @@ class MainWindow(QMainWindow):
         self.timeline_panel.refresh()
 
     def _on_overlay_font_size_changed(self, size: int) -> None:
+        self._pause_timeline_playback_for_user_action()
         clip = self._overlay_target_clip()
         if clip is None or not bool(getattr(clip, "is_text_clip", False)):
             return
@@ -1562,16 +1608,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Khớp voice",
-                "Đang tạo draft khớp voice, vui lòng chờ hoàn tất.",
+                "ang tạo draft khớp voice, vui lòng ch hoàn tất.",
             )
             return
 
         from ..integrations.capcut_generator.adapter import TimelineVoiceMatchOptions
 
+        original_snapshot = self.project.model_copy(deep=True)
+        self._voice_match_original_project = original_snapshot
+        self._voice_match_matched_project = None
+        self._voice_match_view_state = None
+        self.voice_match_panel.set_compare_state(None, has_original=False, has_matched=False)
+
         work_dir = self._voice_match_work_dir()
         output_path = settings.output_json_path or self._default_voice_match_output_path()
         options = TimelineVoiceMatchOptions(
-            project=self.project.model_copy(deep=True),
+            project=original_snapshot.model_copy(deep=True),
             output_json_path=Path(output_path),
             work_dir=work_dir,
             sync_mode=settings.sync_mode,
@@ -1596,11 +1648,31 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_voice_match_worker_succeeded(self, path_obj: object) -> None:
+        from ..core.capcut_importer import import_capcut_draft
+
         path = Path(path_obj)
+        try:
+            if self._voice_match_original_project is None:
+                raise RuntimeError("Thiếu snapshot ban đầu để áp dụng khớp voice.")
+            matched_project = import_capcut_draft(path)
+            matched_snapshot = self._build_direct_main_matched_project(
+                original=self._voice_match_original_project,
+                matched=matched_project,
+            )
+        except Exception as exc:
+            self._on_voice_match_worker_failed(str(exc))
+            return
+
+        self._voice_match_matched_project = matched_snapshot.model_copy(deep=True)
         self.voice_match_panel.set_running(False)
         self.voice_match_panel.set_progress(100, "Hoàn tất.")
         self.voice_match_panel.set_generated_path(path)
-        self.statusBar().showMessage(f"Đã tạo draft khớp voice: {path.name}", 4000)
+        self._apply_voice_match_project_snapshot(self._voice_match_matched_project, "matched")
+        self.voice_match_panel.set_compare_state("matched", has_original=True, has_matched=True)
+        self.statusBar().showMessage(
+            f"ã áp dụng khớp voice trực tiếp lên track Main: {path.name}",
+            4000,
+        )
         self._voice_match_worker = None
 
     def _on_voice_match_worker_failed(self, message: str) -> None:
@@ -1609,6 +1681,200 @@ class MainWindow(QMainWindow):
         self.voice_match_panel.append_log(text)
         self._voice_match_worker = None
         QMessageBox.warning(self, "Không thể khớp voice", text)
+
+    @staticmethod
+    def _main_video_track_for_project(project: Project) -> Track | None:
+        for track in project.tracks:
+            if (
+                track.kind == "video"
+                and track.name.strip().lower() == "main"
+                and not bool(getattr(track, "hidden", False))
+            ):
+                return track
+        return next(
+            (
+                track
+                for track in project.tracks
+                if track.kind == "video" and not bool(getattr(track, "hidden", False))
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _first_visible_video_track(project: Project) -> Track | None:
+        return next(
+            (
+                track
+                for track in project.tracks
+                if track.kind == "video"
+                and track.clips
+                and not bool(getattr(track, "hidden", False))
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _matched_tracks_for_kind(matched: Project, kind: str, default_name: str) -> list[Track]:
+        tracks: list[Track] = []
+        for track in matched.tracks:
+            if track.kind != kind or not track.clips:
+                continue
+            copied = track.model_copy(deep=True)
+            if not copied.name.strip():
+                index = len(tracks) + 1
+                copied.name = default_name if index == 1 else f"{default_name} {index}"
+            tracks.append(copied)
+        return tracks
+
+    @staticmethod
+    def _copy_matched_main_video_clips(
+        matched_video_track: Track,
+        original_main_track: Track | None = None,
+    ) -> list[Clip]:
+        def _source_key(source: object) -> str:
+            raw = str(source or "").strip()
+            if not raw:
+                return ""
+            try:
+                return str(Path(raw).resolve()).lower()
+            except Exception:
+                return raw.lower()
+
+        original_volume_by_source: dict[str, float] = {}
+        if original_main_track is not None:
+            for original_clip in original_main_track.clips:
+                if bool(getattr(original_clip, "is_text_clip", False)):
+                    continue
+                key = _source_key(getattr(original_clip, "source", ""))
+                if not key or key in original_volume_by_source:
+                    continue
+                try:
+                    original_volume_by_source[key] = max(0.0, float(original_clip.volume))
+                except Exception:
+                    original_volume_by_source[key] = 1.0
+
+        clips: list[Clip] = []
+        for clip in matched_video_track.clips:
+            copied = clip.model_copy(deep=True)
+            # Voice match cuts/speeds video into segments. Keep source audio embedded
+            # in each Main segment, but remove generated fade/gain automation at edges.
+            source_key = _source_key(getattr(copied, "source", ""))
+            if source_key in original_volume_by_source:
+                copied.volume = original_volume_by_source[source_key]
+            copied.volume_keyframes = []
+            copied.audio_effects.fade_in = 0.0
+            copied.audio_effects.fade_out = 0.0
+            clips.append(copied)
+        return clips
+
+    @staticmethod
+    def _build_direct_main_matched_project(original: Project, matched: Project) -> Project:
+        result = original.model_copy(deep=True)
+        result_main = MainWindow._main_video_track_for_project(result)
+        matched_video_track = MainWindow._first_visible_video_track(matched)
+        if result_main is None or matched_video_track is None:
+            raise ValueError("Không tìm thấy track Main hoặc track video đã khớp.")
+
+        result_main.name = "Main"
+        original_main_track = MainWindow._main_video_track_for_project(original)
+        result_main.clips = MainWindow._copy_matched_main_video_clips(
+            matched_video_track,
+            original_main_track,
+        )
+        result_main.transitions = [
+            transition.model_copy(deep=True)
+            for transition in getattr(matched_video_track, "transitions", [])
+        ]
+        matched_text_tracks = MainWindow._matched_tracks_for_kind(
+            matched,
+            "text",
+            "Khớp voice - Text",
+        )
+        matched_audio_tracks = MainWindow._matched_tracks_for_kind(
+            matched,
+            "audio",
+            "Khớp voice - Voice",
+        )
+        if not matched_text_tracks and not matched_audio_tracks:
+            return result
+
+        rebuilt_tracks: list[Track] = []
+        inserted_text = False
+        inserted_audio = False
+        for track in result.tracks:
+            if matched_text_tracks and track.kind == "text":
+                if not inserted_text:
+                    rebuilt_tracks.extend([tr.model_copy(deep=True) for tr in matched_text_tracks])
+                    inserted_text = True
+                continue
+            if matched_audio_tracks and track.kind == "audio":
+                if not inserted_audio:
+                    rebuilt_tracks.extend([tr.model_copy(deep=True) for tr in matched_audio_tracks])
+                    inserted_audio = True
+                continue
+            rebuilt_tracks.append(track)
+
+        if matched_text_tracks and not inserted_text:
+            main_idx = next(
+                (idx for idx, track in enumerate(rebuilt_tracks) if track is result_main),
+                len(rebuilt_tracks),
+            )
+            for track in reversed(matched_text_tracks):
+                rebuilt_tracks.insert(main_idx, track.model_copy(deep=True))
+        if matched_audio_tracks and not inserted_audio:
+            main_idx = next(
+                (idx for idx, track in enumerate(rebuilt_tracks) if track is result_main),
+                len(rebuilt_tracks) - 1,
+            )
+            insert_idx = max(0, main_idx + 1)
+            for offset, track in enumerate(matched_audio_tracks):
+                rebuilt_tracks.insert(insert_idx + offset, track.model_copy(deep=True))
+
+        result.tracks = rebuilt_tracks
+        return result
+
+    def _apply_voice_match_project_snapshot(self, snapshot: Project, view_state: str) -> None:
+        self._stop_preview_playback()
+        self.project = snapshot.model_copy(deep=True)
+        self._voice_match_view_state = view_state if view_state in {"original", "matched"} else None
+        self._preview_source_path = None
+        self._preview_active_media_clip = None
+        self._preview_active_text_clip = None
+        self.timeline_panel.set_project(self.project)
+        self.inspector_panel.set_project(self.project)
+        self.topbar.set_project_title(self.project.name)
+        self.timeline_panel.refresh()
+        self._set_clip_in_inspector(None)
+        self.inspector_panel.refresh()
+        self._update_media_library_added_states()
+        self._sync_preview_play_availability()
+        all_clips = [clip for track in self.project.tracks for clip in track.clips]
+        self._schedule_timeline_cache_prewarm(all_clips)
+        self._preview_sync_mode = "timeline"
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        seek_to = min(max(0.0, current), max(0.0, self.project.duration))
+        self.timeline_panel.set_playhead(seek_to)
+        self._on_timeline_seek(seek_to)
+        self._refresh_auto_speed_issue_overlays()
+        self._reset_timeline_history()
+
+    def _on_voice_match_show_original(self) -> None:
+        if self._voice_match_original_project is None:
+            return
+        self._apply_voice_match_project_snapshot(
+            self._voice_match_original_project,
+            "original",
+        )
+        self.voice_match_panel.set_compare_state("original", has_original=True, has_matched=True)
+
+    def _on_voice_match_show_matched(self) -> None:
+        if self._voice_match_matched_project is None:
+            return
+        self._apply_voice_match_project_snapshot(
+            self._voice_match_matched_project,
+            "matched",
+        )
+        self.voice_match_panel.set_compare_state("matched", has_original=True, has_matched=True)
 
     def _on_voice_match_import_requested(self, path_obj: object) -> None:
         from ..core.capcut_importer import import_capcut_draft
@@ -1626,7 +1892,7 @@ class MainWindow(QMainWindow):
 
         self._apply_loaded_project(project)
         self._store_project_id = None
-        self.statusBar().showMessage(f"Đã import draft khớp voice: {path.name}", 4000)
+        self.statusBar().showMessage(f"ã import draft khớp voice: {path.name}", 4000)
 
     def _tracks_snapshot(self) -> str:
         tracks_payload = [track.model_dump(mode="json") for track in self.project.tracks]
@@ -1702,16 +1968,19 @@ class MainWindow(QMainWindow):
             )
 
     def _undo_timeline(self) -> None:
+        self._pause_timeline_playback_for_user_action()
         if self._history_index <= 0:
             return
         self._apply_history_snapshot(self._history_index - 1)
 
     def _redo_timeline(self) -> None:
+        self._pause_timeline_playback_for_user_action()
         if self._history_index >= len(self._history_snapshots) - 1:
             return
         self._apply_history_snapshot(self._history_index + 1)
 
     def _on_timeline_project_mutated(self) -> None:
+        self._pause_timeline_playback_for_user_action()
         self._sync_preview_play_availability()
         self._update_media_library_added_states()
         self._push_timeline_history()
@@ -1776,6 +2045,7 @@ class MainWindow(QMainWindow):
         self.inspector_panel.refresh()
 
     def _on_inspector_clip_changed(self) -> None:
+        self._pause_timeline_playback_for_user_action()
         clip = self.inspector_panel.current_clip()
         info = self.inspector_panel._info
         focus = QApplication.focusWidget()
@@ -2523,6 +2793,181 @@ class MainWindow(QMainWindow):
             pass
         self._save_to_store_safe()
 
+    def _voice_target_subtitle_clips(self) -> list[Clip]:
+        clips: list[Clip] = []
+        for track in self.project.tracks:
+            if track.kind != "text" or self._is_track_hidden(track) or self._is_track_muted(track):
+                continue
+            for clip in track.clips:
+                if not clip.is_text_clip:
+                    continue
+                duration = clip.timeline_duration or 0.0
+                if duration <= 0.0:
+                    continue
+                text = (clip.text_main or clip.text_second or "").strip()
+                if not text:
+                    continue
+                clips.append(clip)
+        clips.sort(key=lambda c: (float(c.start), float(c.timeline_duration or 0.0)))
+        return clips
+
+    @staticmethod
+    def _natural_voice_sort_key(path: Path) -> list[object]:
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", path.name)
+        ]
+
+    def _voice_audio_files_from_folder(self, folder: Path) -> list[Path]:
+        folder = Path(folder)
+        if not folder.is_dir():
+            raise ValueError(f"Folder voice không tồn tại: {folder}")
+        files = [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() == ".mp3"
+        ]
+        files.sort(key=self._natural_voice_sort_key)
+        if not files:
+            raise ValueError("Folder không có file MP3.")
+        return files
+
+    def _add_voice_folder_to_timeline(self, folder: Path) -> list[Clip]:
+        subtitle_clips = self._voice_target_subtitle_clips()
+        audio_files = self._voice_audio_files_from_folder(folder)
+        if subtitle_clips and len(audio_files) != len(subtitle_clips):
+            raise ValueError(
+                f"Số file audio ({len(audio_files)}) không khớp số khối phụ đ "
+                f"({len(subtitle_clips)})."
+            )
+
+        track = self._get_or_create_track("audio", None)
+        touched_tracks: list[Track] = []
+
+        def _register_touched(target: Track) -> None:
+            for existing in touched_tracks:
+                if existing is target:
+                    return
+            touched_tracks.append(target)
+
+        def _has_clip_overlap(target: Track, start: float, duration: float) -> bool:
+            end = float(start) + float(duration)
+            if duration <= 0.0:
+                return False
+            for existing in target.clips:
+                existing_duration = float(existing.timeline_duration or 0.0)
+                if existing_duration <= 0.0:
+                    continue
+                existing_start = float(existing.start)
+                existing_end = existing_start + existing_duration
+                if start < existing_end and end > existing_start:
+                    return True
+            return False
+
+        def _new_audio_track() -> Track:
+            insert_idx = len(self.project.tracks)
+            for idx, existing_track in enumerate(self.project.tracks):
+                if existing_track.kind == "audio":
+                    insert_idx = idx + 1
+            return self._get_or_create_track(
+                "audio",
+                insert_idx,
+                insert_new_track=True,
+            )
+
+        def _pick_target_track(start: float, duration: float) -> Track:
+            candidates: list[Track] = []
+            if not self._is_track_locked(track):
+                candidates.append(track)
+            for existing_track in self.project.tracks:
+                if existing_track.kind != "audio":
+                    continue
+                if existing_track is track:
+                    continue
+                if self._is_track_locked(existing_track):
+                    continue
+                candidates.append(existing_track)
+            for candidate in candidates:
+                if not _has_clip_overlap(candidate, start, duration):
+                    return candidate
+            return _new_audio_track()
+
+        created: list[Clip] = []
+        sequential_start = 0.0
+        if not subtitle_clips:
+            for existing_clip in track.clips:
+                existing_duration = float(existing_clip.timeline_duration or 0.0)
+                if existing_duration > 0.0:
+                    sequential_start = max(
+                        sequential_start,
+                        float(existing_clip.start) + existing_duration,
+                    )
+
+        for index, audio_path in enumerate(audio_files):
+            target_start = sequential_start
+            fallback_duration = 0.05
+            if subtitle_clips:
+                subtitle_clip = subtitle_clips[index]
+                target_start = float(subtitle_clip.start)
+                fallback_duration = max(0.05, float(subtitle_clip.timeline_duration or 0.05))
+            try:
+                duration = probe(audio_path).duration
+            except Exception:
+                duration = None
+            if duration is None or duration <= 0.0:
+                duration = fallback_duration
+
+            target_track = _pick_target_track(target_start, duration)
+            clip = Clip(
+                source=str(audio_path),
+                start=float(target_start),
+                in_point=0.0,
+                out_point=float(duration),
+            )
+            target_track.clips.append(clip)
+            _register_touched(target_track)
+            created.append(clip)
+            self._start_audio_proxy_generation_if_needed(clip)
+            if not subtitle_clips:
+                sequential_start = float(target_start) + float(clip.timeline_duration or duration)
+
+        for touched in touched_tracks:
+            touched.clips.sort(key=lambda c: float(c.start))
+        return created
+
+    def _open_voice_folder_picker(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Chn folder voice")
+        if folder:
+            self._on_add_voice_folder_requested(Path(folder))
+
+    def _on_add_voice_folder_requested(self, folder: Path) -> None:
+        try:
+            created = self._add_voice_folder_to_timeline(Path(folder))
+        except ValueError as exc:
+            QMessageBox.warning(self, "Thêm Voice", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Thêm Voice thất bại", str(exc))
+            return
+
+        self.timeline_panel.refresh()
+        if created:
+            self.timeline_panel.select_clips(created)
+            try:
+                self.timeline_panel.prewarm_track_clips(created)
+            except Exception:
+                pass
+        self.inspector_panel.refresh()
+        self._preview_sync_mode = "timeline"
+        self._push_timeline_history()
+        self._refresh_auto_speed_issue_overlays()
+        self._save_to_store_safe()
+        mode_text = "theo phụ đ" if self._voice_target_subtitle_clips() else "tuần tự"
+        self.statusBar().showMessage(
+            f"ã thêm {len(created)} voice clip vào timeline {mode_text}.",
+            5000,
+        )
+
     def _on_media_files_removed(self, paths: list[Path]) -> None:
         if not paths:
             return
@@ -3168,7 +3613,7 @@ class MainWindow(QMainWindow):
                 self,
                 "CapCut Export Warning",
                 "Main Track Magnet đang tắt và clip đầu trên Main không bắt đầu ở 00:00.\n\n"
-                "JianYing/CapCut có thể tự hút đoạn chính về 0s khi mở draft. "
+                "JianYing/CapCut có thể tự hút đoạn chính v 0s khi mở draft. "
                 "ComeCut sẽ giữ nguyên timeline local của bạn và không tự sửa project.",
             )
 
@@ -3204,6 +3649,7 @@ class MainWindow(QMainWindow):
     def _stop_preview_playback(self) -> None:
         """Stop all preview media immediately (video + timeline audio)."""
         self._stop_gap_playback()
+        self.timeline_panel.set_playing_state(False)
         self.preview_panel.set_timeline_playing_override(False)
         try:
             self.preview_panel.clear()
@@ -3604,8 +4050,8 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------
 
     def _on_ocr_mode_requested(self) -> None:
-        """Kiá»ƒm tra timeline cÃ³ video khÃ´ng, rá»“i báº­t overlay chá»n vÃ¹ng."""
-        # Kiá»ƒm tra Ä‘iá»u kiá»‡n: pháº£i cÃ³ Ã­t nháº¥t 1 clip video trÃªn timeline
+        """Kiá»ƒm tra timeline cÃ³ video khÃ´ng, rá»“i báº­t overlay chá»n vÃ¹ng."""
+        # Kiá»ƒm tra Ä‘iá»u kiá»‡n: pháº£i cÃ³ Ã­t nháº¥t 1 clip video trÃªn timeline
         has_video = any(
             not getattr(clip, "is_text_clip", False)
             for track in self.project.tracks
@@ -3620,20 +4066,20 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(
-            "Chế độ OCR: Kéo để di chuyển / Resize vùng chọn. [Esc] để hủy.", 0
+            "Chế độ OCR: Kéo để di chuyển / Resize vùng chn. [Esc] để hủy.", 0
         )
         self.preview_panel.start_ocr_selection()
         self.text_panel.show_ocr_settings()
         self._update_text_sub_nav_visuals("ocr")
 
     def _on_show_subtitle_list_requested(self) -> None:
-        """Quay láº¡i danh sÃ¡ch phá»¥ Ä‘á»."""
+        """Quay láº¡i danh sÃ¡ch phá»¥ Ä‘á»."""
         self.preview_panel.stop_ocr_selection()
         self.text_panel.show_subtitle_list()
         self._update_text_sub_nav_visuals("list")
 
     def _update_text_sub_nav_visuals(self, mode: str) -> None:
-        """Cáº­p nháº­t style cho cÃ¡c nhÃ£n sub-nav dá»±a trÃªn tab Ä‘ang chá»n."""
+        """Cáº­p nháº­t style cho cÃ¡c nhÃ£n sub-nav dá»±a trÃªn tab Ä‘ang chá»n."""
         active_style = "color: #22d3c5; font-size: 11px; font-weight: normal; padding: 6px 12px; background: #22262d; border-radius: 2px; margin: 4px;"
         inactive_style = "color: #8c93a0; font-size: 11px; font-weight: normal; padding: 6px 12px; background: transparent; border-radius: 2px; margin: 4px;"
 
@@ -3644,7 +4090,7 @@ class MainWindow(QMainWindow):
             self.text_import_nav_label.setStyleSheet(inactive_style)
             self.ocr_nav_label.setStyleSheet(active_style)
     def _on_start_ocr_button_clicked(self) -> None:
-        """Khi ngÆ°á»i dÃ¹ng nháº¥n nÃºt 'Báº¯t Ä‘áº§u trÃ­ch xuáº¥t' trong TextPanel."""
+        """Khi ngÆ°á»i dÃ¹ng nháº¥n nÃºt 'Báº¯t Ä‘áº§u trÃ­ch xuáº¥t' trong TextPanel."""
         lang, mode = self.text_panel.get_ocr_settings()
         area = self.preview_panel.get_ocr_area()
         self._on_ocr_area_selected(*area)
@@ -3655,11 +4101,11 @@ class MainWindow(QMainWindow):
         self.text_panel.show_subtitle_list()
         self._update_text_sub_nav_visuals("list")
         self.inspector_panel.show_properties()
-        self.statusBar().showMessage("Đã hủy chế độ OCR.", 3000)
+        self.statusBar().showMessage("ã hủy chế độ OCR.", 3000)
 
     def _on_ocr_area_selected(self, y1: float, y2: float, x1: float, x2: float) -> None:
-        """Nháº­n vÃ¹ng Ä‘Ã£ chá»n vÃ  khá»Ÿi cháº¡y OCR worker."""
-        self.statusBar().showMessage("Đang chuẩn bị OCR...", 0)
+        """Nháº­n vÃ¹ng Ä‘Ã£ chá»n vÃ  khá»Ÿi cháº¡y OCR worker."""
+        self.statusBar().showMessage("ang chuẩn bị OCR...", 0)
 
         # Láº¥y video clip Ä‘áº§u tiÃªn tá»« timeline
         video_path: str | None = None
@@ -3711,15 +4157,15 @@ class MainWindow(QMainWindow):
             mode=mode,
         )
         self._ocr_worker.progress_frame.connect(
-            lambda p: self.statusBar().showMessage(f"Đang trích xuất khung hình... {p}%", 0)
+            lambda p: self.statusBar().showMessage(f"ang trích xuất khung hình... {p}%", 0)
         )
         self._ocr_worker.progress_ocr.connect(
-            lambda p: self.statusBar().showMessage(f"Đang nhận dạng OCR... {p}%", 0)
+            lambda p: self.statusBar().showMessage(f"ang nhận dạng OCR... {p}%", 0)
         )
         self._ocr_worker.finished.connect(self._on_ocr_result)
         self._ocr_worker.error.connect(self._on_ocr_error)
         self._ocr_worker.start()
-        self.statusBar().showMessage("Đang chạy OCR... Vui lòng chờ.", 0)
+        self.statusBar().showMessage("ang chạy OCR... Vui lòng ch.", 0)
 
     def _on_ocr_result(self, srt_path: str) -> None:
         """Nháº­p file SRT káº¿t quáº£ vÃ o Text Panel."""
@@ -3740,10 +4186,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self.inspector_panel.show_properties())
 
             self.statusBar().showMessage(
-                f"Trích xuất OCR thành công! Đã thêm phụ đề vào Timeline: {p.name}", 8000
+                f"Trích xuất OCR thành công! ã thêm phụ đ vào Timeline: {p.name}", 8000
             )
         else:
-            self.statusBar().showMessage("Không tạo được file phụ đề.", 5000)
+            self.statusBar().showMessage("Không tạo được file phụ đ.", 5000)
 
     def _on_ocr_cue_double_clicked(self, cue: Cue) -> None:
         """Seek timeline when a cue is double-clicked in the OCR results."""
@@ -3751,7 +4197,7 @@ class MainWindow(QMainWindow):
         self._on_timeline_seek(cue.start)
 
     def _on_caption_clip_double_clicked(self, clip: Clip) -> None:
-        """Khi user double-click má»™t dÃ²ng phá»¥ Ä‘á» á»Ÿ tab ChÃº thÃ­ch."""
+        """Khi user double-click má»™t dÃ²ng phá»¥ Ä‘á» á»Ÿ tab ChÃº thÃ­ch."""
         self.timeline_panel.select_clip(clip)
         self.timeline_panel.set_playhead(clip.start)
         self._on_timeline_seek(clip.start)
@@ -3804,7 +4250,7 @@ class MainWindow(QMainWindow):
             start=start,
             in_point=0.0,
             out_point=duration,
-            text_main="Phụ đề mới",
+            text_main="Phụ đ mới",
             text_display="main",
         )
         target_track.clips.append(new_clip)
@@ -3817,17 +4263,17 @@ class MainWindow(QMainWindow):
         self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
         self._push_timeline_history()
         self._refresh_auto_speed_issue_overlays()
-        self.statusBar().showMessage("Đã thêm dòng phụ đề mới.", 3000)
+        self.statusBar().showMessage("ã thêm dòng phụ đ mới.", 3000)
 
     def _on_caption_delete(self, clip: object) -> None:
         target = clip if isinstance(clip, Clip) else self.inspector_panel.current_clip()
         if target is None or not target.is_text_clip:
-            QMessageBox.information(self, "Xóa phụ đề", "Hãy chọn một dòng phụ đề để xóa.")
+            QMessageBox.information(self, "Xóa phụ đ", "Hãy chn một dòng phụ đ để xóa.")
             return
 
         answer = QMessageBox.question(
             self,
-            "Xóa phụ đề",
+            "Xóa phụ đ",
             f'Xóa dòng: "{(target.text_main or "").strip()[:80]}" ?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -3847,7 +4293,7 @@ class MainWindow(QMainWindow):
         self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
         self._push_timeline_history()
         self._refresh_auto_speed_issue_overlays()
-        self.statusBar().showMessage("Đã xóa dòng phụ đề.", 3000)
+        self.statusBar().showMessage("ã xóa dòng phụ đ.", 3000)
 
     def _on_caption_text_edit(self, clip: object, new_text: str) -> None:
         target = clip if isinstance(clip, Clip) else None
@@ -3915,7 +4361,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Tìm & Thay thế",
-            f"Đã cập nhật {changed_rows} dòng phụ đề.",
+            f"ã cập nhật {changed_rows} dòng phụ đ.",
         )
 
 
@@ -3944,7 +4390,7 @@ class MainWindow(QMainWindow):
             if not candidates:
                 self.statusBar().showMessage("Không có dòng cảm thán.", 4000)
                 return
-            dlg = DeleteFilterDialog(self, title="Phụ đề cảm thán", candidates=candidates)
+            dlg = DeleteFilterDialog(self, title="Phụ đ cảm thán", candidates=candidates)
             if dlg.exec() != QDialog.Accepted:
                 return
             to_delete = dlg.selected_clips()
@@ -3961,7 +4407,7 @@ class MainWindow(QMainWindow):
             self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
             self._push_timeline_history()
             self._refresh_auto_speed_issue_overlays()
-            self.statusBar().showMessage(f"Đã xóa {len(to_delete)} dòng cảm thán.", 4000)
+            self.statusBar().showMessage(f"ã xóa {len(to_delete)} dòng cảm thán.", 4000)
             return
 
         if kind == "ocr":
@@ -3976,7 +4422,7 @@ class MainWindow(QMainWindow):
                 ids,
                 ocr_error_check=lambda c: is_ocr_error_text(c.text_main or ""),
             )
-            self.statusBar().showMessage(f"Lọc lỗi OCR: {visible} dòng.", 5000)
+            self.statusBar().showMessage(f"Lc lỗi OCR: {visible} dòng.", 5000)
             return
 
         if kind == "duplicate":
@@ -3987,11 +4433,11 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Không có dòng trùng lặp.", 4000)
                 return
             visible = caption_list.apply_filter("duplicate", ids)
-            self.statusBar().showMessage(f"Trùng lặp liền kề: {visible} dòng.", 5000)
+            self.statusBar().showMessage(f"Trùng lặp lin k: {visible} dòng.", 5000)
             return
 
     def _on_text_card_selected(self, path: Path) -> None:
-        """Khi user click chá»n 1 card phá»¥ Ä‘á» á»Ÿ panel bÃªn trÃ¡i."""
+        """Khi user click chá»n 1 card phá»¥ Ä‘á» á»Ÿ panel bÃªn trÃ¡i."""
         self._preview_sync_mode = "timeline"
 
         # TÃ¬m clip Ä‘áº§u tiÃªn trÃªn timeline dÃ¹ng source nÃ y

@@ -42,10 +42,15 @@ class VoiceMatchPanel(QWidget):
 
     generate_requested = Signal(object)
     import_requested = Signal(object)
+    show_original_requested = Signal()
+    show_matched_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self._generated_path: Path | None = None
+        self._compare_state: str | None = None
+        self._has_original = False
+        self._has_matched = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -145,6 +150,20 @@ class VoiceMatchPanel(QWidget):
         self.import_button.clicked.connect(self._emit_import)
         root.addWidget(self.import_button)
 
+        compare_label = QLabel("So sánh trạng thái")
+        compare_label.setStyleSheet("color: #cfd5df; font-size: 12px; font-weight: 600;")
+        root.addWidget(compare_label)
+
+        compare_row = QHBoxLayout()
+        self.show_original_button = QPushButton("Xem ban đầu")
+        self.show_matched_button = QPushButton("Xem đã khớp")
+        self.show_original_button.clicked.connect(self.show_original_requested.emit)
+        self.show_matched_button.clicked.connect(self.show_matched_requested.emit)
+        compare_row.addWidget(self.show_original_button)
+        compare_row.addWidget(self.show_matched_button)
+        root.addLayout(compare_row)
+        self.set_compare_state(None, has_original=False, has_matched=False)
+
         self.setStyleSheet(
             """
             QWidget { background: #16181d; color: #dce6f2; }
@@ -233,6 +252,14 @@ class VoiceMatchPanel(QWidget):
             widget.setEnabled(not running)
         if running:
             self.import_button.setEnabled(False)
+            self.show_original_button.setEnabled(False)
+            self.show_matched_button.setEnabled(False)
+        else:
+            self.set_compare_state(
+                self._compare_state,
+                has_original=self._has_original,
+                has_matched=self._has_matched,
+            )
 
     def set_progress(self, percent: int, message: str = "") -> None:
         self.progress_bar.setValue(max(0, min(100, int(percent))))
@@ -250,12 +277,29 @@ class VoiceMatchPanel(QWidget):
         self.log_view.clear()
         self.import_button.setEnabled(False)
         self.import_button.setVisible(False)
+        self.set_compare_state(None, has_original=False, has_matched=False)
 
     def set_generated_path(self, path: Path) -> None:
         self._generated_path = Path(path)
-        self.import_button.setEnabled(True)
-        self.import_button.setVisible(True)
         self.append_log(f"Đã tạo draft: {self._generated_path}")
+
+
+    def set_compare_state(
+        self,
+        state: str | None,
+        *,
+        has_original: bool = True,
+        has_matched: bool = True,
+    ) -> None:
+        self._compare_state = state if state in {"original", "matched"} else None
+        self._has_original = bool(has_original)
+        self._has_matched = bool(has_matched)
+        self.show_original_button.setEnabled(
+            self._has_original and self._compare_state != "original"
+        )
+        self.show_matched_button.setEnabled(
+            self._has_matched and self._compare_state != "matched"
+        )
 
 
 __all__ = ["VoiceMatchPanel", "VoiceMatchPanelSettings"]

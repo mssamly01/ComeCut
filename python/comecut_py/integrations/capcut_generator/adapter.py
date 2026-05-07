@@ -8,6 +8,7 @@ import sys
 import types
 from typing import Callable
 
+from ...core.media_probe import probe as probe_media
 from ...core.project import Clip, Project, Track
 from ...subtitles.cue import Cue, CueList
 from ...subtitles.srt import dump_srt
@@ -139,8 +140,10 @@ def prepare_timeline_voice_match_inputs(project: Project, work_dir: Path) -> Tim
 class _ProgressEmitter:
     def __init__(self, callback: ProgressCallback | None) -> None:
         self._callback = callback
+        self.last_message = ""
 
     def emit(self, percent: int, message: str) -> None:
+        self.last_message = str(message)
         if self._callback is not None:
             self._callback(int(percent), str(message))
 
@@ -168,11 +171,78 @@ def _load_capcut_generator_class():
     return CapCutDraftGenerator
 
 
+def _probe_duration_us(path: Path | str) -> int:
+    media_path = Path(path)
+    if not media_path.exists():
+        raise FileNotFoundError(f"Không tìm thấy file media: {media_path}")
+    if media_path.is_file() and media_path.stat().st_size <= 0:
+        raise ValueError(f"File media rỗng: {media_path.name}")
+    info = probe_media(media_path)
+    duration = info.duration
+    if duration is None or duration <= 0:
+        raise ValueError(f"Không đọc được thời lượng media: {media_path.name}")
+    return max(1, int(float(duration) * 1_000_000))
+
+
+def _probe_video_dimensions(path: Path | str, fallback_width: int, fallback_height: int) -> tuple[int, int]:
+    try:
+        info = probe_media(Path(path))
+    except Exception:
+        return int(fallback_width), int(fallback_height)
+    width = int(info.width or 0)
+    height = int(info.height or 0)
+    if width <= 0 or height <= 0:
+        return int(fallback_width), int(fallback_height)
+    return width, height
+
+
+def _validate_timeline_voice_match_media(inputs: TimelineVoiceMatchInputs) -> None:
+    try:
+        _probe_duration_us(inputs.video_path)
+    except Exception as exc:
+        raise RuntimeError(f"Không đọc được video Main: {exc}") from exc
+
+    failed_audio: list[str] = []
+    for audio_path in inputs.audio_files:
+        try:
+            _probe_duration_us(audio_path)
+        except Exception as exc:
+            failed_audio.append(f"- {Path(audio_path).name}: {exc}")
+    if failed_audio:
+        raise RuntimeError("Không đọc được audio voice:\n" + "\n".join(failed_audio))
+
+
+def _install_comecut_media_probe(generator: object) -> None:
+    width = int(getattr(generator, "canvas_width", 1920) or 1920)
+    height = int(getattr(generator, "canvas_height", 1080) or 1080)
+
+    def _get_media_duration(media_path: str) -> int:
+        return _probe_duration_us(media_path)
+
+    def _get_video_dimensions(media_path: str) -> tuple[int, int]:
+        return _probe_video_dimensions(media_path, width, height)
+
+    # The bundled generator expects ffmpeg-python. ComeCut already ships a
+    # local ffprobe-based media_probe, so keep Khớp voice independent of that package.
+    setattr(generator, "get_media_duration", _get_media_duration)
+    setattr(generator, "get_video_dimensions", _get_video_dimensions)
+
+
+def _smart_trimming_available() -> bool:
+    try:
+        from core.audio_video_sync import AudioVideoSyncProcessor  # type: ignore
+
+        return bool(AudioVideoSyncProcessor().is_available())
+    except Exception:
+        return False
+
+
 def generate_voice_match_from_timeline(
     options: TimelineVoiceMatchOptions,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
     inputs = prepare_timeline_voice_match_inputs(options.project, options.work_dir)
+    _validate_timeline_voice_match_media(inputs)
     output_json_path = Path(options.output_json_path)
     output_json_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -185,6 +255,11 @@ def generate_voice_match_from_timeline(
         canvas_width=int(options.project.width),
         canvas_height=int(options.project.height),
     )
+    _install_comecut_media_probe(generator)
+    remove_silence = bool(options.remove_silence)
+    if remove_silence and not _smart_trimming_available():
+        progress.emit(2, "Xóa khoảng lặng bị bỏ qua vì thiếu librosa/soundfile.")
+        remove_silence = False
     result = generator.generate_single_json(
         progress,
         str(inputs.video_path),
@@ -197,14 +272,21 @@ def generate_voice_match_from_timeline(
         str(options.sync_mode),
         bool(options.video_speed_enabled),
         float(options.target_video_speed),
-        bool(options.remove_silence),
+        remove_silence,
         bool(options.waveform_sync),
         None,
         bool(options.skip_stretch_shorter),
         bool(options.export_lt8),
     )
     if not result:
-        raise RuntimeError("Tạo draft khớp voice thất bại.")
+        last_step = progress.last_message.strip()
+        detail = f" Bước cuối: {last_step}" if last_step else ""
+        raise RuntimeError(
+            "Tạo draft khớp voice thất bại."
+            f"{detail} "
+            "Nếu đang bật Xóa khoảng lặng, hãy thử tắt mục này "
+            "hoặc cài thêm thư viện librosa/soundfile cho môi trường Python."
+        )
     return Path(result)
 
 

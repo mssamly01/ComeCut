@@ -1764,6 +1764,7 @@ class ClipRect(QGraphicsRectItem):
         if wave_rect is not None:
             fade_hit = self._hit_fade_handle(event.pos())
             if fade_hit is not None:
+                self._panel.user_pause_requested.emit()
                 self._fade_dragging = fade_hit
                 self._fade_drag_changed = False
                 self._drag_happened = False
@@ -1776,6 +1777,7 @@ class ClipRect(QGraphicsRectItem):
                 event.accept()
                 return
         if wave_rect is not None and self._hit_volume_line(event.pos()):
+            self._panel.user_pause_requested.emit()
             self._volume_dragging = True
             self._volume_drag_changed = False
             self._drag_happened = False
@@ -1789,6 +1791,7 @@ class ClipRect(QGraphicsRectItem):
             return
         trim_hit = self._hit_trim_handle(event.pos())
         if trim_hit is not None:
+            self._panel.user_pause_requested.emit()
             self._trim_dragging = trim_hit
             self._trim_drag_changed = False
             self._trim_drag_ripple = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -1856,6 +1859,8 @@ class ClipRect(QGraphicsRectItem):
         dx = abs(float(sp.x()) - self._press_scene_x)
         dy = abs(float(sp.y()) - self._press_scene_y)
         if dx > 4.0 or dy > 4.0:
+            if not self._drag_happened:
+                self._panel.user_pause_requested.emit()
             self._drag_happened = True
         super().mouseMoveEvent(event)
 
@@ -2125,6 +2130,7 @@ class TimelineView(QGraphicsView):
             self._panel._set_pointer_active(True)
             scene_pt = self.mapToScene(event.pos())
             if float(scene_pt.y()) <= float(RULER_HEIGHT):
+                self._panel.user_pause_requested.emit()
                 self._scrubbing_playhead = True
                 self._panel._begin_playhead_scrub()
                 self._rubber_selecting = False
@@ -2472,6 +2478,7 @@ class TimelinePanel(QWidget):
     save_requested = Signal()
     media_drop_requested = Signal(str, float, int, bool)
     project_mutated = Signal()
+    user_pause_requested = Signal()
 
     def __init__(self, project: Project) -> None:
         super().__init__()
@@ -3140,6 +3147,41 @@ class TimelinePanel(QWidget):
                 return True
         return False
 
+    def _track_count_for_kind(self, kind: str) -> int:
+        return sum(
+            1
+            for track in self._project.tracks
+            if track.kind == kind
+            and not (kind == "video" and self._is_main_track(track))
+        )
+
+    def _clip_count_for_kind(self, kind: str) -> int:
+        return sum(
+            len(track.clips)
+            for track in self._project.tracks
+            if track.kind == kind
+        )
+
+    def _can_create_track_for_clip(
+        self,
+        kind: str,
+        clip: Clip,
+        source_track: Track,
+    ) -> bool:
+        max_tracks = max(1, self._clip_count_for_kind(kind))
+        if self._track_count_for_kind(kind) < max_tracks:
+            return True
+        if self._is_main_track(source_track):
+            return False
+        return clip in source_track.clips and len(source_track.clips) == 1
+
+    def _new_track_name_for_kind(self, kind: str) -> str:
+        label = {"audio": "Audio", "text": "Text", "video": "Video"}.get(
+            kind,
+            kind.title(),
+        )
+        return f"{label} {self._track_count_for_kind(kind) + 1}"
+
     def _update_empty_drop_preview_state(self, *, dragging_media_kind: str | None) -> None:
         should_show = (
             dragging_media_kind == "video"
@@ -3727,6 +3769,65 @@ class TimelinePanel(QWidget):
                 best_dist = dist
         return best_idx
 
+    def _internal_new_track_insert_index(
+        self,
+        kind: str,
+        source_idx: int,
+        dragged_y: float,
+    ) -> int | None:
+        if kind not in {"audio", "text", "video"}:
+            return None
+
+        direct_idx = self._track_index_at_scene_y(dragged_y)
+        if direct_idx is None:
+            nearest_idx = self._nearest_track_index_by_scene_y(dragged_y)
+            if nearest_idx is None:
+                return None
+            top, bottom = self._track_scene_bounds(nearest_idx)
+            center_y = (top + bottom) * 0.5
+            return nearest_idx if dragged_y < center_y else nearest_idx + 1
+
+        if direct_idx < 0 or direct_idx >= len(self._project.tracks):
+            return None
+        top, bottom = self._track_scene_bounds(direct_idx)
+        height = max(1.0, bottom - top)
+        ratio = (dragged_y - top) / height
+        direct_track = self._project.tracks[direct_idx]
+
+        if direct_track.kind == kind:
+            if ratio < 0.18:
+                return direct_idx
+            if ratio > 0.82:
+                return direct_idx + 1
+            return None
+
+        if ratio < 0.25:
+            return direct_idx
+        if ratio > 0.75:
+            return direct_idx + 1
+        return None
+
+    def _insert_track_for_dragged_clip(
+        self,
+        clip: Clip,
+        source_idx: int,
+        insert_idx: int,
+    ) -> tuple[int, int, Track] | None:
+        if source_idx < 0 or source_idx >= len(self._project.tracks):
+            return None
+        source_track = self._project.tracks[source_idx]
+        kind = source_track.kind
+        if not self._can_create_track_for_clip(kind, clip, source_track):
+            return None
+
+        safe_insert_idx = max(0, min(int(insert_idx), len(self._project.tracks)))
+        new_track = Track(kind=kind, name=self._new_track_name_for_kind(kind))
+        self._project.tracks.insert(safe_insert_idx, new_track)
+        if safe_insert_idx <= source_idx:
+            source_idx += 1
+        source_track = self._project.tracks[source_idx]
+        return source_idx, safe_insert_idx, source_track
+
     def _auto_clean_empty_tracks(self) -> None:
         main_idx = self._main_track_index()
         if main_idx is None:
@@ -3851,23 +3952,20 @@ class TimelinePanel(QWidget):
         if direct_target_idx is not None:
             target_idx = direct_target_idx
 
-        main_idx = self._main_track_index()
-        if kind == "video" and main_idx is not None and source_idx == main_idx:
-            main_top, main_bottom = self._track_scene_bounds(main_idx)
-            main_h = max(1.0, main_bottom - main_top)
-            # HTML-like behavior: dragging a main video clip upward can create a new track.
-            if dragged_y < main_top - main_h * 0.15 and target_idx >= main_idx:
-                if main_idx > 0 and self._project.tracks[main_idx - 1].kind == "video":
-                    target_idx = main_idx - 1
-                else:
-                    new_track = Track(
-                        kind="video",
-                        name=f"Video {len(self._project.tracks) + 1}",
-                    )
-                    self._project.tracks.insert(main_idx, new_track)
-                    source_idx += 1
-                    source_track = self._project.tracks[source_idx]
-                    target_idx = main_idx
+        if kind in {"audio", "text", "video"}:
+            insert_idx = self._internal_new_track_insert_index(
+                kind,
+                source_idx,
+                dragged_y,
+            )
+            if insert_idx is not None:
+                inserted = self._insert_track_for_dragged_clip(
+                    clip,
+                    source_idx,
+                    insert_idx,
+                )
+                if inserted is not None:
+                    source_idx, target_idx, source_track = inserted
 
         if target_idx < 0 or target_idx >= len(self._project.tracks):
             target_idx = source_idx

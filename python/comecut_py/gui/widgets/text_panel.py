@@ -335,15 +335,19 @@ class _SubtitleItemWidget(QFrame):
         self._apply_style()
 
     def enterEvent(self, event) -> None:
-        self.del_btn.show()
-        self.del_btn.raise_()
-        self.add_btn.show()
-        self.add_btn.raise_()
+        if hasattr(self, 'del_btn'):
+            self.del_btn.show()
+            self.del_btn.raise_()
+        if hasattr(self, 'add_btn'):
+            self.add_btn.show()
+            self.add_btn.raise_()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self.del_btn.hide()
-        self.add_btn.hide()
+        if hasattr(self, 'del_btn'):
+            self.del_btn.hide()
+        if hasattr(self, 'add_btn'):
+            self.add_btn.hide()
         super().leaveEvent(event)
 
 

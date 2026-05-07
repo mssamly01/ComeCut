@@ -6,8 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from comecut_py.core.project import Clip, Project, Track
+from comecut_py.core.project import Clip, Keyframe, Project, Track
 from comecut_py.integrations.capcut_generator.adapter import (
+    TimelineVoiceMatchOptions,
+    generate_voice_match_from_timeline,
     prepare_timeline_voice_match_inputs,
 )
 
@@ -124,6 +126,75 @@ def test_prepare_timeline_voice_match_inputs_reports_missing_data_in_vietnamese(
     assert "Chưa có phụ đề/text trên timeline" in message
 
 
+def test_generate_voice_match_uses_comecut_media_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from comecut_py.integrations.capcut_generator import adapter as adapter_mod
+
+    video_path = tmp_path / "main.mp4"
+    audio_path = tmp_path / "voice.mp3"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+    output_path = tmp_path / "matched.json"
+    calls: list[tuple[str, str]] = []
+
+    def _fake_probe(path: Path) -> SimpleNamespace:
+        calls.append(("probe", Path(path).name))
+        if Path(path).suffix.lower() == ".mp4":
+            return SimpleNamespace(duration=4.0, width=1280, height=720)
+        return SimpleNamespace(duration=1.25, width=None, height=None)
+
+    class FakeGenerator:
+        def __init__(self, fps: float, canvas_width: int, canvas_height: int) -> None:
+            self.fps = fps
+            self.canvas_width = canvas_width
+            self.canvas_height = canvas_height
+
+        def generate_single_json(self, _progress, video, audio_files, _srt, output, *_args):
+            assert self.get_media_duration(video) == 4_000_000
+            assert self.get_media_duration(audio_files[0]) == 1_250_000
+            assert self.get_video_dimensions(video) == (1280, 720)
+            Path(output).write_text("{}", encoding="utf-8")
+            return output
+
+    monkeypatch.setattr(adapter_mod, "probe_media", _fake_probe)
+    monkeypatch.setattr(adapter_mod, "_load_capcut_generator_class", lambda: FakeGenerator)
+
+    project = Project(
+        tracks=[
+            Track(kind="video", name="Main", clips=[Clip(source=str(video_path), out_point=4.0)]),
+            Track(kind="audio", name="Voice", clips=[Clip(source=str(audio_path), out_point=1.25)]),
+            Track(
+                kind="text",
+                name="Text",
+                clips=[
+                    Clip(
+                        clip_type="text",
+                        source="",
+                        start=0.0,
+                        in_point=0.0,
+                        out_point=1.0,
+                        text_main="line",
+                    )
+                ],
+            ),
+        ]
+    )
+    options = TimelineVoiceMatchOptions(
+        project=project,
+        output_json_path=output_path,
+        work_dir=tmp_path / "work",
+    )
+
+    result = generate_voice_match_from_timeline(options)
+
+    assert result == output_path
+    assert output_path.exists()
+    assert ("probe", "main.mp4") in calls
+    assert ("probe", "voice.mp3") in calls
+
+
 def test_voice_match_panel_has_no_source_picker_fields() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
@@ -174,3 +245,192 @@ def test_set_left_tab_voice_match_uses_side_stack_index_2() -> None:
     assert fake.left_rail.active == TAB_VOICE_MATCH
     assert fake.side_stack.index == 2
     assert fake.sub_nav_stack.index == 2
+
+
+def test_direct_main_voice_match_replaces_main_without_compare_track() -> None:
+    pytest.importorskip("PySide6")
+    from comecut_py.gui.main_window import MainWindow
+
+    original = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Main",
+                clips=[
+                    Clip(
+                        source="original.mp4",
+                        start=0.0,
+                        in_point=0.0,
+                        out_point=8.0,
+                        volume=0.75,
+                    )
+                ],
+            ),
+            Track(
+                kind="audio",
+                name="Voice",
+                clips=[Clip(source="voice.mp3", start=0.5, in_point=0.0, out_point=2.0)],
+            ),
+            Track(
+                kind="text",
+                name="Subtitle",
+                clips=[
+                    Clip(
+                        clip_type="text",
+                        source="",
+                        start=0.5,
+                        in_point=0.0,
+                        out_point=2.0,
+                        text_main="old subtitle",
+                    )
+                ],
+            ),
+        ],
+    )
+    matched = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Khớp voice - Video",
+                clips=[
+                    Clip(
+                        source="original.mp4",
+                        start=0.0,
+                        in_point=0.0,
+                        out_point=2.0,
+                        speed=0.9,
+                        volume_keyframes=[Keyframe(time=0.0, value=0.0)],
+                    ),
+                    Clip(
+                        source="original.mp4",
+                        start=2.0,
+                        in_point=2.0,
+                        out_point=4.5,
+                        speed=1.25,
+                    ),
+                ],
+            ),
+            Track(
+                kind="text",
+                name="Matched Text",
+                clips=[
+                    Clip(
+                        clip_type="text",
+                        source="",
+                        start=2.25,
+                        in_point=0.0,
+                        out_point=1.0,
+                        text_main="matched subtitle",
+                    )
+                ],
+            ),
+            Track(
+                kind="audio",
+                name="Matched Voice",
+                clips=[Clip(source="voice.mp3", start=2.25, in_point=0.0, out_point=1.0)],
+            ),
+        ],
+    )
+
+    result = MainWindow._build_direct_main_matched_project(original, matched)
+    result_main = MainWindow._main_video_track_for_project(result)
+    result_text = next(track for track in result.tracks if track.kind == "text")
+    result_audio = next(track for track in result.tracks if track.kind == "audio")
+
+    assert result_main is not None
+    assert result_main.name == "Main"
+    assert [clip.speed for clip in result_main.clips] == [0.9, 1.25]
+    assert [clip.volume for clip in result_main.clips] == [0.75, 0.75]
+    assert result_main.clips[0].volume_keyframes == []
+    assert result_main.clips[0].audio_effects.fade_in == 0.0
+    assert result_main.clips[0].audio_effects.fade_out == 0.0
+    assert [track.name for track in result.tracks] == ["Main", "Matched Voice", "Matched Text"]
+    assert result_text.clips[0].start == 2.25
+    assert result_text.clips[0].text_main == "matched subtitle"
+    assert result_audio.clips[0].start == 2.25
+    assert original.tracks[0].clips[0].source == "original.mp4"
+    assert len(original.tracks[0].clips) == 1
+
+
+def test_voice_match_snapshot_toggle_restores_original_and_matched() -> None:
+    pytest.importorskip("PySide6")
+    from comecut_py.gui.main_window import MainWindow
+
+    original = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Main",
+                clips=[Clip(source="original.mp4", out_point=8.0)],
+            )
+        ],
+    )
+    matched = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Main",
+                clips=[
+                    Clip(source="original.mp4", start=0.0, in_point=0.0, out_point=2.0, speed=0.8),
+                    Clip(source="original.mp4", start=2.0, in_point=2.0, out_point=4.0, speed=1.2),
+                ],
+            )
+        ],
+    )
+
+    class FakePanel:
+        state: str | None = None
+
+        def set_compare_state(self, state: str | None, **_kwargs) -> None:
+            self.state = state
+
+    class FakeWindow:
+        def __init__(self) -> None:
+            self._voice_match_original_project = original
+            self._voice_match_matched_project = matched
+            self._voice_match_view_state = None
+            self.voice_match_panel = FakePanel()
+            self.project = Project()
+
+        def _apply_voice_match_project_snapshot(self, snapshot: Project, view_state: str) -> None:
+            self.project = snapshot.model_copy(deep=True)
+            self._voice_match_view_state = view_state
+
+    fake = FakeWindow()
+
+    MainWindow._on_voice_match_show_matched(fake)
+    assert fake._voice_match_view_state == "matched"
+    assert fake.voice_match_panel.state == "matched"
+    assert len(fake.project.tracks[0].clips) == 2
+    assert fake.project.tracks[0].clips[1].speed == 1.2
+
+    MainWindow._on_voice_match_show_original(fake)
+    assert fake._voice_match_view_state == "original"
+    assert fake.voice_match_panel.state == "original"
+    assert len(fake.project.tracks[0].clips) == 1
+    assert fake.project.tracks[0].clips[0].source == "original.mp4"
+
+
+def test_voice_match_panel_compare_buttons_state() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from comecut_py.gui.widgets.voice_match_panel import VoiceMatchPanel
+
+    _app = QApplication.instance() or QApplication([])
+    panel = VoiceMatchPanel()
+    try:
+        panel.set_compare_state("matched", has_original=True, has_matched=True)
+        assert panel.show_original_button.isEnabled()
+        assert not panel.show_matched_button.isEnabled()
+
+        panel.set_compare_state("original", has_original=True, has_matched=True)
+        assert not panel.show_original_button.isEnabled()
+        assert panel.show_matched_button.isEnabled()
+
+        panel.set_compare_state(None, has_original=False, has_matched=False)
+        assert not panel.show_original_button.isEnabled()
+        assert not panel.show_matched_button.isEnabled()
+    finally:
+        panel.deleteLater()

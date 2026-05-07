@@ -1195,6 +1195,7 @@ class PreviewPanel(QWidget):
         self._timeline_audio_source_key: str | None = None
         self._timeline_audio_last_seek_ms: int = -1
         self._timeline_audio_last_seek_ts: float = 0.0
+        self._timeline_audio_should_play = False
         self._media_source_path: str | None = None
         self._timeline_play_available = False
         self._timeline_playing_override: bool | None = None
@@ -1226,6 +1227,9 @@ class PreviewPanel(QWidget):
         self._player.positionChanged.connect(self._on_position)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
         self._player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self._timeline_audio_player.playbackStateChanged.connect(
+            self._on_timeline_audio_playback_state_changed
+        )
         self._meter_result_ready.connect(self._on_meter_result_ready)
 
         self._apply_footer_icons()
@@ -1585,6 +1589,7 @@ class PreviewPanel(QWidget):
             ms_i = 0
 
         should_play = playing and not muted
+        self._timeline_audio_should_play = bool(should_play)
         is_playing = (
             self._timeline_audio_player.playbackState()
             == QMediaPlayer.PlaybackState.PlayingState
@@ -1644,6 +1649,7 @@ class PreviewPanel(QWidget):
             self._timeline_audio_player.pause()
 
     def clear_timeline_audio(self) -> None:
+        self._timeline_audio_should_play = False
         self._timeline_audio_player.pause()
         self._timeline_audio_player.setSource(QUrl())
         self._timeline_audio_source_path = None
@@ -1881,6 +1887,17 @@ class PreviewPanel(QWidget):
         self.playback_state_changed.emit(
             self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
         )
+
+    def _on_timeline_audio_playback_state_changed(
+        self, state: QMediaPlayer.PlaybackState
+    ) -> None:
+        # Some backends can transiently auto-resume after source updates.
+        # Timeline audio must only play when explicitly requested by timeline clock.
+        if (
+            state == QMediaPlayer.PlaybackState.PlayingState
+            and not self._timeline_audio_should_play
+        ):
+            self._timeline_audio_player.pause()
 
     def _on_duration(self, d: int) -> None:
         self._duration_ms = d
