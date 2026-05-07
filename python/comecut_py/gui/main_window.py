@@ -1682,9 +1682,8 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_audio_gain(gain)
 
     def _pick_video_clip_for_time(self, seconds: float) -> Clip | None:
-        s = max(0.0, float(seconds))
         self._ensure_clip_interval_indexes()
-        return self._video_clip_index.find(s)
+        return self._video_clip_index.find(max(0.0, float(seconds)))
 
     def _pick_preview_clip_for_time(
         self,
@@ -2726,10 +2725,6 @@ class MainWindow(QMainWindow):
             return cached
         for track in self.project.tracks:
             if any(existing is clip for existing in track.clips):
-                self._clip_track_map[cache_key] = track
-                return track
-        for track in self.project.tracks:
-            if clip in track.clips:
                 self._clip_track_map[cache_key] = track
                 return track
         return None

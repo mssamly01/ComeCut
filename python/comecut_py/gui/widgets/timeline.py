@@ -72,6 +72,18 @@ from ..preview_timeline import clip_fade_multiplier_at_local_time
 
 _RESOLVED_PATH_CACHE: dict[str, str] = {}
 _IS_FILE_CACHE: dict[str, bool] = {}
+_IS_FILE_CACHE_MAX = 8192
+
+
+def _cached_is_file(path_str: str) -> bool:
+    cached = _IS_FILE_CACHE.get(path_str)
+    if cached is not None:
+        return cached
+    result = Path(path_str).is_file()
+    if len(_IS_FILE_CACHE) >= _IS_FILE_CACHE_MAX:
+        _IS_FILE_CACHE.clear()
+    _IS_FILE_CACHE[path_str] = result
+    return result
 
 
 def _resolved_source_str(source: str | Path) -> str:
@@ -743,7 +755,7 @@ class ClipRect(QGraphicsRectItem):
         self._is_audio_clip = self._track_kind == "audio"
         self._decode_source_key = self._current_decode_source_key()
         self._content_signature = self._make_content_signature(clip, self._track_kind)
-        self._is_missing = not self._is_text_clip and not _cached_is_file(clip.source)
+        self._is_missing = not self._is_text_clip and not _cached_is_file(str(clip.source))
         
         self.setPos(panel.seconds_to_pixels(clip.start), lane_y)
         self.setBrush(QBrush(color))
@@ -834,7 +846,7 @@ class ClipRect(QGraphicsRectItem):
             self._content_signature = new_signature
             changed = True
 
-        new_is_missing = not self._is_text_clip and not _cached_is_file(clip.source)
+        new_is_missing = not self._is_text_clip and not _cached_is_file(str(clip.source))
         if new_is_missing != self._is_missing:
             self._is_missing = new_is_missing
             changed = True
