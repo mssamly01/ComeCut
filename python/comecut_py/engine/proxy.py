@@ -5,7 +5,7 @@ editing. The full-resolution source is still used at render time — the
 :func:`comecut_py.engine.render.render_project` function accepts a
 ``use_proxies`` flag that swaps ``Clip.source`` for ``Clip.proxy`` when True.
 
-Proxies are cached under ``~/.cache/comecut-py/proxies/`` keyed by a hash of
+Proxies are cached under the app user cache directory keyed by a hash of
 ``(source path, size, mtime, target width, target height, video codec)`` so
 we don't regenerate them for every preview session.
 """
@@ -13,7 +13,6 @@ we don't regenerate them for every preview session.
 from __future__ import annotations
 
 import hashlib
-import os
 import subprocess
 from pathlib import Path
 
@@ -22,11 +21,11 @@ from ..core.ffmpeg_cmd import (
     detect_nvenc_available,
     ensure_ffmpeg,
 )
+from ..core.media_cache import user_cache_root
 
 
 def _cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    d = Path(base) / "comecut-py" / "proxies"
+    d = user_cache_root() / "proxies"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

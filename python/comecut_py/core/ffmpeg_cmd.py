@@ -222,7 +222,7 @@ def flatten(*groups: Iterable[str]) -> list[str]:
     return out
 
 
-def get_video_duration(path: str | Path) -> float:
+def get_video_duration(path: str | Path, *, timeout: float = 10.0) -> float:
     """Return the duration of a media file in seconds using ffprobe."""
     def _parse_duration(raw: str) -> float | None:
         if not raw:
@@ -264,7 +264,13 @@ def get_video_duration(path: str | Path) -> float:
             ],
         ]
         for argv in probes:
-            res = subprocess.run(argv, capture_output=True, text=True, check=True)
+            res = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=max(1.0, float(timeout)),
+            )
             parsed = _parse_duration(res.stdout or "")
             if parsed is not None:
                 return parsed

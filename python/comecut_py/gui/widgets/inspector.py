@@ -574,6 +574,7 @@ class _CaptionListWidget(QWidget):
         self._caption_start_times: list[float] = []
         self._caption_end_times: list[float] = []
         self._caption_clip_signature: tuple[tuple[int, int, int], ...] = ()
+        self._last_auto_scroll_row: int | None = None
 
     def _caption_item_font(self):
         font = self._table.font()
@@ -624,6 +625,7 @@ class _CaptionListWidget(QWidget):
             + max(0.0, float(getattr(clip, "timeline_duration", 0.0) or 0.0))
             for row, clip in enumerate(items)
         ]
+        self._last_auto_scroll_row = None
         self._model.set_item_font(self._caption_item_font())
         self._model.set_clips(items)
         self._update_stt_column_width()
@@ -657,6 +659,7 @@ class _CaptionListWidget(QWidget):
         self._caption_clip_signature = ()
         self._caption_start_times = []
         self._caption_end_times = []
+        self._last_auto_scroll_row = None
         self._model.set_clips([])
         self._update_stt_column_width()
         self._search_matches = []
@@ -695,6 +698,9 @@ class _CaptionListWidget(QWidget):
 
         if target_row is None:
             return
+        if target_row == self._last_auto_scroll_row:
+            return
+        self._last_auto_scroll_row = target_row
         index = self._model.index(target_row, 0)
         if not index.isValid():
             return

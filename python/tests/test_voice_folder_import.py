@@ -4,31 +4,56 @@ from pathlib import Path
 
 import pytest
 
+from comecut_py.core.media_cache import CachedMediaInfo
 from comecut_py.core.project import Clip, Project, Track
-
-
-class _ProbeInfo:
-    def __init__(self, duration: float) -> None:
-        self.duration = duration
 
 
 class _VoiceImportHarness:
     from comecut_py.gui.main_window import MainWindow
 
+    _source_key_for_path = staticmethod(MainWindow._source_key_for_path)
     _is_track_hidden = staticmethod(MainWindow._is_track_hidden)
     _is_track_locked = staticmethod(MainWindow._is_track_locked)
     _is_track_muted = staticmethod(MainWindow._is_track_muted)
     _main_video_track = MainWindow._main_video_track
     _get_or_create_track = MainWindow._get_or_create_track
+    _cached_media_info_for_path = MainWindow._cached_media_info_for_path
+    _duration_for_insert = MainWindow._duration_for_insert
     _voice_target_subtitle_clips = MainWindow._voice_target_subtitle_clips
     _voice_audio_files_from_folder = MainWindow._voice_audio_files_from_folder
     _add_voice_folder_to_timeline = MainWindow._add_voice_folder_to_timeline
 
-    def __init__(self, project: Project) -> None:
+    class _Cache:
+        def __init__(self, durations: dict[str, float] | None = None) -> None:
+            self.durations = durations or {}
+
+        def get(self, path: Path | str) -> CachedMediaInfo | None:
+            duration = self.durations.get(Path(path).name)
+            if duration is None:
+                return None
+            return CachedMediaInfo(
+                source=str(path),
+                duration=duration,
+                has_audio=True,
+                has_video=False,
+                audio_codec="mp3",
+            )
+
+    class _Ingest:
+        def __init__(self, durations: dict[str, float] | None = None) -> None:
+            self.cache = _VoiceImportHarness._Cache(durations)
+            self.enqueued: list[Path] = []
+
+        def enqueue(self, path: Path | str) -> None:
+            self.enqueued.append(Path(path))
+
+    def __init__(self, project: Project, durations: dict[str, float] | None = None) -> None:
         from comecut_py.gui.main_window import MainWindow
 
         self.project = project
         self._natural_voice_sort_key = MainWindow._natural_voice_sort_key
+        self._media_ingest = self._Ingest(durations)
+        self._duration_placeholder_clip_ids: set[int] = set()
         self.audio_proxy_started: list[Clip] = []
 
     def _start_audio_proxy_generation_if_needed(self, clip: Clip) -> None:
@@ -54,27 +79,19 @@ def _touch_mp3(folder: Path, name: str) -> Path:
 
 def test_add_voice_folder_without_subtitles_adds_sequential_audio(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _touch_mp3(tmp_path, "10.mp3")
     _touch_mp3(tmp_path, "1.mp3")
     _touch_mp3(tmp_path, "2.mp3")
-    harness = _VoiceImportHarness(Project(tracks=[]))
-
-    from comecut_py.gui import main_window as main_window_mod
-
     durations = {"1.mp3": 1.0, "2.mp3": 2.5, "10.mp3": 3.0}
-    monkeypatch.setattr(
-        main_window_mod,
-        "probe",
-        lambda path: _ProbeInfo(durations[Path(path).name]),
-    )
+    harness = _VoiceImportHarness(Project(tracks=[]), durations=durations)
 
     created = harness._add_voice_folder_to_timeline(tmp_path)
 
     assert [Path(clip.source).name for clip in created] == ["1.mp3", "2.mp3", "10.mp3"]
     assert [clip.start for clip in created] == [0.0, 1.0, 3.5]
     assert [clip.out_point for clip in created] == [1.0, 2.5, 3.0]
+    assert [path.name for path in harness._media_ingest.enqueued] == ["1.mp3", "2.mp3", "10.mp3"]
     assert harness.project.library_media == []
 
 
@@ -104,7 +121,6 @@ def test_add_voice_folder_mismatch_does_not_create_audio(tmp_path: Path) -> None
 
 def test_add_voice_folder_matches_mp3_to_subtitle_timestamps(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _touch_mp3(tmp_path, "10.mp3")
     _touch_mp3(tmp_path, "1.mp3")
@@ -131,14 +147,7 @@ def test_add_voice_folder_matches_mp3_to_subtitle_timestamps(
     )
     durations = {"1.mp3": 1.1, "2.mp3": 2.2, "10.mp3": 10.1}
 
-    from comecut_py.gui import main_window as main_window_mod
-
-    monkeypatch.setattr(
-        main_window_mod,
-        "probe",
-        lambda path: _ProbeInfo(durations[Path(path).name]),
-    )
-    harness = _VoiceImportHarness(project)
+    harness = _VoiceImportHarness(project, durations=durations)
 
     created = harness._add_voice_folder_to_timeline(tmp_path)
 
@@ -149,23 +158,17 @@ def test_add_voice_folder_matches_mp3_to_subtitle_timestamps(
     audio_tracks = [track for track in project.tracks if track.kind == "audio"]
     assert len(audio_tracks) == 1
     assert audio_tracks[0].clips == created
-    assert harness.audio_proxy_started == created
+    assert harness.audio_proxy_started == []
+    assert [path.name for path in harness._media_ingest.enqueued] == ["1.mp3", "2.mp3", "10.mp3"]
 
 
 def test_add_voice_folder_falls_back_to_subtitle_duration_when_probe_fails(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _touch_mp3(tmp_path, "1.mp3")
     project = Project(
         tracks=[Track(kind="text", name="Subtitle", clips=[_text_clip(4.0, 2.5, "line")])]
     )
-    from comecut_py.gui import main_window as main_window_mod
-
-    def _raise_probe(_path: object) -> _ProbeInfo:
-        raise RuntimeError("bad media")
-
-    monkeypatch.setattr(main_window_mod, "probe", _raise_probe)
     harness = _VoiceImportHarness(project)
 
     created = harness._add_voice_folder_to_timeline(tmp_path)
@@ -173,11 +176,11 @@ def test_add_voice_folder_falls_back_to_subtitle_duration_when_probe_fails(
     assert len(created) == 1
     assert created[0].start == 4.0
     assert created[0].out_point == 2.5
+    assert id(created[0]) in harness._duration_placeholder_clip_ids
 
 
 def test_add_voice_folder_overlapping_subtitles_auto_split_to_multiple_audio_tracks(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _touch_mp3(tmp_path, "1.mp3")
     _touch_mp3(tmp_path, "2.mp3")
@@ -193,15 +196,7 @@ def test_add_voice_folder_overlapping_subtitles_auto_split_to_multiple_audio_tra
             )
         ]
     )
-    harness = _VoiceImportHarness(project)
-
-    from comecut_py.gui import main_window as main_window_mod
-
-    monkeypatch.setattr(
-        main_window_mod,
-        "probe",
-        lambda _path: _ProbeInfo(2.0),
-    )
+    harness = _VoiceImportHarness(project, durations={"1.mp3": 2.0, "2.mp3": 2.0})
 
     created = harness._add_voice_folder_to_timeline(tmp_path)
 
@@ -217,7 +212,6 @@ def test_add_voice_folder_overlapping_subtitles_auto_split_to_multiple_audio_tra
 
 def test_add_voice_folder_uses_new_audio_track_when_existing_track_overlaps(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _touch_mp3(tmp_path, "1.mp3")
     project = Project(
@@ -241,15 +235,7 @@ def test_add_voice_folder_uses_new_audio_track_when_existing_track_overlaps(
             ),
         ]
     )
-    harness = _VoiceImportHarness(project)
-
-    from comecut_py.gui import main_window as main_window_mod
-
-    monkeypatch.setattr(
-        main_window_mod,
-        "probe",
-        lambda _path: _ProbeInfo(1.5),
-    )
+    harness = _VoiceImportHarness(project, durations={"1.mp3": 1.5})
 
     created = harness._add_voice_folder_to_timeline(tmp_path)
 

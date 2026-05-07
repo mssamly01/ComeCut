@@ -9,17 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import struct
 import subprocess
 from pathlib import Path
 
 from ..core.ffmpeg_cmd import ensure_ffmpeg
+from ..core.media_cache import user_cache_root
 
 
 def _cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    d = Path(base) / "comecut-py" / "waveforms"
+    d = user_cache_root() / "waveform"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -79,8 +78,7 @@ def render_waveform_png(
 
 
 def _peaks_cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    d = Path(base) / "comecut-py" / "waveform-peaks"
+    d = user_cache_root() / "waveform-peaks"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

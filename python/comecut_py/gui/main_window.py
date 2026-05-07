@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (  # type: ignore
     QWidget,
 )
 
-from ..core.ffmpeg_cmd import get_video_duration
+from ..core.media_cache import CachedMediaInfo
 from ..core.media_probe import probe
 from ..core.auto_ducking import (
     AutoDuckingConfig,
@@ -79,6 +79,7 @@ from ..subtitles.translate_batch import (
 from ..subtitles.vtt import parse_vtt, write_vtt
 from .dialogs.export_dialog import ExportDialog
 from .dialogs.plugin_manager import PluginManagerDialog
+from .media_ingest_service import MediaIngestService
 from .dialogs.subtitle_edit_translate import SubtitleDialogInfo, SubtitleEditTranslateDialog
 from .plugin_config import PluginConfigStore, build_translate_provider
 from .preview_timeline import (
@@ -141,6 +142,7 @@ class _VoiceMatchWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    _VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
     _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
     _SUBTITLE_EXTS = {".srt", ".vtt", ".lrc", ".ass", ".ssa", ".txt"}
     _PROXY_MIN_DURATION_SECONDS = 30.0
@@ -148,6 +150,7 @@ class MainWindow(QMainWindow):
     _PROXY_PREVIEW_CRF = 30
     _VIDEO_CLOCK_RESYNC_THRESHOLD_MS = 450
     _VIDEO_RESUME_RESYNC_DELAY_MS = 120
+    _LARGE_SUBTITLE_IMPORT_CUE_COUNT = 500
     _TIMELINE_AUDIO_WINDOW_SECONDS = 120.0
     _TIMELINE_AUDIO_WINDOW_STEP_SECONDS = 60.0
     _TIMELINE_AUDIO_WINDOW_PREFETCH_SECONDS = 30.0
@@ -174,6 +177,7 @@ class MainWindow(QMainWindow):
         self._subtitle_lookup_dirty = True
         self._subtitle_lookup_starts: list[float] = []
         self._subtitle_lookup_items: list[tuple[float, float, Clip]] = []
+        self._subtitle_overlay_state: tuple | None = None
         self._menu_just_closed = False
         self._suspend_timeline_selection_sync = False
         self._history_snapshots: list[str] = []
@@ -188,6 +192,8 @@ class MainWindow(QMainWindow):
         self._audio_proxy_inflight: set[str] = set()
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
+        self._media_ingest = MediaIngestService()
+        self._duration_placeholder_clip_ids: set[int] = set()
         self._suspend_text_autoselect = False
         self._voice_match_worker: _VoiceMatchWorker | None = None
         self._voice_match_original_project: Project | None = None
@@ -374,6 +380,11 @@ class MainWindow(QMainWindow):
         self.media_panel.media_double_clicked.connect(self._on_add_clip)
         self.media_panel.media_add_requested.connect(self._on_add_clip_from_card)
         self.media_panel.media_selection_changed.connect(self._on_media_selection_changed)
+        self._media_ingest.status_changed.connect(self._on_ingest_status_changed)
+        self._media_ingest.metadata_ready.connect(self._on_ingest_metadata_ready)
+        self._media_ingest.thumbnail_ready.connect(self._on_ingest_thumbnail_ready)
+        self._media_ingest.proxy_ready.connect(self._on_ingest_proxy_ready)
+        self._media_ingest.audio_proxy_ready.connect(self._on_ingest_audio_proxy_ready)
         self.text_panel.subtitle_add_requested.connect(self._on_add_clip_from_card)
         self.text_panel.subtitle_files_imported.connect(self._on_subtitle_files_imported)
         self.text_panel.subtitle_files_removed.connect(self._on_subtitle_files_removed)
@@ -479,7 +490,9 @@ class MainWindow(QMainWindow):
         self._update_subtitle_overlay(timeline_seconds)
         self._auto_select_text_clip_at_playhead()
         try:
-            self.inspector_panel._info._caption_list.scroll_to_clip_at_time(timeline_seconds)
+            info = self.inspector_panel._info
+            if info._btn_text_tab_caption.isChecked() and info._text_tab_stack.currentIndex() == 0:
+                info._caption_list.scroll_to_clip_at_time(timeline_seconds)
         except Exception:
             pass
 
@@ -834,6 +847,41 @@ class MainWindow(QMainWindow):
         except Exception:
             return str(path)
 
+    def _cached_media_info_for_path(self, path: Path | str) -> CachedMediaInfo | None:
+        try:
+            return self._media_ingest.cache.get(path)
+        except Exception:
+            return None
+
+    def _duration_for_insert(
+        self,
+        path: Path | str,
+        *,
+        fallback: float = 5.0,
+    ) -> tuple[float, bool]:
+        path_obj = Path(path)
+        cached = self._cached_media_info_for_path(path_obj)
+        if cached is not None and cached.duration and cached.duration > 0.0:
+            return float(cached.duration), False
+        try:
+            norm = str(path_obj.resolve()).lower()
+        except Exception:
+            norm = str(path_obj).lower()
+        for entry in getattr(self.project, "library_media", []) or []:
+            try:
+                entry_norm = str(Path(str(entry.source)).resolve()).lower()
+            except Exception:
+                entry_norm = str(getattr(entry, "source", "") or "").lower()
+            if entry_norm == norm:
+                try:
+                    duration = float(getattr(entry, "duration", 0.0) or 0.0)
+                except Exception:
+                    duration = 0.0
+                if duration > 0.0:
+                    return duration, False
+                break
+        return max(0.001, float(fallback)), True
+
     def _audio_proxy_for_source_path(self, path: Path | str) -> Path | None:
         key = self._source_key_for_path(path)
         proxy = self._audio_proxy_by_source.get(key)
@@ -877,19 +925,20 @@ class MainWindow(QMainWindow):
         ext = path.suffix.lower()
         if ext in self._AUDIO_EXTS:
             return True
-        try:
-            key = str(path.resolve()).lower()
-        except Exception:
-            key = str(path).lower()
+        key = self._source_key_for_path(path)
         cached = self._preview_audio_presence_cache.get(key)
         if cached is not None:
             return cached
+        info = self._cached_media_info_for_path(path)
+        if info is not None:
+            has_audio = bool(info.has_audio)
+            self._preview_audio_presence_cache[key] = has_audio
+            return has_audio
         try:
-            has_audio = bool(probe(path).has_audio)
+            self._media_ingest.enqueue(path)
         except Exception:
-            has_audio = True
-        self._preview_audio_presence_cache[key] = has_audio
-        return has_audio
+            pass
+        return True
 
     def _clip_has_preview_audio(self, clip: Clip) -> bool:
         track = self._find_track_for_clip(clip)
@@ -1030,6 +1079,7 @@ class MainWindow(QMainWindow):
             ):
                 current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
                 self._clear_preview_video_when_no_video()
+                self._subtitle_overlay_state = None
                 self._set_preview_timeline_time_display(current)
             return
 
@@ -1052,6 +1102,8 @@ class MainWindow(QMainWindow):
             if not same_clip or force_seek or not self.preview_panel.main_player_is_playing():
                 self._preview_active_media_clip = video_clip
                 self._preview_source_path = preview_path_s
+                if not same_clip or force_seek:
+                    self._subtitle_overlay_state = None
                 self.preview_panel.load_seek_play(
                     preview_path,
                     source_ms,
@@ -1065,6 +1117,8 @@ class MainWindow(QMainWindow):
             return
 
         self._preview_active_media_clip = video_clip
+        if not same_clip or force_seek:
+            self._subtitle_overlay_state = None
         self._set_preview_source_for_clip(video_clip)
         self.preview_panel.seek(source_ms, throttle=throttle_preview)
         self.preview_panel.pause()
@@ -1093,7 +1147,9 @@ class MainWindow(QMainWindow):
         self._update_subtitle_overlay(s)
         self._auto_select_text_clip_at_playhead()
         try:
-            self.inspector_panel._info._caption_list.scroll_to_clip_at_time(s)
+            info = self.inspector_panel._info
+            if info._btn_text_tab_caption.isChecked() and info._text_tab_stack.currentIndex() == 0:
+                info._caption_list.scroll_to_clip_at_time(s)
         except Exception:
             pass
 
@@ -1755,6 +1811,7 @@ class MainWindow(QMainWindow):
         self._subtitle_lookup_dirty = True
         self._subtitle_lookup_starts = []
         self._subtitle_lookup_items = []
+        self._subtitle_overlay_state = None
 
     def _ensure_subtitle_lookup_cache(self) -> None:
         if not self._subtitle_lookup_dirty:
@@ -1801,6 +1858,23 @@ class MainWindow(QMainWindow):
         active_text_clip = self._active_text_clip_at(seconds)
         main_txt = (active_text_clip.text_main or "") if active_text_clip is not None else ""
         second_txt = (active_text_clip.text_second or "") if active_text_clip is not None else ""
+        if active_text_clip is None:
+            state = (None, "", "")
+        else:
+            state = (
+                id(active_text_clip),
+                main_txt,
+                second_txt,
+                active_text_clip.pos_x,
+                active_text_clip.pos_y,
+                int(getattr(active_text_clip, "text_font_size", 36)),
+                int(self.project.width),
+                int(self.project.height),
+            )
+        if state == self._subtitle_overlay_state:
+            self._preview_active_text_clip = active_text_clip
+            return
+        self._subtitle_overlay_state = state
         self._preview_active_text_clip = active_text_clip
         self.preview_panel.set_subtitle(main_txt, second_txt)
         if active_text_clip is not None:
@@ -1876,6 +1950,7 @@ class MainWindow(QMainWindow):
             return
         clip.pos_x = int(x)
         clip.pos_y = int(y)
+        self._subtitle_overlay_state = None
         self.preview_panel.set_subtitle_position(
             pos_x=clip.pos_x,
             pos_y=clip.pos_y,
@@ -3165,17 +3240,19 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         from ..core.project import LibraryEntry
-        from ..core.media_probe import probe
+
         existing = {self._norm_lib_path(e.source) for e in self.project.library_media}
+        added_count = 0
         for p in paths:
             norm = self._norm_lib_path(p)
             if not norm or norm in existing:
+                try:
+                    self._media_ingest.enqueue(p)
+                except Exception:
+                    pass
                 continue
-            duration = None
-            try:
-                duration = probe(p).duration
-            except Exception:
-                pass
+            cached = self._cached_media_info_for_path(p)
+            duration = cached.duration if cached is not None else None
             try:
                 st = Path(p).stat()
                 entry = LibraryEntry(
@@ -3185,11 +3262,153 @@ class MainWindow(QMainWindow):
                 entry = LibraryEntry(source=str(p), name=Path(p).name, duration=duration)
             self.project.library_media.append(entry)
             existing.add(norm)
+            added_count += 1
+            try:
+                self._media_ingest.enqueue(p)
+            except Exception:
+                pass
+        self._save_to_store_safe()
+        if added_count:
+            self.statusBar().showMessage(
+                f"Imported {added_count} file(s). Analyzing in background...",
+                4000,
+            )
+
+    def _on_ingest_status_changed(self, path_obj: object, status_obj: object) -> None:
+        path = Path(str(path_obj))
+        status = str(status_obj or "")
         try:
-            self.timeline_panel.prewarm_media(paths)
+            self.media_panel.update_media_status(path, status)
         except Exception:
             pass
+        if status and status != "Ready":
+            self.statusBar().showMessage(f"{status}: {path.name}", 2500)
+
+    def _on_ingest_metadata_ready(self, path_obj: object, info_obj: object) -> None:
+        path = Path(str(path_obj))
+        if not isinstance(info_obj, CachedMediaInfo):
+            self.media_panel.update_media_status(path, "Analyze failed")
+            return
+
+        info = info_obj
+        source_key = self._source_key_for_path(path)
+        self._preview_audio_presence_cache[source_key] = bool(info.has_audio)
+
+        changed_library = False
+        norm = self._norm_lib_path(path)
+        for entry in self.project.library_media:
+            if self._norm_lib_path(entry.source) != norm:
+                continue
+            duration = info.duration if info.duration and info.duration > 0.0 else getattr(entry, "duration", None)
+            try:
+                entry.duration = duration
+                entry.size = info.size or getattr(entry, "size", None)
+                entry.mtime = Path(path).stat().st_mtime
+                changed_library = True
+            except Exception:
+                pass
+            break
+
+        changed_timeline = self._apply_ingest_duration_to_placeholder_clips(path, info.duration)
+        if changed_library or changed_timeline:
+            self._save_to_store_safe()
+        self.media_panel.update_media_status(path, "Ready")
+
+    def _apply_ingest_duration_to_placeholder_clips(
+        self,
+        path: Path,
+        duration: float | None,
+    ) -> bool:
+        try:
+            new_duration = float(duration or 0.0)
+        except Exception:
+            new_duration = 0.0
+        if new_duration <= 0.0:
+            return False
+        source_key = self._source_key_for_path(path)
+        changed = False
+        changed_clips: list[Clip] = []
+        for track in self.project.tracks:
+            for clip in track.clips:
+                if id(clip) not in self._duration_placeholder_clip_ids:
+                    continue
+                if self._source_key_for_path(clip.source) != source_key:
+                    continue
+                clip.out_point = float(clip.in_point) + max(0.001, new_duration)
+                self._duration_placeholder_clip_ids.discard(id(clip))
+                changed = True
+                changed_clips.append(clip)
+            if changed:
+                track.clips.sort(key=lambda c: float(c.start))
+        if not changed:
+            return False
+        try:
+            self.timeline_panel.refresh()
+            self._prewarm_timeline_cache_for_clips(changed_clips)
+            if changed_clips and self._find_track_for_clip(changed_clips[0]) is not None:
+                track = self._find_track_for_clip(changed_clips[0])
+                if track is not None and track.kind == "video":
+                    self.timeline_panel.auto_zoom_to_duration(max(1.0, self.project.duration + 5.0))
+        except Exception:
+            pass
+        self.inspector_panel.refresh()
+        self._invalidate_timeline_audio_mix(clear_player=False)
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        self._sync_preview_for_timeline_clock(current, playing=False, force_seek=False)
+        return True
+
+    def _on_ingest_thumbnail_ready(self, path_obj: object, thumbnail_obj: object) -> None:
+        path = Path(str(path_obj))
+        thumb = Path(str(thumbnail_obj)) if thumbnail_obj else None
+        self.media_panel.update_media_thumbnail(path, thumb)
+
+    def _on_ingest_proxy_ready(self, path_obj: object, proxy_obj: object) -> None:
+        path = Path(str(path_obj))
+        proxy = Path(str(proxy_obj)) if proxy_obj else None
+        if proxy is None or not proxy.exists():
+            return
+        source_key = self._source_key_for_path(path)
+        changed_clips: list[Clip] = []
+        for track in self.project.tracks:
+            if track.kind != "video":
+                continue
+            for clip in track.clips:
+                if self._source_key_for_path(clip.source) != source_key:
+                    continue
+                clip.proxy = str(proxy)
+                changed_clips.append(clip)
+        if not changed_clips:
+            return
+        self._prewarm_timeline_cache_for_clips(changed_clips)
+        self.timeline_panel.refresh()
         self._save_to_store_safe()
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        active_clip = self._pick_video_clip_for_time(current)
+        if active_clip is not None and self._source_key_for_path(active_clip.source) == source_key:
+            playing = bool(getattr(self.timeline_panel, "_is_playing", False))
+            self._sync_preview_for_timeline_clock(current, playing=playing, force_seek=not playing)
+        self.statusBar().showMessage(f"Preview proxy ready: {path.name}", 3000)
+
+    def _on_ingest_audio_proxy_ready(self, path_obj: object, proxy_obj: object) -> None:
+        path = Path(str(path_obj))
+        proxy = Path(str(proxy_obj)) if proxy_obj else None
+        if proxy is None or not proxy.exists():
+            return
+        source_key = self._source_key_for_path(path)
+        self._audio_proxy_by_source[source_key] = str(proxy)
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        active_clip = pick_timeline_audio_clip(
+            self.project.tracks,
+            current,
+            fallback_to_first=False,
+        )
+        if (
+            bool(getattr(self.timeline_panel, "_is_playing", False))
+            and active_clip is not None
+            and self._source_key_for_path(active_clip.source) == source_key
+        ):
+            self._sync_preview_for_timeline_clock(current, playing=True, force_seek=False)
+        self.statusBar().showMessage(f"Audio proxy ready: {path.name}", 3000)
 
     def _voice_target_subtitle_clips(self) -> list[Clip]:
         clips: list[Clip] = []
@@ -3308,12 +3527,10 @@ class MainWindow(QMainWindow):
                 subtitle_clip = subtitle_clips[index]
                 target_start = float(subtitle_clip.start)
                 fallback_duration = max(0.05, float(subtitle_clip.timeline_duration or 0.05))
-            try:
-                duration = probe(audio_path).duration
-            except Exception:
-                duration = None
-            if duration is None or duration <= 0.0:
-                duration = fallback_duration
+            duration, duration_is_placeholder = self._duration_for_insert(
+                audio_path,
+                fallback=fallback_duration,
+            )
 
             target_track = _pick_target_track(target_start, duration)
             clip = Clip(
@@ -3323,9 +3540,14 @@ class MainWindow(QMainWindow):
                 out_point=float(duration),
             )
             target_track.clips.append(clip)
+            if duration_is_placeholder:
+                self._duration_placeholder_clip_ids.add(id(clip))
             _register_touched(target_track)
             created.append(clip)
-            self._start_audio_proxy_generation_if_needed(clip)
+            try:
+                self._media_ingest.enqueue(audio_path)
+            except Exception:
+                pass
             if not subtitle_clips:
                 sequential_start = float(target_start) + float(clip.timeline_duration or duration)
 
@@ -3351,8 +3573,13 @@ class MainWindow(QMainWindow):
         self.timeline_panel.refresh()
         if created:
             self.timeline_panel.select_clips(created)
+            ready_created = [
+                clip for clip in created
+                if id(clip) not in self._duration_placeholder_clip_ids
+            ]
             try:
-                self.timeline_panel.prewarm_track_clips(created)
+                if ready_created:
+                    self.timeline_panel.prewarm_track_clips(ready_created)
             except Exception:
                 pass
         self.inspector_panel.refresh()
@@ -3766,20 +3993,55 @@ class MainWindow(QMainWindow):
                     self.timeline_panel.select_clips(created)
             finally:
                 self._suspend_timeline_selection_sync = False
-            try:
-                self.timeline_panel.prewarm_track_clips(created)
-            except Exception:
-                pass
-            self.inspector_panel.show_caption_list_neutral()
-            self.text_panel.add_imported_subtitle(path)
-            self.statusBar().showMessage(
-                f"Imported subtitle: {path.name} ({len(created)} cues)",
-                5000,
+            self._preview_sync_mode = "timeline"
+            self._invalidate_subtitle_lookup_cache()
+            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+            self._sync_preview_for_timeline_clock(
+                current,
+                playing=False,
+                force_seek=True,
             )
-            self.media_panel.list_widget.clearSelection()
-            self._update_media_library_added_states()
-            self._push_timeline_history()
-            self._refresh_auto_speed_issue_overlays()
+
+            large_import = len(created) >= self._LARGE_SUBTITLE_IMPORT_CUE_COUNT
+
+            def _finish_subtitle_import() -> None:
+                if not large_import:
+                    self.inspector_panel.show_caption_list_neutral()
+                self.text_panel.add_imported_subtitle(path)
+                self.statusBar().showMessage(
+                    f"Imported subtitle: {path.name} ({len(created)} cues)",
+                    5000,
+                )
+                self.media_panel.list_widget.clearSelection()
+                self._update_media_library_added_states()
+                self._sync_preview_for_timeline_clock(
+                    float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)),
+                    playing=False,
+                    force_seek=False,
+                )
+
+                def _record_subtitle_import_state() -> None:
+                    self._push_timeline_history()
+                    self._refresh_auto_speed_issue_overlays()
+                    self._sync_preview_for_timeline_clock(
+                        float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)),
+                        playing=False,
+                        force_seek=False,
+                    )
+
+                if large_import:
+                    QTimer.singleShot(120, _record_subtitle_import_state)
+                else:
+                    _record_subtitle_import_state()
+
+            if large_import:
+                self.statusBar().showMessage(
+                    f"Imported subtitle: {path.name} ({len(created)} cues). Finalizing...",
+                    3000,
+                )
+                QTimer.singleShot(0, _finish_subtitle_import)
+            else:
+                _finish_subtitle_import()
             return
 
         track = self._get_or_create_track(
@@ -3788,7 +4050,7 @@ class MainWindow(QMainWindow):
             insert_new_track=insert_new_track,
         )
 
-        dur = get_video_duration(path)
+        dur, duration_is_placeholder = self._duration_for_insert(path, fallback=5.0)
 
         if start is None:
             # Add button/no explicit drop position: append after the target track.
@@ -3804,8 +4066,12 @@ class MainWindow(QMainWindow):
         else:
             start = self._resolve_non_overlapping_start(track, start, dur)
         clip = Clip(source=str(path), start=start, in_point=0.0, out_point=dur)
-        self._start_proxy_generation_if_needed(clip, duration=dur, kind=kind)
-        self._start_audio_proxy_generation_if_needed(clip)
+        if duration_is_placeholder:
+            self._duration_placeholder_clip_ids.add(id(clip))
+        try:
+            self._media_ingest.enqueue(path)
+        except Exception:
+            pass
         track.clips.append(clip)
         track.clips.sort(key=lambda c: c.start)
         if kind == "video":
@@ -3813,13 +4079,14 @@ class MainWindow(QMainWindow):
                 self.timeline_panel.normalize_main_track_magnetic()
             except Exception:
                 pass
-        try:
-            self.timeline_panel.prewarm_track_clips([clip])
-        except Exception:
-            pass
+        if not duration_is_placeholder:
+            try:
+                self.timeline_panel.prewarm_track_clips([clip])
+            except Exception:
+                pass
         self.timeline_panel.refresh()
         self.timeline_panel.select_clip(clip)
-        if was_timeline_empty and kind == "video":
+        if was_timeline_empty and kind == "video" and not duration_is_placeholder:
             # Auto-fit first imported visual clip so ruler range reflects media length.
             self.timeline_panel.auto_zoom_to_duration(max(1.0, dur + 5.0))
             self.timeline_panel.set_playhead(0.0)
@@ -4884,6 +5151,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self._audio_proxy_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        try:
+            self._media_ingest.close()
         except Exception:
             pass
         self.closed.emit()

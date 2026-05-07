@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import subprocess
 from pathlib import Path
 
 from ..core.ffmpeg_cmd import ensure_ffmpeg
+from ..core.media_cache import user_cache_root
 
 
 def _cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    path = Path(base) / "comecut-py" / "audio-proxies"
+    path = user_cache_root() / "audio-proxies"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

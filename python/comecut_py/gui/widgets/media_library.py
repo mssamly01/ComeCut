@@ -23,11 +23,13 @@ from PySide6.QtWidgets import (  # type: ignore
     QToolButton,
 )
 
-from ...engine.thumbnails import render_filmstrip_png
-
 MEDIA_PATH_ROLE = 256
 MEDIA_NORM_PATH_ROLE = 257
 MEDIA_MIME_TYPE = "application/x-comecut-media-path"
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
+SUBTITLE_EXTS = {".srt", ".vtt", ".lrc", ".ass", ".ssa", ".txt"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 PLUS_ICON_SVG = (
     '<svg width="800" height="800" viewBox="0 0 48 48" version="1" '
     'xmlns="http://www.w3.org/2000/svg"><circle fill="#22d3c5" cx="24" cy="24" r="21"/>'
@@ -190,33 +192,32 @@ class _MediaItemWidget(QFrame):
         self.thumb_lbl.setStyleSheet("background: #0b0d10; border-top-left-radius: 5px; border-top-right-radius: 5px; border: none;")
         self.thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Load image directly or generate video thumbnail
+        # Load small still images directly. Video/audio previews are attached
+        # later by the background ingest service so imports stay instant.
         ext = path.suffix.lower()
         thumb_success = False
         try:
-            if ext in ('.jpg', '.jpeg', '.png', '.bmp', '.webp'):
+            if ext in IMAGE_EXTS:
                 pix = QPixmap(str(path))
                 if not pix.isNull():
                     self.thumb_lbl.setPixmap(pix.scaled(138, 78, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
                     thumb_success = True
-            else:
-                # Try FFmpeg-based thumbnail
-                t_path = render_filmstrip_png(str(path), strip_width=138, strip_height=78, frames=1)
-                if t_path and Path(t_path).exists():
-                    pix = QPixmap(str(t_path))
-                    if not pix.isNull():
-                        self.thumb_lbl.setPixmap(pix.scaled(138, 78, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
-                        thumb_success = True
         except Exception:
             pass
 
         if not thumb_success:
             # High-quality placeholder (HTML parity)
-            icon_text = "🎬" if ext not in ('.wav', '.mp3') else "🎵"
+            if ext in AUDIO_EXTS:
+                icon_text = "AUD"
+            elif ext in SUBTITLE_EXTS:
+                icon_text = "CC"
+            else:
+                icon_text = "VID"
             self.thumb_lbl.setText(icon_text)
             self.thumb_lbl.setStyleSheet("""
                 color: #4a505c; 
-                font-size: 32px; 
+                font-size: 24px;
+                font-weight: 800;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1a1d23, stop:1 #0b0d10);
                 border-top-left-radius: 5px; 
                 border-top-right-radius: 5px;
@@ -299,6 +300,22 @@ class _MediaItemWidget(QFrame):
         self.missing_badge.hide()
         self._missing = False
 
+        self.status_badge = QLabel("", self.thumb_lbl)
+        self.status_badge.setFixedSize(92, 18)
+        self.status_badge.move(4, 56)
+        self.status_badge.setStyleSheet("""
+            QLabel {
+                background: rgba(11, 13, 16, 0.78);
+                color: #b8c0cc;
+                font-size: 10px;
+                font-weight: 700;
+                border-radius: 9px;
+                padding: 0 6px;
+            }
+        """)
+        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_badge.hide()
+
         name_container = QWidget()
         name_layout = QHBoxLayout(name_container)
         name_layout.setContentsMargins(6, 4, 6, 4)
@@ -345,6 +362,27 @@ class _MediaItemWidget(QFrame):
 
     def is_missing(self) -> bool:
         return getattr(self, "_missing", False)
+
+    def set_status(self, status: str | None) -> None:
+        text = (status or "").strip()
+        self.status_badge.setText(text[:18])
+        self.status_badge.setVisible(bool(text))
+
+    def set_thumbnail(self, thumbnail_path: Path | str | None) -> None:
+        if not thumbnail_path:
+            return
+        pix = QPixmap(str(thumbnail_path))
+        if pix.isNull():
+            return
+        self.thumb_lbl.setText("")
+        self.thumb_lbl.setPixmap(
+            pix.scaled(
+                138,
+                78,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     def set_selected(self, selected: bool) -> None:
         selected_b = bool(selected)
@@ -695,6 +733,27 @@ class MediaLibraryPanel(QWidget):
             widget = self.list_widget.itemWidget(item)
             if isinstance(widget, _MediaItemWidget):
                 widget.set_added(norm_path in used_norm_paths)
+
+    def _widget_for_path(self, path: Path | str) -> _MediaItemWidget | None:
+        norm_path = self._normalize_path(path)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.data(MEDIA_NORM_PATH_ROLE) != norm_path:
+                continue
+            widget = self.list_widget.itemWidget(item)
+            if isinstance(widget, _MediaItemWidget):
+                return widget
+        return None
+
+    def update_media_status(self, path: Path | str, status: str | None) -> None:
+        widget = self._widget_for_path(path)
+        if widget is not None:
+            widget.set_status(status)
+
+    def update_media_thumbnail(self, path: Path | str, thumbnail_path: Path | str | None) -> None:
+        widget = self._widget_for_path(path)
+        if widget is not None:
+            widget.set_thumbnail(thumbnail_path)
 
     def _emit_add_item(self, item: QListWidgetItem) -> None:
         raw = str(item.data(MEDIA_PATH_ROLE) or "").strip()

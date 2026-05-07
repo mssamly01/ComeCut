@@ -175,7 +175,8 @@ class _SubtitleDropZone(QFrame):
 
 def _first_subtitle_preview(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        with path.open("rb") as f:
+            text = f.read(64 * 1024).decode("utf-8", errors="ignore")
     except Exception:
         return "Subtitle file"
     for raw in text.replace("\r\n", "\n").split("\n"):

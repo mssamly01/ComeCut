@@ -8,11 +8,11 @@ cached on disk so repeated timeline refreshes don't re-invoke ffmpeg.
 from __future__ import annotations
 
 import hashlib
-import os
 import subprocess
 from pathlib import Path
 
 from ..core.ffmpeg_cmd import detect_cuda_decode_available, ensure_ffmpeg
+from ..core.media_cache import user_cache_root
 
 TILES_PER_CHUNK = 60
 DEFAULT_TILE_WIDTH = 80
@@ -21,8 +21,7 @@ THUMB_COVER_MODE_VERSION = "cover-v1"
 
 
 def _cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    d = Path(base) / "comecut-py" / "thumbnails"
+    d = user_cache_root() / "filmstrip"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -48,8 +47,7 @@ def _cache_key(
 
 
 def _chunk_cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    d = Path(base) / "comecut-py" / "filmstrip-chunks"
+    d = user_cache_root() / "filmstrip-chunks"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

@@ -41,7 +41,7 @@ def _parse_fps(rate: str | None) -> float | None:
         return None
 
 
-def probe(path: str | Path) -> MediaInfo:
+def probe(path: str | Path, *, timeout: float = 15.0) -> MediaInfo:
     """Probe a media file using ``ffprobe``. Requires the ``ffprobe`` binary."""
     ffprobe = ensure_ffprobe()
     argv = [
@@ -54,7 +54,13 @@ def probe(path: str | Path) -> MediaInfo:
         "-show_streams",
         str(path),
     ]
-    result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        argv,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=max(1.0, float(timeout)),
+    )
     data = json.loads(result.stdout or "{}")
     fmt = data.get("format") or {}
     streams = data.get("streams") or []

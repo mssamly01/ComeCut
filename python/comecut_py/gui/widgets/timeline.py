@@ -90,6 +90,7 @@ VISIBLE_CACHE_PREFETCH_VIEWPORTS = 1.0
 MEDIA_CACHE_IDLE_DELAY_MS = 250
 MAX_FILMSTRIP_CHUNKS_INFLIGHT = 64
 MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE = 8
+SCENE_INDEX_CLIP_THRESHOLD = 800
 FILMSTRIP_FRAMES = 24
 FILMSTRIP_TILE_WIDTH = 120
 FILMSTRIP_HEIGHT_BUCKET = 16
@@ -2037,6 +2038,7 @@ class TimelineScene(QGraphicsScene):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             playhead_color = QColor("#22d3c5")
             painter.setPen(QPen(playhead_color, 1))
+            painter.drawLine(QPointF(x, RULER_HEIGHT), QPointF(x, self.height()))
             painter.drawLine(QPointF(x, 0.0), QPointF(x, RULER_HEIGHT))
             handle_path = QPainterPath()
             handle_path.moveTo(x, 0.0)
@@ -4616,12 +4618,7 @@ class TimelinePanel(QWidget):
                 except Exception:
                     pass
 
-        probed = 0.0
-        try:
-            probed = float(get_video_duration(source))
-        except Exception:
-            probed = 0.0
-        duration = max(cached, upper_bound, probed)
+        duration = max(cached, upper_bound)
         if duration <= 1e-6:
             try:
                 duration = float(clip.source_duration or clip.timeline_duration or 0.0)
@@ -5015,10 +5012,7 @@ class TimelinePanel(QWidget):
         if TIMELINE_USE_TILED_FILMSTRIP:
             src_duration = duration
             if src_duration <= 1e-6:
-                try:
-                    src_duration = float(get_video_duration(source))
-                except Exception:
-                    src_duration = 0.0
+                return
             src_duration = max(0.0, src_duration)
             if src_duration <= 1e-6:
                 return
@@ -5057,10 +5051,7 @@ class TimelinePanel(QWidget):
             ),
         )
         if duration <= 1e-6:
-            try:
-                duration = float(get_video_duration(source))
-            except Exception:
-                duration = 0.0
+            return
         if duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS and not self._clip_has_ready_proxy(clip):
             return
         key = self._filmstrip_key_from_source(
@@ -5084,6 +5075,8 @@ class TimelinePanel(QWidget):
         seen: set[tuple[str, int, str, int, int]] = set()
         for clip in clips:
             if not isinstance(clip, Clip):
+                continue
+            if bool(getattr(clip, "is_text_clip", False)):
                 continue
             source_raw = self._clip_decode_source(clip)
             if not source_raw:
@@ -5170,6 +5163,7 @@ class TimelinePanel(QWidget):
         self._transient_scene_items.clear()
         self._playhead_item = None
         self._playhead_handle = None
+        self._last_playhead_scene_x = None
 
     def _add_transient(self, item: QGraphicsItem) -> QGraphicsItem:
         self._transient_scene_items.append(item)
@@ -5227,6 +5221,17 @@ class TimelinePanel(QWidget):
             tracks, lane_tops, lane_heights, main_idx = self._track_layout_data(
                 self._project.tracks
             )
+            clip_count = sum(len(track.clips) for track in tracks)
+            target_index_method = (
+                QGraphicsScene.ItemIndexMethod.BspTreeIndex
+                if clip_count >= SCENE_INDEX_CLIP_THRESHOLD
+                else QGraphicsScene.ItemIndexMethod.NoIndex
+            )
+            try:
+                if self._scene.itemIndexMethod() != target_index_method:
+                    self._scene.setItemIndexMethod(target_index_method)
+            except Exception:
+                pass
 
             viewport_h = self._timeline_viewport_height()
             scene_duration = self._scene_duration_seconds()
@@ -5460,23 +5465,26 @@ class TimelinePanel(QWidget):
                 text.setZValue(621)
 
     def _refresh_playhead(self) -> None:
+        old_x = getattr(self, "_last_playhead_scene_x", None)
+        self._remove_transient_item(self._playhead_item)
         self._remove_transient_item(self._playhead_handle)
         x = self.seconds_to_pixels(self._playhead_seconds)
-        h = self._scene.height()
-        if self._playhead_item is not None:
-            try:
-                self._playhead_item.setLine(x, RULER_HEIGHT, x, h)
-            except RuntimeError:
-                self._playhead_item = None
-        if self._playhead_item is None:
-            pen = QPen(QColor("#22d3c5"), 1)
-            self._playhead_item = self._add_transient(
-                self._scene.addLine(x, RULER_HEIGHT, x, h, pen)
-            )
-            self._playhead_item.setZValue(1000)
+        self._last_playhead_scene_x = x
+        self._playhead_item = None
         self._playhead_handle = None
+        if old_x is None:
+            dirty_left = x - 14.0
+            dirty_width = 28.0
+        else:
+            dirty_left = min(float(old_x), x) - 14.0
+            dirty_width = abs(float(old_x) - x) + 28.0
         self._scene.invalidate(
-            QRectF(0.0, 0.0, max(1.0, self._scene.width()), RULER_HEIGHT),
+            QRectF(
+                dirty_left,
+                0.0,
+                max(1.0, dirty_width),
+                max(RULER_HEIGHT, self._scene.height()),
+            ),
             QGraphicsScene.SceneLayer.ForegroundLayer,
         )
 
