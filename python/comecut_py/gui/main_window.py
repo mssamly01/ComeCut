@@ -183,6 +183,9 @@ class MainWindow(QMainWindow):
         self._proxy_source_to_clips: dict[str, list[Clip]] = {}
         self._audio_proxy_by_source: dict[str, str] = {}
         self._audio_proxy_inflight: set[str] = set()
+        self._audio_proxy_path_cache: dict[str, Path | None] = {}
+        self._clip_audio_preview_path_cache: dict[int, Path] = {}
+        self._clip_deferred_audio_proxy_cache: dict[int, bool] = {}
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
         self._audio_clip_index = _ClipIntervalIndex()
@@ -855,6 +858,9 @@ class MainWindow(QMainWindow):
     def _invalidate_clip_interval_indexes(self) -> None:
         self._clip_interval_indexes_dirty = True
         self._clip_track_map.clear()
+        self._audio_proxy_path_cache.clear()
+        self._clip_audio_preview_path_cache.clear()
+        self._clip_deferred_audio_proxy_cache.clear()
 
     def _ensure_clip_interval_indexes(self) -> None:
         if not self._clip_interval_indexes_dirty:
@@ -926,31 +932,51 @@ class MainWindow(QMainWindow):
             self._duration_placeholder_by_source_key.pop(source_key, None)
 
     def _audio_proxy_for_source_path(self, path: Path | str) -> Path | None:
+        raw_key = str(path)
+        if raw_key in self._audio_proxy_path_cache:
+            return self._audio_proxy_path_cache[raw_key]
+
         key = self._source_key_for_path(path)
         proxy = self._audio_proxy_by_source.get(key)
         if proxy:
             proxy_path_obj = Path(proxy)
             if proxy_path_obj.exists():
+                self._audio_proxy_path_cache[raw_key] = proxy_path_obj
                 return proxy_path_obj
 
         cached = audio_proxy_path(path)
         if cached.exists() and cached.stat().st_size > 0:
             self._audio_proxy_by_source[key] = str(cached)
+            self._audio_proxy_path_cache[raw_key] = cached
             return cached
+        self._audio_proxy_path_cache[raw_key] = None
         return None
 
     def _clip_audio_preview_path(self, clip: Clip) -> Path:
+        clip_key = id(clip)
+        cached = self._clip_audio_preview_path_cache.get(clip_key)
+        if cached is not None:
+            return cached
         proxy = self._audio_proxy_for_source_path(clip.source)
         if proxy is not None:
+            self._clip_audio_preview_path_cache[clip_key] = proxy
             return proxy
-        return Path(clip.source)
+        source = Path(clip.source)
+        self._clip_audio_preview_path_cache[clip_key] = source
+        return source
 
     def _clip_uses_deferred_audio_proxy(self, clip: Clip, path: Path) -> bool:
-        source = Path(clip.source)
-        if path != source:
+        clip_key = id(clip)
+        cached = self._clip_deferred_audio_proxy_cache.get(clip_key)
+        if cached is not None:
+            return cached
+        source_raw = str(getattr(clip, "source", "") or "")
+        if str(path) != source_raw:
+            self._clip_deferred_audio_proxy_cache[clip_key] = False
             return False
-        ext = source.suffix.lower()
-        return ext != ".wav"
+        uses_deferred = Path(source_raw).suffix.lower() != ".wav"
+        self._clip_deferred_audio_proxy_cache[clip_key] = uses_deferred
+        return uses_deferred
 
     def _clip_preview_path(self, clip: Clip) -> Path:
         track = self._find_track_for_clip(clip)
@@ -1229,14 +1255,15 @@ class MainWindow(QMainWindow):
             self.timeline_panel.set_playing_state(False)
             self.preview_panel.set_timeline_playing_override(False)
             return
-        self.timeline_panel.set_playhead(next_seconds)
         if (
             self._gap_play_last_full_sync_ts > 0.0
             and now - self._gap_play_last_full_sync_ts < self._GAP_PLAY_FULL_SYNC_INTERVAL
         ):
+            self.timeline_panel._playhead_seconds = next_seconds
             self._set_preview_timeline_time_display(next_seconds)
             return
         self._gap_play_last_full_sync_ts = now
+        self.timeline_panel.set_playhead(next_seconds)
         self._sync_preview_for_timeline_clock(
             next_seconds,
             playing=True,
@@ -1438,6 +1465,9 @@ class MainWindow(QMainWindow):
     def _on_audio_proxy_ready(self, source_key_obj: object, proxy_obj: object, error_obj: object) -> None:
         source_key = str(source_key_obj or "")
         self._audio_proxy_inflight.discard(source_key)
+        self._audio_proxy_path_cache.clear()
+        self._clip_audio_preview_path_cache.clear()
+        self._clip_deferred_audio_proxy_cache.clear()
         proxy = str(proxy_obj or "")
         if proxy:
             self._audio_proxy_by_source[source_key] = proxy
@@ -1580,8 +1610,9 @@ class MainWindow(QMainWindow):
         gain *= track_output_gain(track)
         gain *= self._preview_fade_multiplier(audio_clip, timeline_seconds)
         audio_path = self._clip_audio_preview_path(audio_clip)
-        if playing and self._clip_uses_deferred_audio_proxy(audio_clip, audio_path):
-            self._start_audio_proxy_generation_if_needed(audio_clip)
+        if self._clip_uses_deferred_audio_proxy(audio_clip, audio_path):
+            if not playing:
+                self._start_audio_proxy_generation_if_needed(audio_clip)
             self.preview_panel.clear_timeline_audio()
             return
         self.preview_panel.sync_timeline_audio(
@@ -3282,6 +3313,9 @@ class MainWindow(QMainWindow):
             return
         source_key = self._source_key_for_path(path)
         self._audio_proxy_by_source[source_key] = str(proxy)
+        self._audio_proxy_path_cache.clear()
+        self._clip_audio_preview_path_cache.clear()
+        self._clip_deferred_audio_proxy_cache.clear()
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         self._ensure_clip_interval_indexes()
         active_clip = pick_timeline_audio_clip(

@@ -119,11 +119,9 @@ def pick_timeline_audio_clip(
     index: _ClipIntervalIndex | None = None,
 ) -> Clip | None:
     s = max(0.0, float(seconds))
-    audio_tracks = visible_audio_tracks(tracks)
     if index is not None:
-        clip = index.find(s)
-        if clip is not None:
-            return clip
+        return index.find(s)
+    audio_tracks = visible_audio_tracks(tracks)
     for track in audio_tracks:
         for clip in track.clips:
             if clip_contains_time(clip, s):

@@ -1564,11 +1564,20 @@ class PreviewPanel(QWidget):
         force_seek: bool = False,
     ) -> None:
         path_obj = Path(path)
-        try:
-            path_str = str(path_obj.resolve())
-        except Exception:
-            path_str = str(path_obj)
-        path_key = path_str.casefold()
+        raw_path_str = str(path_obj)
+        raw_path_key = raw_path_str.casefold()
+        if self._timeline_audio_source_path == raw_path_str:
+            path_str = raw_path_str
+            path_key = self._timeline_audio_source_key or raw_path_key
+        elif self._timeline_audio_source_key == raw_path_key:
+            path_str = self._timeline_audio_source_path or raw_path_str
+            path_key = raw_path_key
+        else:
+            try:
+                path_str = str(path_obj.resolve())
+            except Exception:
+                path_str = raw_path_str
+            path_key = path_str.casefold()
         is_mp3_source = Path(path_str).suffix.lower() == ".mp3"
         source_changed = self._timeline_audio_source_key != path_key
         if source_changed:
