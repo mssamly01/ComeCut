@@ -86,7 +86,10 @@ ICON_ACTIVE = "#22d3c5"
 SNAP_TOLERANCE_PX = 5.0
 SCRUB_SEEK_INTERVAL_MS = 33
 LONG_MEDIA_CACHE_THRESHOLD_SECONDS = 30.0
-VISIBLE_CACHE_PREFETCH_VIEWPORTS = 0.75
+VISIBLE_CACHE_PREFETCH_VIEWPORTS = 1.0
+MEDIA_CACHE_IDLE_DELAY_MS = 250
+MAX_FILMSTRIP_CHUNKS_INFLIGHT = 64
+MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE = 8
 FILMSTRIP_FRAMES = 24
 FILMSTRIP_TILE_WIDTH = 120
 FILMSTRIP_HEIGHT_BUCKET = 16
@@ -568,7 +571,7 @@ from ...engine.thumbnails import (
     extract_filmstrip_chunk,
     render_filmstrip_png,
 )
-from ...engine.waveform import extract_waveform_peaks
+from ...engine.waveform import extract_waveform_peaks, extract_waveform_peaks_range
 
 
 def _format_clip_duration_smpte(seconds: float, fps: float = 24.0) -> str:
@@ -1265,25 +1268,54 @@ class ClipRect(QGraphicsRectItem):
                     if self._muted:
                         wave_bg = QColor(35, 45, 52, 210)
                     painter.fillRect(wave_rect, wave_bg)
-                    peaks_full = self._panel.request_waveform_peaks_async(
+                    media_kind = "audio" if self._is_audio_clip else "video"
+                    visible_wave = self._panel.request_visible_waveform_peaks_async(
                         self.clip,
                         num_peaks=WAVEFORM_PEAKS_RESOLUTION,
-                        media_kind="audio" if self._is_audio_clip else "video",
+                        media_kind=media_kind,
                     )
-                    if peaks_full:
-                        source_duration = self._panel._waveform_source_duration_seconds(self.clip)
-                        peaks_full = waveform_peaks_for_clip_source_range(
-                            peaks_full,
-                            self.clip,
-                            source_duration,
+                    local_start = 0.0
+                    local_end = float(getattr(self.clip, "timeline_duration", 0.0) or 0.0)
+                    draw_rect = wave_rect
+                    if visible_wave is not None:
+                        peaks_full, local_start, local_end = visible_wave
+                        timeline_dur = max(1e-6, float(getattr(self.clip, "timeline_duration", 0.0) or 0.0))
+                        x0 = wave_rect.left() + wave_rect.width() * (local_start / timeline_dur)
+                        x1 = wave_rect.left() + wave_rect.width() * (local_end / timeline_dur)
+                        draw_rect = QRectF(
+                            x0,
+                            wave_rect.top(),
+                            max(1.0, x1 - x0),
+                            wave_rect.height(),
                         )
-                        bar_count = max(8, int(wave_rect.width() / 3.0))
+                    else:
+                        peaks_full = self._panel.request_waveform_peaks_async(
+                            self.clip,
+                            num_peaks=WAVEFORM_PEAKS_RESOLUTION,
+                            media_kind=media_kind,
+                        )
+                        if peaks_full:
+                            source_duration = self._panel._waveform_source_duration_seconds(self.clip)
+                            peaks_full = waveform_peaks_for_clip_source_range(
+                                peaks_full,
+                                self.clip,
+                                source_duration,
+                            )
+                    if peaks_full:
+                        bar_count = max(8, int(draw_rect.width() / 3.0))
                         peaks = (
                             peaks_full
                             if bar_count >= len(peaks_full)
                             else _downsample_peaks(peaks_full, bar_count)
                         )
                         fade_in, fade_out, _ = self._fade_durations_seconds()
+                        if visible_wave is not None:
+                            timeline_dur = max(
+                                1e-6,
+                                float(getattr(self.clip, "timeline_duration", 0.0) or 0.0),
+                            )
+                            fade_in = max(0.0, fade_in - local_start)
+                            fade_out = max(0.0, fade_out - max(0.0, timeline_dur - local_end))
                         peaks = apply_fade_endpoint_zero(
                             peaks,
                             fade_in_seconds=fade_in,
@@ -1302,7 +1334,7 @@ class ClipRect(QGraphicsRectItem):
                         try:
                             draw_waveform(
                                 painter,
-                                wave_rect,
+                                draw_rect,
                                 peaks,
                                 audio_style=self._is_audio_clip,
                                 muted=self._muted,
@@ -1382,18 +1414,21 @@ class ClipRect(QGraphicsRectItem):
         fm = QFontMetrics(font)
         if self._is_text_clip:
             painter.setPen(QColor("#ffffff"))
-            main = (self.clip.text_main or "").strip()
-            second = (self.clip.text_second or "").strip()
-            if second:
-                label = f"{main} | {second}" if main else second
-            else:
-                label = main or "Text"
-            label = label.replace("\n", " ").replace("\r", " ")
-            painter.drawText(
-                rect.adjusted(8, 4, -8, -4),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-                label,
-            )
+            if rect.width() >= 28.0:
+                main = (self.clip.text_main or "").strip()
+                second = (self.clip.text_second or "").strip()
+                if second:
+                    label = f"{main} | {second}" if main else second
+                else:
+                    label = main or "Text"
+                label = label.replace("\n", " ").replace("\r", " ")
+                text_rect = rect.adjusted(8, 4, -8, -4)
+                label = fm.elidedText(label, Qt.TextElideMode.ElideRight, int(text_rect.width()))
+                painter.drawText(
+                    text_rect,
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                    label,
+                )
         elif has_capcut_layout:
             painter.setPen(QColor("#e6e9ef"))
             header_rect = QRectF(rect.left(), rect.top(), rect.width(), header_h)
@@ -2569,8 +2604,14 @@ class TimelinePanel(QWidget):
         self._chunk_inflight: set[tuple[str, int, int, int, int]] = set()
         self._wave_peaks_cache: dict[tuple[str, int, int], list[float] | None] = {}
         self._wave_peaks_inflight: set[tuple[str, int, int]] = set()
+        self._wave_range_peaks_cache: dict[tuple[str, int, int, int], list[float] | None] = {}
+        self._wave_range_peaks_inflight: set[tuple[str, int, int, int]] = set()
         self._wave_upgrade_pending: set[tuple[str, int, int]] = set()
         self._wave_source_duration_cache: dict[str, float] = {}
+        self._media_cache_generation = 0
+        self._media_cache_idle_timer = QTimer(self)
+        self._media_cache_idle_timer.setSingleShot(True)
+        self._media_cache_idle_timer.timeout.connect(self._on_media_cache_idle)
         self._pending_track_volume_commits: set[int] = set()
         self._thumbnail_ready.connect(self._on_thumbnail_ready)
         self._filmstrip_chunk_ready.connect(self._on_filmstrip_chunk_ready)
@@ -2659,10 +2700,35 @@ class TimelinePanel(QWidget):
                     item.update()
             if hasattr(self, "_view"):
                 self._view.viewport().update()
+            self._bump_media_cache_idle()
         if self._pointer_active or not self._pending_pointer_refresh:
             return
         self._pending_pointer_refresh = False
         self._schedule_refresh()
+
+    def _bump_media_cache_idle(self) -> None:
+        if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            return
+        try:
+            self._media_cache_idle_timer.start(MEDIA_CACHE_IDLE_DELAY_MS)
+        except RuntimeError:
+            return
+
+    def _on_media_cache_idle(self) -> None:
+        if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            self._bump_media_cache_idle()
+            return
+        visible_items = [
+            item
+            for item in getattr(self, "_clip_items_by_id", {}).values()
+            if isinstance(item, ClipRect)
+            and not getattr(item, "_is_text_clip", False)
+            and self._clip_intersects_visible_timeline(item.clip)
+        ]
+        for item in visible_items:
+            item.update()
+        if visible_items and hasattr(self, "_view"):
+            self._view.viewport().update()
 
     def _build_transport(self) -> QWidget:
         bar = QWidget()
@@ -2934,6 +3000,7 @@ class TimelinePanel(QWidget):
         was_playing = self._is_playing
         self._is_playing = bool(playing)
         if was_playing and not self._is_playing:
+            self._bump_media_cache_idle()
             self._schedule_refresh()
 
     def set_speed_issue_clip_ids(self, ids: set[int]) -> None:
@@ -3771,8 +3838,9 @@ class TimelinePanel(QWidget):
         try:
             self._scene.clearSelection()
             if clip_ids:
-                for item in self._scene.items():
-                    if isinstance(item, ClipRect) and id(item.clip) in clip_ids:
+                for clip_id in clip_ids:
+                    item = self._clip_items_by_id.get(clip_id)
+                    if isinstance(item, ClipRect):
                         item.setSelected(True)
         finally:
             del blocker
@@ -4189,8 +4257,58 @@ class TimelinePanel(QWidget):
         clip_end = clip_start + dur
         return clip_end >= visible_start and clip_start <= visible_end
 
+    def _clip_visible_source_window(
+        self,
+        clip: Clip,
+    ) -> tuple[float, float, float, float] | None:
+        try:
+            timeline_dur = max(0.0, float(getattr(clip, "timeline_duration", 0.0) or 0.0))
+        except Exception:
+            timeline_dur = 0.0
+        if timeline_dur <= 1e-6:
+            return None
+        visible_start, visible_end = self._visible_timeline_seconds()
+        try:
+            clip_start = max(0.0, float(getattr(clip, "start", 0.0) or 0.0))
+        except Exception:
+            clip_start = 0.0
+        local_start = max(0.0, visible_start - clip_start)
+        local_end = min(timeline_dur, visible_end - clip_start)
+        if local_end <= local_start + 1e-6:
+            return None
+        try:
+            speed = max(1e-6, float(getattr(clip, "speed", 1.0) or 1.0))
+        except Exception:
+            speed = 1.0
+        try:
+            in_point = max(0.0, float(getattr(clip, "in_point", 0.0) or 0.0))
+        except Exception:
+            in_point = 0.0
+        try:
+            source_span = max(0.0, float(getattr(clip, "source_duration", 0.0) or 0.0))
+        except Exception:
+            source_span = 0.0
+        if source_span <= 1e-6:
+            source_span = timeline_dur * speed
+        if source_span <= 1e-6:
+            return None
+        source_start_bound = in_point
+        source_end_bound = in_point + source_span
+        if bool(getattr(clip, "reverse", False)):
+            source_start = source_end_bound - local_end * speed
+            source_end = source_end_bound - local_start * speed
+        else:
+            source_start = in_point + local_start * speed
+            source_end = in_point + local_end * speed
+        source_start = max(source_start_bound, min(source_end_bound, source_start))
+        source_end = max(source_start_bound, min(source_end_bound, source_end))
+        if source_end <= source_start + 1e-6:
+            return None
+        return source_start, source_end, local_start, local_end
+
     def _allow_media_cache_request(self, clip: Clip, *, media_kind: str) -> bool:
         if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            self._bump_media_cache_idle()
             return False
         if not self._clip_intersects_visible_timeline(clip):
             return False
@@ -4202,6 +4320,28 @@ class TimelinePanel(QWidget):
         if is_long_video and not self._clip_has_ready_proxy(clip):
             return False
         return True
+
+    def _cache_signal_key(self, key: object) -> tuple | None:
+        if (
+            isinstance(key, tuple)
+            and len(key) == 2
+            and isinstance(key[0], int)
+            and isinstance(key[1], tuple)
+        ):
+            if int(key[0]) != int(self._media_cache_generation):
+                return None
+            return key[1]
+        if isinstance(key, tuple):
+            return key
+        return None
+
+    def _reset_media_cache_generation(self) -> None:
+        self._media_cache_generation += 1
+        self._thumb_inflight.clear()
+        self._chunk_inflight.clear()
+        self._wave_peaks_inflight.clear()
+        self._wave_range_peaks_inflight.clear()
+        self._wave_upgrade_pending.clear()
 
     @staticmethod
     def _filmstrip_key(
@@ -4246,6 +4386,7 @@ class TimelinePanel(QWidget):
         if key in self._thumb_cache or key in self._thumb_inflight:
             return
         self._thumb_inflight.add(key)
+        generation = int(self._media_cache_generation)
 
         def _job() -> None:
             path = render_filmstrip_png(
@@ -4256,7 +4397,7 @@ class TimelinePanel(QWidget):
                 duration=duration,
             )
             try:
-                self._thumbnail_ready.emit(key, path)
+                self._thumbnail_ready.emit((generation, key), path)
             except RuntimeError:
                 return
 
@@ -4294,9 +4435,9 @@ class TimelinePanel(QWidget):
         return None
 
     def _on_thumbnail_ready(self, key: object, path: object) -> None:
-        if not isinstance(key, tuple):
+        key_t = self._cache_signal_key(key)
+        if key_t is None:
             return
-        key_t = key
         self._thumb_inflight.discard(key_t)
         if isinstance(path, Path):
             resolved = path
@@ -4339,7 +4480,14 @@ class TimelinePanel(QWidget):
     ) -> None:
         if key in self._chunk_pixmap_cache or key in self._chunk_inflight:
             return
+        if len(self._chunk_inflight) >= MAX_FILMSTRIP_CHUNKS_INFLIGHT:
+            return
+        source_key = str(key[0]) if key else str(Path(source).resolve())
+        per_source = sum(1 for existing in self._chunk_inflight if existing and str(existing[0]) == source_key)
+        if per_source >= MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE:
+            return
         self._chunk_inflight.add(key)
+        generation = int(self._media_cache_generation)
 
         def _job() -> None:
             try:
@@ -4353,7 +4501,7 @@ class TimelinePanel(QWidget):
             except Exception:
                 path = None
             try:
-                self._filmstrip_chunk_ready.emit(key, path)
+                self._filmstrip_chunk_ready.emit((generation, key), path)
             except RuntimeError:
                 return
 
@@ -4387,9 +4535,9 @@ class TimelinePanel(QWidget):
         return None
 
     def _on_filmstrip_chunk_ready(self, key: object, path: object) -> None:
-        if not isinstance(key, tuple):
+        key_t = self._cache_signal_key(key)
+        if key_t is None:
             return
-        key_t = key
         self._chunk_inflight.discard(key_t)
         pix: QPixmap | None = None
         if isinstance(path, Path):
@@ -4424,6 +4572,17 @@ class TimelinePanel(QWidget):
         duration_ms: int = 0,
     ) -> tuple[str, int, int]:
         return (str(source), int(num_peaks), int(duration_ms))
+
+    @staticmethod
+    def _range_peaks_key_from_source(
+        source: str,
+        start: float,
+        duration: float,
+        num_peaks: int,
+    ) -> tuple[str, int, int, int]:
+        start_ms = int(round(max(0.0, float(start)) * 1000.0))
+        duration_ms = int(round(max(0.0, float(duration)) * 1000.0))
+        return (str(Path(source).resolve()), start_ms, duration_ms, int(num_peaks))
 
     def _waveform_source_duration_seconds(self, clip: Clip) -> float:
         try:
@@ -4481,6 +4640,7 @@ class TimelinePanel(QWidget):
         if key in self._wave_peaks_cache or key in self._wave_peaks_inflight:
             return
         self._wave_peaks_inflight.add(key)
+        generation = int(self._media_cache_generation)
 
         def _job() -> None:
             try:
@@ -4488,7 +4648,38 @@ class TimelinePanel(QWidget):
             except Exception:
                 peaks = None
             try:
-                self._waveform_peaks_ready.emit(key, peaks)
+                self._waveform_peaks_ready.emit((generation, key), peaks)
+            except RuntimeError:
+                return
+
+        self._wave_executor.submit(_job)
+
+    def _submit_waveform_range_extract(
+        self,
+        key: tuple[str, int, int, int],
+        source: str,
+        *,
+        start: float,
+        duration: float,
+        num_peaks: int,
+    ) -> None:
+        if key in self._wave_range_peaks_cache or key in self._wave_range_peaks_inflight:
+            return
+        self._wave_range_peaks_inflight.add(key)
+        generation = int(self._media_cache_generation)
+
+        def _job() -> None:
+            try:
+                peaks = extract_waveform_peaks_range(
+                    source,
+                    start=start,
+                    duration=duration,
+                    num_peaks=num_peaks,
+                )
+            except Exception:
+                peaks = None
+            try:
+                self._waveform_peaks_ready.emit((generation, key), peaks)
             except RuntimeError:
                 return
 
@@ -4531,6 +4722,7 @@ class TimelinePanel(QWidget):
         if key in self._wave_peaks_cache or key in self._wave_peaks_inflight:
             return
         if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            self._bump_media_cache_idle()
             return
         self._submit_waveform_extract(key, source, num_peaks)
 
@@ -4580,10 +4772,96 @@ class TimelinePanel(QWidget):
         )
         return None
 
+    def request_waveform_peaks_range_async(
+        self,
+        clip: Clip,
+        *,
+        source_start: float,
+        source_duration: float,
+        num_peaks: int = 256,
+        media_kind: str = "video",
+    ) -> list[float] | None:
+        target_peaks = max(1, int(num_peaks))
+        if source_duration <= 1e-6:
+            return None
+        try:
+            source = str(Path(self._clip_decode_source(clip)).resolve())
+        except Exception:
+            source = self._clip_decode_source(clip)
+        if not source:
+            return None
+        key = self._range_peaks_key_from_source(
+            source,
+            source_start,
+            source_duration,
+            target_peaks,
+        )
+        if key in self._wave_range_peaks_cache:
+            return self._wave_range_peaks_cache[key]
+        if key in self._wave_range_peaks_inflight:
+            return None
+        if not self._allow_media_cache_request(clip, media_kind=media_kind):
+            return None
+        self._submit_waveform_range_extract(
+            key,
+            source,
+            start=source_start,
+            duration=source_duration,
+            num_peaks=target_peaks,
+        )
+        return None
+
+    def request_visible_waveform_peaks_async(
+        self,
+        clip: Clip,
+        *,
+        num_peaks: int = 256,
+        media_kind: str = "video",
+    ) -> tuple[list[float], float, float] | None:
+        try:
+            duration = max(
+                0.0,
+                float(
+                    getattr(clip, "source_duration", 0.0)
+                    or getattr(clip, "timeline_duration", 0.0)
+                    or 0.0
+                ),
+            )
+        except Exception:
+            duration = 0.0
+        if duration < LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
+            return None
+        window = self._clip_visible_source_window(clip)
+        if window is None:
+            return None
+        source_start, source_end, local_start, local_end = window
+        peaks = self.request_waveform_peaks_range_async(
+            clip,
+            source_start=source_start,
+            source_duration=source_end - source_start,
+            num_peaks=num_peaks,
+            media_kind=media_kind,
+        )
+        if not peaks:
+            return None
+        visible_peaks = list(peaks)
+        if bool(getattr(clip, "reverse", False)):
+            visible_peaks.reverse()
+        return visible_peaks, local_start, local_end
+
     def _on_waveform_peaks_ready(self, key: object, peaks: object) -> None:
-        if not isinstance(key, tuple):
+        key_t = self._cache_signal_key(key)
+        if key_t is None:
             return
-        key_t = key
+        if len(key_t) == 4:
+            self._wave_range_peaks_inflight.discard(key_t)
+            if isinstance(peaks, list):
+                self._wave_range_peaks_cache[key_t] = [float(x) for x in peaks]
+            else:
+                self._wave_range_peaks_cache[key_t] = None
+            self._update_clip_items_for_cache_key(key_t)
+            return
+
         self._wave_peaks_inflight.discard(key_t)
         if isinstance(peaks, list):
             self._wave_peaks_cache[key_t] = [float(x) for x in peaks]
@@ -4647,6 +4925,7 @@ class TimelinePanel(QWidget):
                 src: str = source,
                 sw: int = strip_width,
                 sh: int = strip_height,
+                generation: int = int(self._media_cache_generation),
             ) -> None:
                 duration = get_video_duration(src)
                 key = self._filmstrip_key_from_source(
@@ -4667,7 +4946,7 @@ class TimelinePanel(QWidget):
                     duration=duration,
                 )
                 try:
-                    self._thumbnail_ready.emit(key, path_result)
+                    self._thumbnail_ready.emit((generation, key), path_result)
                 except RuntimeError:
                     return
 
@@ -4678,6 +4957,11 @@ class TimelinePanel(QWidget):
             return
         source_raw = self._clip_decode_source(clip)
         if not source_raw:
+            return
+        if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            self._bump_media_cache_idle()
+            return
+        if not self._clip_intersects_visible_timeline(clip):
             return
         try:
             source = str(Path(source_raw).resolve())
@@ -4694,18 +4978,37 @@ class TimelinePanel(QWidget):
         except Exception:
             duration = 0.0
         duration = max(0.0, duration)
-        fast_key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
-        self._submit_waveform_extract(
-            fast_key,
-            source,
-            WAVEFORM_PEAKS_FAST,
-        )
-        hi_key = self._peaks_key(clip, WAVEFORM_PEAKS_RESOLUTION)
-        self._submit_waveform_extract(
-            hi_key,
-            source,
-            WAVEFORM_PEAKS_RESOLUTION,
-        )
+        is_long = duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS
+        if is_long:
+            window = self._clip_visible_source_window(clip)
+            if window is not None:
+                source_start, source_end, _, _ = window
+                range_key = self._range_peaks_key_from_source(
+                    source,
+                    source_start,
+                    source_end - source_start,
+                    WAVEFORM_PEAKS_FAST,
+                )
+                self._submit_waveform_range_extract(
+                    range_key,
+                    source,
+                    start=source_start,
+                    duration=source_end - source_start,
+                    num_peaks=WAVEFORM_PEAKS_FAST,
+                )
+        else:
+            fast_key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
+            self._submit_waveform_extract(
+                fast_key,
+                source,
+                WAVEFORM_PEAKS_FAST,
+            )
+            hi_key = self._peaks_key(clip, WAVEFORM_PEAKS_RESOLUTION)
+            self._submit_waveform_extract(
+                hi_key,
+                source,
+                WAVEFORM_PEAKS_RESOLUTION,
+            )
 
         if is_audio:
             return
@@ -4723,7 +5026,18 @@ class TimelinePanel(QWidget):
                 1,
                 int(math.ceil(src_duration / float(max(1, FILMSTRIP_TILES_PER_CHUNK)))),
             )
-            for chunk_idx in range(chunk_count):
+            window = self._clip_visible_source_window(clip)
+            if window is None:
+                return
+            source_start, source_end, _, _ = window
+            chunk_size = float(max(1, FILMSTRIP_TILES_PER_CHUNK))
+            first_chunk = max(0, int(source_start // chunk_size))
+            last_chunk = max(
+                first_chunk,
+                int(max(source_start, source_end - 1e-6) // chunk_size),
+            )
+            last_chunk = min(chunk_count - 1, last_chunk)
+            for chunk_idx in range(first_chunk, last_chunk + 1):
                 key = self._filmstrip_chunk_key(source, chunk_idx)
                 self._submit_filmstrip_chunk_extract(key, source, int(chunk_idx))
             return
@@ -4747,6 +5061,8 @@ class TimelinePanel(QWidget):
                 duration = float(get_video_duration(source))
             except Exception:
                 duration = 0.0
+        if duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS and not self._clip_has_ready_proxy(clip):
+            return
         key = self._filmstrip_key_from_source(
             source,
             strip_width=strip_width,
@@ -4765,7 +5081,7 @@ class TimelinePanel(QWidget):
 
     def prewarm_track_clips(self, clips: list[Clip]) -> None:
         """Eagerly preload timeline cache for clips already on tracks."""
-        seen: set[tuple[str, int, str]] = set()
+        seen: set[tuple[str, int, str, int, int]] = set()
         for clip in clips:
             if not isinstance(clip, Clip):
                 continue
@@ -4792,7 +5108,15 @@ class TimelinePanel(QWidget):
                 )
             except Exception:
                 duration_ms = 0
-            signature = (source, duration_ms, str(clip.clip_type))
+            try:
+                in_point_ms = int(round(float(getattr(clip, "in_point", 0.0) or 0.0) * 1000.0))
+            except Exception:
+                in_point_ms = 0
+            try:
+                start_ms = int(round(float(getattr(clip, "start", 0.0) or 0.0) * 1000.0))
+            except Exception:
+                start_ms = 0
+            signature = (source, duration_ms, str(clip.clip_type), in_point_ms, start_ms)
             if signature in seen:
                 continue
             seen.add(signature)
@@ -4814,6 +5138,15 @@ class TimelinePanel(QWidget):
                 item.invalidate_filmstrip()
             else:
                 item.update()
+
+    def update_clip_visuals(self, clip: Clip) -> None:
+        """Repaint a single clip item after cheap metadata/text changes."""
+        item = self._clip_items_by_id.get(id(clip))
+        if item is None:
+            return
+        item.update()
+        if hasattr(self, "_view"):
+            self._view.viewport().update()
 
     def _remove_transient_item(self, item: QGraphicsItem | None) -> None:
         if item is None:
@@ -5127,15 +5460,20 @@ class TimelinePanel(QWidget):
                 text.setZValue(621)
 
     def _refresh_playhead(self) -> None:
-        self._remove_transient_item(self._playhead_item)
         self._remove_transient_item(self._playhead_handle)
         x = self.seconds_to_pixels(self._playhead_seconds)
         h = self._scene.height()
-        pen = QPen(QColor("#22d3c5"), 1)
-        self._playhead_item = self._add_transient(
-            self._scene.addLine(x, RULER_HEIGHT, x, h, pen)
-        )
-        self._playhead_item.setZValue(1000)
+        if self._playhead_item is not None:
+            try:
+                self._playhead_item.setLine(x, RULER_HEIGHT, x, h)
+            except RuntimeError:
+                self._playhead_item = None
+        if self._playhead_item is None:
+            pen = QPen(QColor("#22d3c5"), 1)
+            self._playhead_item = self._add_transient(
+                self._scene.addLine(x, RULER_HEIGHT, x, h, pen)
+            )
+            self._playhead_item.setZValue(1000)
         self._playhead_handle = None
         self._scene.invalidate(
             QRectF(0.0, 0.0, max(1.0, self._scene.width()), RULER_HEIGHT),
@@ -5166,6 +5504,7 @@ class TimelinePanel(QWidget):
     def set_project(self, project: Project) -> None:
         self._clear_transient_items()
         self._clear_clip_items()
+        self._reset_media_cache_generation()
         self._project = project
         self._ensure_unique_clip_ids()
         self.refresh()
@@ -5217,6 +5556,7 @@ class TimelinePanel(QWidget):
             self._scrub_emit_timer.stop()
         self._is_playhead_scrubbing = False
         self._flush_pending_scrub_seek()
+        self._bump_media_cache_idle()
         self._schedule_refresh()
 
     def _scrub_playhead_to_scene_x(self, scene_x: float, *, emit_seek: bool) -> None:

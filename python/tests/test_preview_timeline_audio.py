@@ -47,6 +47,32 @@ class _PreviewPickerStub:
         return bool(getattr(track, "hidden", False))
 
 
+class _PreviewClockStub:
+    def __init__(self, position_ms: int, *, playing: bool = True) -> None:
+        self.position_ms = position_ms
+        self.playing = playing
+        self.seek_calls: list[int] = []
+        self.rate_calls: list[float] = []
+        self.play_calls = 0
+
+    def main_player_position_ms(self) -> int:
+        return self.position_ms
+
+    def set_playback_rate(self, rate: float) -> None:
+        self.rate_calls.append(rate)
+
+    def force_seek(self, ms: int) -> None:
+        self.seek_calls.append(ms)
+        self.position_ms = ms
+
+    def main_player_is_playing(self) -> bool:
+        return self.playing
+
+    def play(self) -> None:
+        self.play_calls += 1
+        self.playing = True
+
+
 def test_audio_clip_can_be_picked_without_selection() -> None:
     audio = Clip(source="a.wav", start=5.0, in_point=0.0, out_point=10.0)
     tracks = [Track(kind="audio", clips=[audio])]
@@ -116,6 +142,39 @@ def test_timeline_play_start_returns_clip_when_playhead_touches_media() -> None:
 
     assert play_time == pytest.approx(3.5)
     assert clip is audio
+
+
+def test_preview_video_resyncs_when_player_clock_drifts() -> None:
+    preview = _PreviewClockStub(position_ms=0, playing=True)
+    stub = type("ClockWindowStub", (), {"preview_panel": preview})()
+
+    changed = MainWindow._resync_preview_video_if_clock_drifted(
+        stub,
+        1_000,
+        rate=1.25,
+    )
+
+    assert changed is True
+    assert preview.seek_calls == [1_000]
+    assert preview.rate_calls == [1.25]
+    assert preview.play_calls == 0
+
+
+def test_preview_video_resync_skips_small_clock_drift() -> None:
+    preview = _PreviewClockStub(
+        position_ms=1_000 - MainWindow._VIDEO_CLOCK_RESYNC_THRESHOLD_MS,
+        playing=True,
+    )
+    stub = type("ClockWindowStub", (), {"preview_panel": preview})()
+
+    changed = MainWindow._resync_preview_video_if_clock_drifted(
+        stub,
+        1_000,
+        rate=1.0,
+    )
+
+    assert changed is False
+    assert preview.seek_calls == []
 
 
 def test_next_playable_time_skips_to_later_audio_clip() -> None:

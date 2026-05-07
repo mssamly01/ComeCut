@@ -1429,6 +1429,16 @@ class PreviewPanel(QWidget):
         if not self._seek_flush.isActive():
             self._seek_flush.start(interval_ms)
 
+    def force_seek(self, ms: int) -> None:
+        """Immediately seek the main player, even while it is playing."""
+        ms_i = self._normalize_seek_ms(ms)
+        if self._seek_flush.isActive():
+            self._seek_flush.stop()
+        self._pending_seek_ms = None
+        self._last_seek_ms = ms_i
+        self._last_seek_flush_ts = monotonic()
+        self._player.setPosition(ms_i)
+
     def load_seek_play(self, path: Path | str, ms: int, *, rate: float = 1.0) -> None:
         """Load a source, then seek and play after Qt reports it is ready."""
         path_s = str(path)
@@ -1459,7 +1469,7 @@ class PreviewPanel(QWidget):
                 self._seek_flush.stop()
             self._pending_seek_ms = None
             self._seek_on_load_ms = None
-            self.seek(ms_i)
+            self.force_seek(ms_i)
             self._player.play()
             self._sync_play_icon()
             return
@@ -1516,6 +1526,9 @@ class PreviewPanel(QWidget):
 
     def main_player_is_playing(self) -> bool:
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+
+    def main_player_position_ms(self) -> int:
+        return int(self._player.position())
 
     def set_audio_muted(self, muted: bool) -> None:
         self._audio.setMuted(bool(muted))

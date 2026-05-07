@@ -175,3 +175,47 @@ def test_internal_video_track_limit_excludes_main_track(timeline_app) -> None:
     assert any(clip_b in track.clips for track in overlay_tracks)
     assert all(track.clips for track in overlay_tracks)
     panel.deleteLater()
+
+
+def test_prewarm_long_video_limits_to_visible_cache_window(
+    timeline_app,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    source = tmp_path / "long.mp4"
+    source.write_bytes(b"video")
+    clip = _media_clip(str(source), duration=7200.0)
+    project = Project(tracks=[Track(kind="video", name="Main", clips=[clip])])
+    panel = TimelinePanel(project)
+    panel.resize(1000, 500)
+    monkeypatch.setattr(panel, "_visible_timeline_seconds", lambda: (0.0, 120.0))
+
+    full_waveform_requests: list[object] = []
+    range_waveform_requests: list[tuple[float, float, int]] = []
+    chunk_requests: list[int] = []
+
+    monkeypatch.setattr(
+        panel,
+        "_submit_waveform_extract",
+        lambda key, source, num_peaks: full_waveform_requests.append(key),
+    )
+
+    def fake_submit_range(key, source, *, start, duration, num_peaks):
+        del key, source
+        range_waveform_requests.append((float(start), float(duration), int(num_peaks)))
+
+    monkeypatch.setattr(panel, "_submit_waveform_range_extract", fake_submit_range)
+    monkeypatch.setattr(
+        panel,
+        "_submit_filmstrip_chunk_extract",
+        lambda key, source, chunk_idx: chunk_requests.append(int(chunk_idx)),
+    )
+
+    panel.prewarm_track_clips([clip])
+
+    assert full_waveform_requests == []
+    assert range_waveform_requests == [(0.0, 120.0, 256)]
+    assert chunk_requests == [0, 1]
+    panel.deleteLater()

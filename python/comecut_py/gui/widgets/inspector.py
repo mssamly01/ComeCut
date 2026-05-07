@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, QTimer, Qt, Signal  # type: ignore
+from PySide6.QtCore import (  # type: ignore
+    QAbstractTableModel,
+    QByteArray,
+    QEvent,
+    QModelIndex,
+    QSize,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPixmap, QTransform  # type: ignore
 from PySide6.QtWidgets import (  # type: ignore
     QAbstractItemView,
@@ -33,8 +43,7 @@ from PySide6.QtWidgets import (  # type: ignore
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -274,17 +283,155 @@ class _CaptionTextDelegate(_CaptionEditDelegate):
         painter.restore()
 
 
+class _CaptionTableModel(QAbstractTableModel):
+    text_edited = Signal(object, str)  # Clip, new_text
+
+    def __init__(self, item_font) -> None:
+        super().__init__()
+        self._clips: list[Clip] = []
+        self._item_font = item_font
+        self._filter_mode: str | None = None
+        self._filter_snapshot_ids: set[int] = set()
+        self._is_ocr_error_check = None
+
+    def rowCount(self, parent=QModelIndex()) -> int:  # type: ignore[override]
+        if parent.isValid():
+            return 0
+        return len(self._clips)
+
+    def columnCount(self, parent=QModelIndex()) -> int:  # type: ignore[override]
+        if parent.isValid():
+            return 0
+        return 2
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return "STT" if int(section) == 0 else "Text"
+        return None
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):  # type: ignore[override]
+        if not index.isValid():
+            return None
+        row = index.row()
+        col = index.column()
+        if row < 0 or row >= len(self._clips):
+            return None
+        clip = self._clips[row]
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            if col == 0:
+                return str(row + 1)
+            return clip.text_main or ""
+        if role == Qt.ItemDataRole.TextAlignmentRole and col == 0:
+            return Qt.AlignmentFlag.AlignCenter
+        if role == Qt.ItemDataRole.FontRole:
+            return self._item_font
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return self._filter_background_for_clip(clip)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return self._filter_foreground_for_clip(clip)
+        return None
+
+    def flags(self, index):  # type: ignore[override]
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        flags = (
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+        )
+        if index.column() == 1:
+            flags |= Qt.ItemFlag.ItemIsEditable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):  # type: ignore[override]
+        if role != Qt.ItemDataRole.EditRole or not index.isValid() or index.column() != 1:
+            return False
+        row = index.row()
+        if row < 0 or row >= len(self._clips):
+            return False
+        clip = self._clips[row]
+        self.text_edited.emit(clip, str(value or ""))
+        if 0 <= row < len(self._clips) and self._clips[row] is clip:
+            updated = self.index(row, index.column())
+            self.dataChanged.emit(
+                updated,
+                updated,
+                [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole],
+            )
+        return True
+
+    def set_clips(self, clips: list[Clip]) -> None:
+        self.beginResetModel()
+        self._clips = list(clips)
+        self.endResetModel()
+
+    def clips(self) -> list[Clip]:
+        return self._clips
+
+    def clip_at(self, row: int) -> Clip | None:
+        if 0 <= row < len(self._clips):
+            return self._clips[row]
+        return None
+
+    def set_item_font(self, item_font) -> None:
+        self._item_font = item_font
+        if self._clips:
+            top_left = self.index(0, 0)
+            bottom_right = self.index(len(self._clips) - 1, 1)
+            self.dataChanged.emit(top_left, bottom_right, [Qt.ItemDataRole.FontRole])
+
+    def set_filter_context(
+        self,
+        mode: str | None,
+        matched_clip_ids: set[int],
+        *,
+        ocr_error_check=None,
+    ) -> None:
+        self._filter_mode = mode
+        self._filter_snapshot_ids = set(matched_clip_ids)
+        self._is_ocr_error_check = ocr_error_check if mode == "ocr" else None
+        self.refresh_filter_styles()
+
+    def refresh_filter_styles(self) -> None:
+        if not self._clips:
+            return
+        top_left = self.index(0, 0)
+        bottom_right = self.index(len(self._clips) - 1, 1)
+        self.dataChanged.emit(
+            top_left,
+            bottom_right,
+            [Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole],
+        )
+
+    def _filter_background_for_clip(self, clip: Clip) -> QColor | None:
+        if self._filter_mode is None:
+            return None
+        if id(clip) not in self._filter_snapshot_ids:
+            return None
+        if self._filter_mode == "ocr" and self._is_ocr_error_check is not None:
+            return QColor("#3a1f1f") if bool(self._is_ocr_error_check(clip)) else QColor("#1d2027")
+        return QColor("#2d1f3a")
+
+    def _filter_foreground_for_clip(self, clip: Clip) -> QColor:
+        if (
+            self._filter_mode == "ocr"
+            and id(clip) in self._filter_snapshot_ids
+            and self._is_ocr_error_check is not None
+            and not bool(self._is_ocr_error_check(clip))
+        ):
+            return QColor("#6F6F6F")
+        return QColor("#e6e8ec")
+
+
 class _CaptionListWidget(QWidget):
     """Caption table with inline edit, search and filter actions."""
 
     _ROW_MIN_HEIGHT = 48  # editor_app.py: 36px text area + 6px top/bottom margins
     _ROW_FONT_PT = 12      # editor_app.py: SubtitleListItemWidget font size
     _STT_COL_MIN_WIDTH = 72
+    _AUTO_RESIZE_ROW_LIMIT = 300
 
     clip_double_clicked = Signal(object)  # Emits Clip
     clip_selected = Signal(object)  # Emits Clip | None
-    clip_text_edit_requested = Signal(object, str)  # (clip, new_text)
-    add_subtitle_requested = Signal()
     clip_text_edit_requested = Signal(object, str)  # (clip, new_text)
     add_subtitle_requested = Signal()
     delete_subtitle_requested = Signal(object)  # Clip | None
@@ -368,30 +515,33 @@ class _CaptionListWidget(QWidget):
         search_bar.addWidget(self._btn_replace)
         layout.addLayout(search_bar)
 
-        self._table = QTableWidget(0, 2, self)
-        self._table.setHorizontalHeaderLabels(['STT', 'Text'])
+        self._table = QTableView(self)
+        self._clips: list[Clip] = []
+        self._model = _CaptionTableModel(self._caption_item_font())
+        self._table.setModel(self._model)
         self._table.verticalHeader().setVisible(False)
         self._table.verticalHeader().setDefaultSectionSize(self._ROW_MIN_HEIGHT)
         self._table.verticalHeader().setMinimumSectionSize(self._ROW_MIN_HEIGHT)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.setEditTriggers(
-            QTableWidget.EditTrigger.DoubleClicked
-            | QTableWidget.EditTrigger.EditKeyPressed
-            | QTableWidget.EditTrigger.SelectedClicked
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.SelectedClicked
         )
         self._table.setWordWrap(True)
         self._table.setAlternatingRowColors(True)
         self._table.setStyleSheet(
-            'QTableWidget { background:#1d2027; color:#e6e8ec; '
+            'QTableView { background:#1d2027; color:#e6e8ec; '
             'gridline-color:#363b46; border:1px solid #363b46; '
             'selection-background-color:#10383b; selection-color:#eafffb; } '
-            'QTableWidget::item { padding:6px 10px; border-bottom:1px solid #2b3038; } '
-            'QTableWidget::item:selected { background:#10383b; color:#eafffb; '
+            'QTableView::item { padding:6px 10px; border-bottom:1px solid #2b3038; } '
+            'QTableView::item:selected { background:#10383b; color:#eafffb; '
             'border:1px solid #22d3c5; } '
-            'QTableWidget::item:focus { outline: none; } '
-            'QTableWidget QLineEdit { border:none; background:#10383b; '
+            'QTableView::item:focus { outline: none; } '
+            'QTableView QLineEdit { border:none; background:#10383b; '
             'padding:0; margin:0; color:#eafffb; font-size:12pt; } '
-            'QTableWidget QLineEdit:focus { border:none; outline:none; '
+            'QTableView QLineEdit:focus { border:none; outline:none; '
             'background:#10383b; color:#eafffb; font-size:12pt; } '
             'QHeaderView::section { background:#2b2f36; color:#a6acb8; '
             'border:0; padding:6px; font-weight:600; }'
@@ -399,13 +549,14 @@ class _CaptionListWidget(QWidget):
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._clips: list[Clip] = []
         self._update_stt_column_width()
         self._table.setItemDelegateForColumn(1, _CaptionTextDelegate(self))
 
-        self._table.itemDoubleClicked.connect(self._on_double_click)
-        self._table.itemChanged.connect(self._on_item_changed)
-        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._table.doubleClicked.connect(self._on_double_click)
+        self._model.text_edited.connect(self._on_model_text_edited)
+        selection_model = self._table.selectionModel()
+        if selection_model is not None:
+            selection_model.selectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self._table, stretch=1)
 
         self._search_matches: list[int] = []
@@ -420,6 +571,9 @@ class _CaptionListWidget(QWidget):
         self._filter_snapshot_ids: set[int] = set()
         self._is_ocr_error_check = None
         self._suppress_selection_emit = False
+        self._caption_start_times: list[float] = []
+        self._caption_end_times: list[float] = []
+        self._caption_clip_signature: tuple[tuple[int, int, int], ...] = ()
 
     def _caption_item_font(self):
         font = self._table.font()
@@ -440,52 +594,70 @@ class _CaptionListWidget(QWidget):
         self._table.setColumnWidth(0, width)
 
     def _enforce_min_row_height(self, row: int) -> None:
-        if row < 0 or row >= self._table.rowCount():
+        if row < 0 or row >= len(self._clips):
             return
         if self._table.rowHeight(row) < self._ROW_MIN_HEIGHT:
             self._table.setRowHeight(row, self._ROW_MIN_HEIGHT)
 
     def set_clips(self, clips: list[Clip]) -> None:
         items = list(clips)
-        item_font = self._caption_item_font()
+        signature = tuple(
+            (
+                id(clip),
+                int(round(float(getattr(clip, "start", 0.0) or 0.0) * 1000.0)),
+                int(round(float(getattr(clip, "timeline_duration", 0.0) or 0.0) * 1000.0)),
+            )
+            for clip in items
+        )
+        if signature == self._caption_clip_signature and len(items) == len(self._clips):
+            self._clips = items
+            if self._filter_mode is not None:
+                self.refresh_filter_styles()
+            else:
+                self._recompute_search_matches()
+            return
         self._clips = items
-        self._suppress_item_changed = True
-        try:
-            self._table.setRowCount(len(items))
-            for row, clip in enumerate(items):
-                stt_item = QTableWidgetItem(str(row + 1))
-                stt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                stt_item.setFlags(stt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                stt_item.setFont(item_font)
-                text_item = QTableWidgetItem(clip.text_main or '')
-                text_item.setFont(item_font)
-                self._table.setItem(row, 0, stt_item)
-                self._table.setItem(row, 1, text_item)
-            self._update_stt_column_width()
+        self._caption_clip_signature = signature
+        self._caption_start_times = [float(getattr(clip, "start", 0.0) or 0.0) for clip in items]
+        self._caption_end_times = [
+            self._caption_start_times[row]
+            + max(0.0, float(getattr(clip, "timeline_duration", 0.0) or 0.0))
+            for row, clip in enumerate(items)
+        ]
+        self._model.set_item_font(self._caption_item_font())
+        self._model.set_clips(items)
+        self._update_stt_column_width()
+        v_header = self._table.verticalHeader()
+        if len(items) <= self._AUTO_RESIZE_ROW_LIMIT:
+            v_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
             self._table.resizeRowsToContents()
             for row in range(len(items)):
                 self._enforce_min_row_height(row)
-        finally:
-            self._suppress_item_changed = False
+        else:
+            v_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            v_header.setDefaultSectionSize(self._ROW_MIN_HEIGHT)
         if self._filter_mode is not None:
             visible = 0
-            self._suppress_item_changed = True
-            try:
-                for row, clip in enumerate(self._clips):
-                    in_set = id(clip) in self._filter_snapshot_ids
-                    self._table.setRowHidden(row, not in_set)
-                    if in_set:
-                        visible += 1
-                    self._paint_row_for_filter(row, clip)
-            finally:
-                self._suppress_item_changed = False
+            for row, clip in enumerate(self._clips):
+                in_set = id(clip) in self._filter_snapshot_ids
+                self._table.setRowHidden(row, not in_set)
+                if in_set:
+                    visible += 1
+            self._model.set_filter_context(
+                self._filter_mode,
+                self._filter_snapshot_ids,
+                ocr_error_check=self._is_ocr_error_check,
+            )
             self._search_count_lbl.setText(f"0/{visible}")
         else:
             self._recompute_search_matches()
 
     def clear(self) -> None:
         self._clips = []
-        self._table.setRowCount(0)
+        self._caption_clip_signature = ()
+        self._caption_start_times = []
+        self._caption_end_times = []
+        self._model.set_clips([])
         self._update_stt_column_width()
         self._search_matches = []
         self._search_match_spans = {}
@@ -504,13 +676,7 @@ class _CaptionListWidget(QWidget):
                 return
             for row, c in enumerate(self._clips):
                 if c is clip:
-                    self._table.selectRow(row)
-                    item = self._table.item(row, 1) or self._table.item(row, 0)
-                    if item is not None:
-                        self._table.scrollToItem(
-                            item,
-                            QAbstractItemView.ScrollHint.PositionAtCenter,
-                        )
+                    self._select_row(row)
                     return
         finally:
             self._suppress_selection_emit = False
@@ -522,28 +688,21 @@ class _CaptionListWidget(QWidget):
         if self._table.state() == QAbstractItemView.State.EditingState:
             return
 
+        idx = bisect_right(self._caption_start_times, float(t_sec)) - 1
         target_row: int | None = None
-        for row, clip in enumerate(self._clips):
-            try:
-                duration = float(clip.timeline_duration or 0.0)
-            except Exception:
-                duration = 0.0
-            if duration <= 0.0:
-                continue
-            if clip.start <= t_sec < clip.start + duration:
-                target_row = row
-                break
+        if 0 <= idx < len(self._clips) and float(t_sec) < self._caption_end_times[idx]:
+            target_row = idx
 
         if target_row is None:
             return
-        item = self._table.item(target_row, 0)
-        if item is None:
+        index = self._model.index(target_row, 0)
+        if not index.isValid():
             return
-        rect = self._table.visualItemRect(item)
+        rect = self._table.visualRect(index)
         viewport_rect = self._table.viewport().rect()
         if viewport_rect.contains(rect.center()):
             return
-        self._table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self._table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _selected_clip(self) -> Clip | None:
         rows = self._table.selectionModel().selectedRows()
@@ -553,6 +712,15 @@ class _CaptionListWidget(QWidget):
         if 0 <= row < len(self._clips):
             return self._clips[row]
         return None
+
+    def _select_row(self, row: int) -> None:
+        if row < 0 or row >= len(self._clips):
+            return
+        index = self._model.index(row, 0)
+        if not index.isValid():
+            return
+        self._table.selectRow(row)
+        self._table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _on_search_text_changed(self, _text: str) -> None:
         if self._filter_mode is not None:
@@ -600,7 +768,7 @@ class _CaptionListWidget(QWidget):
             return
         if self._search_cursor < 0 or self._search_cursor >= len(self._search_matches):
             self._search_cursor = 0
-        self._table.selectRow(self._search_matches[self._search_cursor])
+        self._select_row(self._search_matches[self._search_cursor])
         self._update_search_count()
         self._table.viewport().update()
 
@@ -610,7 +778,7 @@ class _CaptionListWidget(QWidget):
         if not self._search_matches:
             return
         self._search_cursor = (self._search_cursor + 1) % len(self._search_matches)
-        self._table.selectRow(self._search_matches[self._search_cursor])
+        self._select_row(self._search_matches[self._search_cursor])
         self._update_search_count()
 
     def _on_find_prev(self) -> None:
@@ -619,7 +787,7 @@ class _CaptionListWidget(QWidget):
         if not self._search_matches:
             return
         self._search_cursor = (self._search_cursor - 1) % len(self._search_matches)
-        self._table.selectRow(self._search_matches[self._search_cursor])
+        self._select_row(self._search_matches[self._search_cursor])
         self._update_search_count()
 
     def _on_clear_search(self) -> None:
@@ -667,16 +835,16 @@ class _CaptionListWidget(QWidget):
         self._set_search_locked(True, self._filter_label_map.get(kind, ""))
 
         visible = 0
-        self._suppress_item_changed = True
-        try:
-            for row, clip in enumerate(self._clips):
-                in_set = id(clip) in self._filter_snapshot_ids
-                self._table.setRowHidden(row, not in_set)
-                if in_set:
-                    visible += 1
-                self._paint_row_for_filter(row, clip)
-        finally:
-            self._suppress_item_changed = False
+        for row, clip in enumerate(self._clips):
+            in_set = id(clip) in self._filter_snapshot_ids
+            self._table.setRowHidden(row, not in_set)
+            if in_set:
+                visible += 1
+        self._model.set_filter_context(
+            self._filter_mode,
+            self._filter_snapshot_ids,
+            ocr_error_check=self._is_ocr_error_check,
+        )
 
         self._search_count_lbl.setText(f"0/{visible}")
         return visible
@@ -688,65 +856,19 @@ class _CaptionListWidget(QWidget):
         self._filter_snapshot_ids = set()
         self._is_ocr_error_check = None
         self._set_search_locked(False, "")
-        self._suppress_item_changed = True
-        try:
-            for row in range(self._table.rowCount()):
-                self._table.setRowHidden(row, False)
-                self._paint_row_for_filter(row, None)
-        finally:
-            self._suppress_item_changed = False
+        for row in range(len(self._clips)):
+            self._table.setRowHidden(row, False)
+        self._model.set_filter_context(None, set())
         self._recompute_search_matches()
 
     def refresh_filter_styles(self) -> None:
         if self._filter_mode is None:
             return
-        self._suppress_item_changed = True
-        try:
-            for row, clip in enumerate(self._clips):
-                self._paint_row_for_filter(row, clip)
-        finally:
-            self._suppress_item_changed = False
+        self._model.refresh_filter_styles()
 
     def _paint_row_for_filter(self, row: int, clip: Clip | None) -> None:
-        text_item = self._table.item(row, 1)
-        stt_item = self._table.item(row, 0)
-        if text_item is None or stt_item is None:
-            return
-
-        if self._filter_mode is None:
-            text_item.setData(Qt.ItemDataRole.BackgroundRole, None)
-            stt_item.setData(Qt.ItemDataRole.BackgroundRole, None)
-            text_item.setForeground(QColor("#e6e8ec"))
-            stt_item.setForeground(QColor("#e6e8ec"))
-            return
-
-        in_set = clip is not None and id(clip) in self._filter_snapshot_ids
-        if not in_set:
-            text_item.setData(Qt.ItemDataRole.BackgroundRole, None)
-            stt_item.setData(Qt.ItemDataRole.BackgroundRole, None)
-            text_item.setForeground(QColor("#e6e8ec"))
-            stt_item.setForeground(QColor("#e6e8ec"))
-            return
-
-        if self._filter_mode == "ocr" and self._is_ocr_error_check is not None:
-            still_error = bool(self._is_ocr_error_check(clip))
-            if still_error:
-                bg = QColor("#3a1f1f")
-                fg = QColor("#e6e8ec")
-            else:
-                bg = QColor("#1d2027")
-                fg = QColor("#6F6F6F")
-            text_item.setBackground(bg)
-            stt_item.setBackground(bg)
-            text_item.setForeground(fg)
-            stt_item.setForeground(fg)
-            return
-
-        bg = QColor("#2d1f3a")
-        text_item.setBackground(bg)
-        stt_item.setBackground(bg)
-        text_item.setForeground(QColor("#e6e8ec"))
-        stt_item.setForeground(QColor("#e6e8ec"))
+        del row, clip
+        self._model.refresh_filter_styles()
 
     def _set_search_locked(self, locked: bool, sentinel: str) -> None:
         self._search_input.blockSignals(True)
@@ -758,34 +880,36 @@ class _CaptionListWidget(QWidget):
         finally:
             self._search_input.blockSignals(False)
         self._search_input.setReadOnly(locked)
-        self._btn_regex.setDisabled(locked)
         self._btn_find_prev.setDisabled(locked)
         self._btn_find_next.setDisabled(locked)
         self._btn_replace.setDisabled(locked)
 
-    def _on_double_click(self, item: QTableWidgetItem) -> None:
-        if item.column() != 0:
+    def _on_double_click(self, index: QModelIndex) -> None:
+        if not index.isValid() or index.column() != 0:
             return
-        row = item.row()
+        row = index.row()
         if 0 <= row < len(self._clips):
             self.clip_double_clicked.emit(self._clips[row])
 
-    def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._suppress_item_changed or item.column() != 1:
-            return
-        row = item.row()
+    def _on_model_text_edited(self, clip: object, text: str) -> None:
+        row = -1
+        for idx, item in enumerate(self._clips):
+            if item is clip:
+                row = idx
+                break
         if row < 0 or row >= len(self._clips):
             return
-        self._table.resizeRowToContents(row)
-        self._enforce_min_row_height(row)
-        clip = self._clips[row]
-        self.clip_text_edit_requested.emit(clip, item.text())
+        if len(self._clips) <= self._AUTO_RESIZE_ROW_LIMIT:
+            self._table.resizeRowToContents(row)
+            self._enforce_min_row_height(row)
+        self.clip_text_edit_requested.emit(clip, text)
         if self._filter_mode is not None:
-            self._paint_row_for_filter(row, clip)
+            self._model.refresh_filter_styles()
             return
         self._recompute_search_matches()
 
-    def _on_selection_changed(self) -> None:
+    def _on_selection_changed(self, *args) -> None:
+        del args
         if self._suppress_selection_emit:
             return
         self.clip_selected.emit(self._selected_clip())
