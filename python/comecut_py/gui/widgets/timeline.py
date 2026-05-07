@@ -71,6 +71,7 @@ from ...core.transitions import (
 from ..preview_timeline import clip_fade_multiplier_at_local_time
 
 _RESOLVED_PATH_CACHE: dict[str, str] = {}
+_IS_FILE_CACHE: dict[str, bool] = {}
 
 
 def _resolved_source_str(source: str | Path) -> str:
@@ -86,6 +87,21 @@ def _resolved_source_str(source: str | Path) -> str:
         resolved = raw
     _RESOLVED_PATH_CACHE[raw] = resolved
     return resolved
+
+
+def _cached_is_file(source: str | Path) -> bool:
+    raw = str(source or "")
+    if not raw:
+        return False
+    cached = _IS_FILE_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        is_file = Path(raw).is_file()
+    except Exception:
+        is_file = False
+    _IS_FILE_CACHE[raw] = is_file
+    return is_file
 
 
 BASE_PIXELS_PER_SECOND = 50.0
@@ -727,7 +743,7 @@ class ClipRect(QGraphicsRectItem):
         self._is_audio_clip = self._track_kind == "audio"
         self._decode_source_key = self._current_decode_source_key()
         self._content_signature = self._make_content_signature(clip, self._track_kind)
-        self._is_missing = not self._is_text_clip and not Path(clip.source).is_file()
+        self._is_missing = not self._is_text_clip and not _cached_is_file(clip.source)
         
         self.setPos(panel.seconds_to_pixels(clip.start), lane_y)
         self.setBrush(QBrush(color))
@@ -818,7 +834,7 @@ class ClipRect(QGraphicsRectItem):
             self._content_signature = new_signature
             changed = True
 
-        new_is_missing = not self._is_text_clip and not Path(clip.source).is_file()
+        new_is_missing = not self._is_text_clip and not _cached_is_file(clip.source)
         if new_is_missing != self._is_missing:
             self._is_missing = new_is_missing
             changed = True
@@ -2722,6 +2738,7 @@ class TimelinePanel(QWidget):
                     isinstance(item, ClipRect)
                     and not getattr(item, "_is_text_clip", False)
                     and not getattr(item, "_is_audio_clip", False)
+                    and self._clip_intersects_visible_timeline(item.clip)
                 ):
                     item.update()
             if hasattr(self, "_view"):
@@ -3027,7 +3044,8 @@ class TimelinePanel(QWidget):
         self._is_playing = bool(playing)
         if was_playing and not self._is_playing:
             self._bump_media_cache_idle()
-            self._schedule_refresh()
+            self._set_pointer_active(False)
+            self._refresh_playhead()
 
     def set_speed_issue_clip_ids(self, ids: set[int]) -> None:
         new_ids = set(ids) if ids else set()
@@ -5614,7 +5632,7 @@ class TimelinePanel(QWidget):
         self._is_playhead_scrubbing = False
         self._flush_pending_scrub_seek()
         self._bump_media_cache_idle()
-        self._schedule_refresh()
+        self._refresh_playhead()
 
     def _scrub_playhead_to_scene_x(self, scene_x: float, *, emit_seek: bool) -> None:
         seconds = max(0.0, self.pixels_to_seconds(scene_x))

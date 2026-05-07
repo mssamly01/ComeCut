@@ -196,6 +196,8 @@ class MainWindow(QMainWindow):
         self._audio_clip_index = _ClipIntervalIndex()
         self._video_clip_index = _ClipIntervalIndex()
         self._clip_interval_indexes_dirty = True
+        self._clip_track_map: dict[int, Track] = {}
+        self._audio_mix_candidates_cache: tuple[bool, int] | None = None
         self._media_ingest = MediaIngestService()
         self._duration_placeholder_clip_ids: set[int] = set()
         self._duration_placeholder_by_source_key: dict[str, list[Clip]] = {}
@@ -860,16 +862,22 @@ class MainWindow(QMainWindow):
 
     def _invalidate_clip_interval_indexes(self) -> None:
         self._clip_interval_indexes_dirty = True
+        self._clip_track_map.clear()
+        self._audio_mix_candidates_cache = None
 
     def _ensure_clip_interval_indexes(self) -> None:
         if not self._clip_interval_indexes_dirty:
             return
         self._audio_clip_index.rebuild(audible_audio_tracks(self.project.tracks))
-        video_tracks = [
-            track
-            for track in self.project.tracks
-            if track.kind == "video" and track.clips and not self._is_track_hidden(track)
-        ]
+        video_tracks: list[Track] = []
+        main_track = self._main_video_track()
+        if main_track is not None and main_track.clips:
+            video_tracks.append(main_track)
+        for track in self.project.tracks:
+            if track is main_track:
+                continue
+            if track.kind == "video" and track.clips and not self._is_track_hidden(track):
+                video_tracks.append(track)
         self._video_clip_index.rebuild(video_tracks)
         self._clip_interval_indexes_dirty = False
 
@@ -1421,29 +1429,22 @@ class MainWindow(QMainWindow):
         self._timeline_audio_next_window_duration = None
         return True
 
-    def _timeline_has_audio_mix_candidates(self) -> bool:
-        for track in self.project.tracks:
-            if track.kind not in {"video", "audio"}:
-                continue
-            if self._is_track_hidden(track) or self._is_track_muted(track):
-                continue
-            if any(not bool(getattr(clip, "is_text_clip", False)) for clip in track.clips):
-                return True
-        return False
-
-    def _timeline_audio_mix_candidate_count(self) -> int:
+    def _ensure_audio_mix_candidates_cache(self) -> tuple[bool, int]:
+        cached = self._audio_mix_candidates_cache
+        if cached is not None:
+            return cached
         total = 0
         for track in self.project.tracks:
             if track.kind not in {"video", "audio"}:
                 continue
             if self._is_track_hidden(track) or self._is_track_muted(track):
                 continue
-            total += sum(
-                1
-                for clip in track.clips
-                if not bool(getattr(clip, "is_text_clip", False))
-            )
-        return total
+            for clip in track.clips:
+                if not bool(getattr(clip, "is_text_clip", False)):
+                    total += 1
+        cached = (total > 0, total)
+        self._audio_mix_candidates_cache = cached
+        return cached
 
     def _should_use_windowed_timeline_audio_mix(self) -> bool:
         try:
@@ -1452,7 +1453,7 @@ class MainWindow(QMainWindow):
             duration = 0.0
         if duration >= self._TIMELINE_AUDIO_WINDOW_PROJECT_SECONDS:
             return True
-        return self._timeline_audio_mix_candidate_count() > self._TIMELINE_AUDIO_WINDOW_CLIP_THRESHOLD
+        return self._ensure_audio_mix_candidates_cache()[1] > self._TIMELINE_AUDIO_WINDOW_CLIP_THRESHOLD
 
     def _timeline_audio_window_start_for_time(self, seconds: float) -> float:
         step = max(1.0, float(self._TIMELINE_AUDIO_WINDOW_STEP_SECONDS))
@@ -1479,7 +1480,7 @@ class MainWindow(QMainWindow):
         force: bool = False,
         anchor_seconds: float | None = None,
     ) -> None:
-        if not self._timeline_has_audio_mix_candidates():
+        if not self._ensure_audio_mix_candidates_cache()[0]:
             return
         if self._timeline_audio_mix_inflight:
             return
@@ -1682,12 +1683,6 @@ class MainWindow(QMainWindow):
 
     def _pick_video_clip_for_time(self, seconds: float) -> Clip | None:
         s = max(0.0, float(seconds))
-        main = self._main_video_track()
-        if main is not None:
-            for clip in main.clips:
-                if clip.start <= s < self._clip_end_seconds(clip):
-                    return clip
-
         self._ensure_clip_interval_indexes()
         return self._video_clip_index.find(s)
 
@@ -2725,8 +2720,17 @@ class MainWindow(QMainWindow):
         self._translate_subtitle_track_batch(clip)
 
     def _find_track_for_clip(self, clip: Clip) -> Track | None:
+        cache_key = id(clip)
+        cached = self._clip_track_map.get(cache_key)
+        if cached is not None:
+            return cached
+        for track in self.project.tracks:
+            if any(existing is clip for existing in track.clips):
+                self._clip_track_map[cache_key] = track
+                return track
         for track in self.project.tracks:
             if clip in track.clips:
+                self._clip_track_map[cache_key] = track
                 return track
         return None
 
