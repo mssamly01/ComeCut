@@ -511,6 +511,48 @@ def _downsample_peaks(peaks: list[float], target: int) -> list[float]:
     return out
 
 
+def waveform_peaks_for_clip_source_range(
+    peaks: list[float],
+    clip: Clip,
+    source_duration_seconds: float,
+) -> list[float]:
+    """Return only the waveform peaks covered by the clip's source in/out range."""
+    if not peaks:
+        return peaks
+
+    try:
+        source_duration = float(source_duration_seconds)
+    except Exception:
+        source_duration = 0.0
+    if source_duration <= 1e-6:
+        return list(reversed(peaks)) if bool(getattr(clip, "reverse", False)) else list(peaks)
+
+    try:
+        in_point = max(0.0, float(getattr(clip, "in_point", 0.0) or 0.0))
+    except Exception:
+        in_point = 0.0
+    try:
+        raw_out = getattr(clip, "out_point", None)
+        out_point = float(raw_out) if raw_out is not None else source_duration
+    except Exception:
+        out_point = source_duration
+
+    out_point = max(in_point, min(source_duration, out_point))
+    in_point = min(in_point, source_duration)
+    if out_point <= in_point + 1e-6:
+        return []
+
+    n = len(peaks)
+    start_idx = int(math.floor((in_point / source_duration) * n))
+    end_idx = int(math.ceil((out_point / source_duration) * n))
+    start_idx = max(0, min(n - 1, start_idx))
+    end_idx = max(start_idx + 1, min(n, end_idx))
+    sliced = list(peaks[start_idx:end_idx])
+    if bool(getattr(clip, "reverse", False)):
+        sliced.reverse()
+    return sliced
+
+
 def _filmstrip_sample_step_seconds(px_per_src_sec: float) -> int:
     """Choose how many source seconds one visible thumbnail should represent."""
     if px_per_src_sec >= FILMSTRIP_DENSE_PX_PER_SECOND:
@@ -1229,6 +1271,12 @@ class ClipRect(QGraphicsRectItem):
                         media_kind="audio" if self._is_audio_clip else "video",
                     )
                     if peaks_full:
+                        source_duration = self._panel._waveform_source_duration_seconds(self.clip)
+                        peaks_full = waveform_peaks_for_clip_source_range(
+                            peaks_full,
+                            self.clip,
+                            source_duration,
+                        )
                         bar_count = max(8, int(wave_rect.width() / 3.0))
                         peaks = (
                             peaks_full
@@ -2522,6 +2570,7 @@ class TimelinePanel(QWidget):
         self._wave_peaks_cache: dict[tuple[str, int, int], list[float] | None] = {}
         self._wave_peaks_inflight: set[tuple[str, int, int]] = set()
         self._wave_upgrade_pending: set[tuple[str, int, int]] = set()
+        self._wave_source_duration_cache: dict[str, float] = {}
         self._pending_track_volume_commits: set[int] = set()
         self._thumbnail_ready.connect(self._on_thumbnail_ready)
         self._filmstrip_chunk_ready.connect(self._on_filmstrip_chunk_ready)
@@ -4375,6 +4424,53 @@ class TimelinePanel(QWidget):
         duration_ms: int = 0,
     ) -> tuple[str, int, int]:
         return (str(source), int(num_peaks), int(duration_ms))
+
+    def _waveform_source_duration_seconds(self, clip: Clip) -> float:
+        try:
+            source = str(Path(self._clip_decode_source(clip)).resolve())
+        except Exception:
+            source = self._clip_decode_source(clip)
+
+        cached = float(self._wave_source_duration_cache.get(source, 0.0) or 0.0)
+        if cached > 1e-6:
+            return cached
+
+        upper_bound = 0.0
+        for track in self._project.tracks:
+            for item in track.clips:
+                try:
+                    item_source = str(Path(self._clip_decode_source(item)).resolve())
+                except Exception:
+                    item_source = self._clip_decode_source(item)
+                if item_source != source:
+                    continue
+                try:
+                    out_point = getattr(item, "out_point", None)
+                    if out_point is not None:
+                        upper_bound = max(upper_bound, float(out_point))
+                except Exception:
+                    pass
+                try:
+                    source_span = float(getattr(item, "source_duration", 0.0) or 0.0)
+                    in_point = float(getattr(item, "in_point", 0.0) or 0.0)
+                    upper_bound = max(upper_bound, in_point + source_span)
+                except Exception:
+                    pass
+
+        probed = 0.0
+        try:
+            probed = float(get_video_duration(source))
+        except Exception:
+            probed = 0.0
+        duration = max(cached, upper_bound, probed)
+        if duration <= 1e-6:
+            try:
+                duration = float(clip.source_duration or clip.timeline_duration or 0.0)
+            except Exception:
+                duration = 0.0
+        if duration > 1e-6:
+            self._wave_source_duration_cache[source] = duration
+        return duration
 
     def _submit_waveform_extract(
         self,

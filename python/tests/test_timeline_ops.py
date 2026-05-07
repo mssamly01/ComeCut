@@ -18,6 +18,7 @@ from comecut_py.gui.widgets.timeline import (
     ripple_delete_clips_from_track,
     timeline_snap_times,
     trim_clip_edge,
+    waveform_peaks_for_clip_source_range,
 )
 from comecut_py.core.beat_markers import add_beat_marker
 from comecut_py.core.transitions import set_track_transition
@@ -295,3 +296,21 @@ def test_apply_fade_endpoint_zero_keeps_peaks_without_fade():
     peaks = [0.8, 0.7, 0.6]
     out = apply_fade_endpoint_zero(peaks, fade_in_seconds=0.0, fade_out_seconds=0.0)
     assert out == pytest.approx([0.8, 0.7, 0.6])
+
+
+def test_waveform_peaks_for_clip_source_range_slices_by_in_out_points():
+    peaks = [float(i) for i in range(10)]
+    clip = Clip(source="a.mp4", in_point=2.0, out_point=5.0)
+
+    out = waveform_peaks_for_clip_source_range(peaks, clip, source_duration_seconds=10.0)
+
+    assert out == pytest.approx([2.0, 3.0, 4.0])
+
+
+def test_waveform_peaks_for_clip_source_range_reverses_when_clip_reversed():
+    peaks = [float(i) for i in range(10)]
+    clip = Clip(source="a.mp4", in_point=2.0, out_point=5.0, reverse=True)
+
+    out = waveform_peaks_for_clip_source_range(peaks, clip, source_duration_seconds=10.0)
+
+    assert out == pytest.approx([4.0, 3.0, 2.0])
