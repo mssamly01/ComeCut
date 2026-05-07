@@ -37,6 +37,7 @@ def test_widget_modules_import() -> None:
         text_panel,
         timeline,
         topbar,
+        voice_match_panel,
     )
 
     # Public classes referenced by main_window must exist.
@@ -51,11 +52,13 @@ def test_widget_modules_import() -> None:
     assert text_panel.TextPanel is not None
     assert timeline.TimelinePanel is not None
     assert topbar.TopBar is not None
+    assert voice_match_panel.VoiceMatchPanel is not None
 
     # Tab keys are part of the public API.
-    assert {left_rail.TAB_MEDIA, left_rail.TAB_TEXT} == {
+    assert {left_rail.TAB_MEDIA, left_rail.TAB_TEXT, left_rail.TAB_VOICE_MATCH} == {
         "media",
         "text",
+        "voice_match",
     }
 
 

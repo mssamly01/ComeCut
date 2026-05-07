@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from time import monotonic
 
-from PySide6.QtCore import QEvent, QTimer, Qt, Signal  # type: ignore
+from PySide6.QtCore import QEvent, QThread, QTimer, Qt, Signal  # type: ignore
 from PySide6.QtGui import QKeySequence  # type: ignore
 from PySide6.QtWidgets import (  # type: ignore
     QAbstractItemView,
@@ -55,6 +55,7 @@ from ..core.project_templates import (
 )
 from ..core.time_utils import format_timecode
 from ..core.project import Clip, Project, Track
+from ..core.store import default_store_dir
 from ..core.store import load_project as store_load_project
 from ..core.store import save_project as store_save_project
 from ..engine.audio_proxy import audio_proxy_path, make_audio_proxy
@@ -81,12 +82,13 @@ from .preview_timeline import (
     pick_timeline_audio_clip,
 )
 from .widgets.inspector import InspectorPanel
-from .widgets.left_rail import TAB_MEDIA, TAB_TEXT, LeftRail
+from .widgets.left_rail import TAB_MEDIA, TAB_TEXT, TAB_VOICE_MATCH, LeftRail
 from .widgets.media_library import MediaLibraryPanel
 from .widgets.preview import PreviewPanel
 from .widgets.text_panel import TextPanel
 from .widgets.timeline import TimelinePanel
 from .widgets.topbar import TopBar
+from .widgets.voice_match_panel import VoiceMatchPanel, VoiceMatchPanelSettings
 
 
 def _clip_speed_value(clip: Clip) -> float:
@@ -105,6 +107,32 @@ def _timeline_to_source_seconds(clip: Clip, timeline_seconds: float) -> float:
 def _source_to_timeline_seconds(clip: Clip, source_seconds: float) -> float:
     rel_src = max(0.0, float(source_seconds) - float(clip.in_point))
     return float(clip.start) + (rel_src / _clip_speed_value(clip))
+
+
+class _VoiceMatchWorker(QThread):
+    progress = Signal(int, str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, options: object) -> None:
+        super().__init__()
+        self.options = options
+
+    def run(self) -> None:
+        try:
+            from ..integrations.capcut_generator.adapter import generate_voice_match_from_timeline
+
+            result = generate_voice_match_from_timeline(
+                self.options,  # type: ignore[arg-type]
+                progress_callback=lambda percent, message: self.progress.emit(
+                    int(percent),
+                    str(message),
+                ),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -145,6 +173,7 @@ class MainWindow(QMainWindow):
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
         self._suspend_text_autoselect = False
+        self._voice_match_worker: _VoiceMatchWorker | None = None
         self._gap_play_timer = QTimer(self)
         self._gap_play_timer.setInterval(16)
         self._gap_play_timer.timeout.connect(self._on_gap_play_tick)
@@ -247,10 +276,9 @@ class MainWindow(QMainWindow):
         self._update_text_sub_nav_visuals("list") # Initial state
         self.sub_nav_stack.addWidget(self.text_sub_nav)
 
-        # --- Page 3+: Empty Sub-Nav for other tabs ---
-        for _ in range(4): # For remaining tabs in LeftRail
-            empty_sub = QWidget()
-            self.sub_nav_stack.addWidget(empty_sub)
+        # --- Page 3: Voice Match has no secondary source picker ---
+        self.voice_match_sub_nav = QWidget()
+        self.sub_nav_stack.addWidget(self.voice_match_sub_nav)
         
         self.side_stack = QStackedWidget()
         self.side_stack.setMinimumWidth(300)
@@ -261,8 +289,10 @@ class MainWindow(QMainWindow):
 
         self.media_panel = MediaLibraryPanel()
         self.text_panel = TextPanel()
+        self.voice_match_panel = VoiceMatchPanel()
         self.side_stack.addWidget(self.media_panel)
         self.side_stack.addWidget(self.text_panel)
+        self.side_stack.addWidget(self.voice_match_panel)
         self.text_panel.subtitle_import_requested.connect(self._import_subtitles_into_text_panel)
 
         self.preview_panel = PreviewPanel()
@@ -303,6 +333,8 @@ class MainWindow(QMainWindow):
         self.text_panel.subtitle_add_requested.connect(self._on_add_clip_from_card)
         self.text_panel.subtitle_files_imported.connect(self._on_subtitle_files_imported)
         self.text_panel.subtitle_files_removed.connect(self._on_subtitle_files_removed)
+        self.voice_match_panel.generate_requested.connect(self._on_voice_match_generate_requested)
+        self.voice_match_panel.import_requested.connect(self._on_voice_match_import_requested)
         self.timeline_panel.media_drop_requested.connect(self._on_drop_add_clip)
         self.media_panel.relink_requested.connect(self._on_relink_media)
         self.text_panel.relink_subtitle_requested.connect(self._on_relink_subtitle)
@@ -471,7 +503,11 @@ class MainWindow(QMainWindow):
         selected_clip = self.inspector_panel.current_clip()
         selected_timeline_clips = self.timeline_panel.selected_clips()
         side_idx = int(self.side_stack.currentIndex())
-        left_tab_key = TAB_TEXT if side_idx == 1 else TAB_MEDIA
+        left_tab_key = {
+            0: TAB_MEDIA,
+            1: TAB_TEXT,
+            2: TAB_VOICE_MATCH,
+        }.get(side_idx, TAB_MEDIA)
         inspector_title = ""
         try:
             inspector_title = str(info.current_title())
@@ -521,8 +557,12 @@ class MainWindow(QMainWindow):
     def _restore_window_toggle_state(self, snap: dict[str, object]) -> None:
         side_idx = int(snap.get("side_stack", 0))
         left_tab_key = snap.get("left_tab_key")
-        if left_tab_key not in (TAB_MEDIA, TAB_TEXT):
-            left_tab_key = TAB_TEXT if side_idx == 1 else TAB_MEDIA
+        if left_tab_key not in (TAB_MEDIA, TAB_TEXT, TAB_VOICE_MATCH):
+            left_tab_key = {
+                0: TAB_MEDIA,
+                1: TAB_TEXT,
+                2: TAB_VOICE_MATCH,
+            }.get(side_idx, TAB_MEDIA)
         self._set_left_tab(left_tab_key)
 
         inspector_idx = int(snap.get("inspector_stack", 0))
@@ -1497,11 +1537,96 @@ class MainWindow(QMainWindow):
         self._set_left_tab(key)
 
     def _set_left_tab(self, key: str) -> None:
-        safe_key = key if key in (TAB_MEDIA, TAB_TEXT) else TAB_MEDIA
-        idx = {TAB_MEDIA: 0, TAB_TEXT: 1}.get(safe_key, 0)
+        safe_key = key if key in (TAB_MEDIA, TAB_TEXT, TAB_VOICE_MATCH) else TAB_MEDIA
+        idx = {
+            TAB_MEDIA: 0,
+            TAB_TEXT: 1,
+            TAB_VOICE_MATCH: 2,
+        }.get(safe_key, 0)
         self.left_rail.set_active(safe_key)
         self.side_stack.setCurrentIndex(idx)
         self.sub_nav_stack.setCurrentIndex(idx)
+
+    def _voice_match_work_dir(self) -> Path:
+        project_key = self._store_project_id or "_unsaved"
+        return default_store_dir() / project_key / "voice_match"
+
+    def _default_voice_match_output_path(self) -> Path:
+        work_dir = self._voice_match_work_dir()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        stamp = int(monotonic() * 1000)
+        return work_dir / f"voice_match_{stamp}.json"
+
+    def _on_voice_match_generate_requested(self, settings: VoiceMatchPanelSettings) -> None:
+        if self._voice_match_worker is not None and self._voice_match_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Khớp voice",
+                "Đang tạo draft khớp voice, vui lòng chờ hoàn tất.",
+            )
+            return
+
+        from ..integrations.capcut_generator.adapter import TimelineVoiceMatchOptions
+
+        work_dir = self._voice_match_work_dir()
+        output_path = settings.output_json_path or self._default_voice_match_output_path()
+        options = TimelineVoiceMatchOptions(
+            project=self.project.model_copy(deep=True),
+            output_json_path=Path(output_path),
+            work_dir=work_dir,
+            sync_mode=settings.sync_mode,
+            target_audio_speed=settings.target_audio_speed,
+            keep_pitch=settings.keep_pitch,
+            video_speed_enabled=settings.video_speed_enabled,
+            target_video_speed=settings.target_video_speed,
+            remove_silence=settings.remove_silence,
+            waveform_sync=settings.waveform_sync,
+            skip_stretch_shorter=settings.skip_stretch_shorter,
+            export_lt8=settings.export_lt8,
+        )
+
+        self.voice_match_panel.set_running(True)
+        self.voice_match_panel.set_progress(0, "Bắt đầu tạo draft khớp voice từ timeline...")
+        worker = _VoiceMatchWorker(options)
+        self._voice_match_worker = worker
+        worker.progress.connect(self.voice_match_panel.set_progress)
+        worker.succeeded.connect(self._on_voice_match_worker_succeeded)
+        worker.failed.connect(self._on_voice_match_worker_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_voice_match_worker_succeeded(self, path_obj: object) -> None:
+        path = Path(path_obj)
+        self.voice_match_panel.set_running(False)
+        self.voice_match_panel.set_progress(100, "Hoàn tất.")
+        self.voice_match_panel.set_generated_path(path)
+        self.statusBar().showMessage(f"Đã tạo draft khớp voice: {path.name}", 4000)
+        self._voice_match_worker = None
+
+    def _on_voice_match_worker_failed(self, message: str) -> None:
+        text = str(message).strip() or "Không thể tạo draft khớp voice."
+        self.voice_match_panel.set_running(False)
+        self.voice_match_panel.append_log(text)
+        self._voice_match_worker = None
+        QMessageBox.warning(self, "Không thể khớp voice", text)
+
+    def _on_voice_match_import_requested(self, path_obj: object) -> None:
+        from ..core.capcut_importer import import_capcut_draft
+
+        path = Path(path_obj)
+        try:
+            project = import_capcut_draft(path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Import khớp voice thất bại",
+                f"Không thể import draft đã tạo:\n\n{exc}",
+            )
+            return
+
+        self._apply_loaded_project(project)
+        self._store_project_id = None
+        self.statusBar().showMessage(f"Đã import draft khớp voice: {path.name}", 4000)
 
     def _tracks_snapshot(self) -> str:
         tracks_payload = [track.model_dump(mode="json") for track in self.project.tracks]

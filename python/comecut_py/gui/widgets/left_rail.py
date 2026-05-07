@@ -16,16 +16,19 @@ from PySide6.QtWidgets import (  # type: ignore
 
 TAB_MEDIA = "media"
 TAB_TEXT = "text"
+TAB_VOICE_MATCH = "voice_match"
 
 # Use fill="currentColor" to allow dynamic color replacement
 _SVG_ICONS = {
     TAB_MEDIA: """<svg viewBox="0 0 50 50" xmlns="http://www.w3.org/2000/svg"><path d="M50 12.5V9.498A2 2 0 0 0 48.002 7.5H2.002A2 2 0 0 0 0 9.498V12.5h5v5H0v5h5v5H0v5h5v5H0v2.998A2 2 0 0 0 2.002 42.5h46a2 2 0 0 0 1.998 -2.002V37.5h-5v-5h5v-5h-5V22.5h5V17.5h-5V12.5zM20 32.5V17.5l12.5 7.5z" fill="currentColor"/></svg>""",
     TAB_TEXT: """<svg viewBox="0 -1 20 20" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><path d="M19 9V7h-8v2"/><path data-name="primary" d="M1 3V1h10v2m4 4v10m-2 0h4M6 1v16m-2 0h4"/></g></svg>""",
+    TAB_VOICE_MATCH: """<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M16.19 2H7.81C4.17 2 2 4.17 2 7.81v8.37C2 19.83 4.17 22 7.81 22h8.37c3.64 0 5.81-2.17 5.81-5.81V7.81C22 4.17 19.83 2 16.19 2M6.75 14.14c0 .41-.34.75-.75.75s-.75-.34-.75-.75V9.86c0-.41.34-.75.75-.75s.75.34.75.75zm3 1.43c0 .41-.34.75-.75.75s-.75-.34-.75-.75V8.43c0-.41.34-.75.75-.75s.75.34.75.75zm3 1.43c0 .41-.34.75-.75.75s-.75-.34-.75-.75V7c0-.41.34-.75.75-.75s.75.34.75.75zm3-1.43c0 .41-.34.75-.75.75s-.75-.34-.75-.75V8.43c0-.41.34-.75.75-.75s.75.34.75.75zm3-1.43c0 .41-.34.75-.75.75s-.75-.34-.75-.75V9.86c0-.41.34-.75.75-.75s.75.34.75.75z" fill="currentColor"/></svg>""",
 }
 
 _LABELS = {
     TAB_MEDIA: "Media",
     TAB_TEXT: "Text",
+    TAB_VOICE_MATCH: "Khớp voice",
 }
 
 # Colors matching the CSS
@@ -53,7 +56,7 @@ class LeftRail(QFrame):
         self._group.setExclusive(True)
         self._buttons: dict[str, QToolButton] = {}
 
-        for key in (TAB_MEDIA, TAB_TEXT):
+        for key in (TAB_MEDIA, TAB_TEXT, TAB_VOICE_MATCH):
             btn = self._make_btn(_SVG_ICONS[key], _LABELS[key])
             btn.setCheckable(True)
             btn.clicked.connect(lambda _checked=False, k=key: self.tab_selected.emit(k))
@@ -121,4 +124,4 @@ class LeftRail(QFrame):
             self._buttons[key].setChecked(True)
 
 
-__all__ = ["TAB_MEDIA", "TAB_TEXT", "LeftRail"]
+__all__ = ["TAB_MEDIA", "TAB_TEXT", "TAB_VOICE_MATCH", "LeftRail"]
