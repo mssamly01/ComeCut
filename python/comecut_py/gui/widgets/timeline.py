@@ -69,6 +69,25 @@ from ...core.transitions import (
     transition_duration_limit,
 )
 from ..preview_timeline import clip_fade_multiplier_at_local_time
+
+_RESOLVED_PATH_CACHE: dict[str, str] = {}
+
+
+def _resolved_source_str(source: str | Path) -> str:
+    raw = str(source or "")
+    if not raw:
+        return ""
+    cached = _RESOLVED_PATH_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        resolved = str(Path(raw).resolve())
+    except Exception:
+        resolved = raw
+    _RESOLVED_PATH_CACHE[raw] = resolved
+    return resolved
+
+
 BASE_PIXELS_PER_SECOND = 50.0
 PIXELS_PER_SECOND = BASE_PIXELS_PER_SECOND
 TRACK_HEIGHT = 64.0
@@ -746,7 +765,7 @@ class ClipRect(QGraphicsRectItem):
 
     def _current_decode_source_key(self) -> str:
         try:
-            return str(Path(self._panel._clip_decode_source(self.clip)).resolve())
+            return _resolved_source_str(self._panel._clip_decode_source(self.clip))
         except Exception:
             return str(getattr(self.clip, "source", "") or "")
 
@@ -2664,6 +2683,8 @@ class TimelinePanel(QWidget):
         self._scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self._scene.setBackgroundBrush(QBrush(QColor(TIMELINE_BG_COLOR)))
         self._clip_items_by_id: dict[int, ClipRect] = {}
+        self._clip_items_by_source: dict[str, list[ClipRect]] = {}
+        self._last_emitted_selection_key: tuple[int, ...] | None = None
         self._transient_scene_items: list[QGraphicsItem] = []
         self._scene.selectionChanged.connect(self._on_selection_changed)
         self._view = TimelineView(self._scene, self)
@@ -2688,6 +2709,9 @@ class TimelinePanel(QWidget):
             self.refresh()
 
         QTimer.singleShot(0, _do)
+
+    def schedule_refresh(self) -> None:
+        self._schedule_refresh()
 
     def _set_pointer_active(self, active: bool) -> None:
         was_active = bool(self._pointer_active)
@@ -4353,7 +4377,7 @@ class TimelinePanel(QWidget):
         strip_height: int,
         frames: int,
     ) -> tuple[str, int, int, int, int]:
-        src = str(Path(TimelinePanel._clip_decode_source(clip)).resolve())
+        src = _resolved_source_str(TimelinePanel._clip_decode_source(clip))
         dur_ms = int(round(float(clip.source_duration or 0.0) * 1000.0))
         return (src, int(strip_width), int(strip_height), int(frames), dur_ms)
 
@@ -4368,7 +4392,7 @@ class TimelinePanel(QWidget):
     ) -> tuple[str, int, int, int, int]:
         dur_ms = int(round(float(duration or 0.0) * 1000.0))
         return (
-            str(Path(source).resolve()),
+            _resolved_source_str(source),
             int(strip_width),
             int(strip_height),
             int(frames),
@@ -4467,7 +4491,7 @@ class TimelinePanel(QWidget):
         chunk_idx: int,
     ) -> tuple[str, int, int, int, int]:
         return (
-            str(Path(source).resolve()),
+            _resolved_source_str(source),
             int(chunk_idx),
             int(FILMSTRIP_TILE_W),
             int(FILMSTRIP_TILE_H),
@@ -4484,7 +4508,7 @@ class TimelinePanel(QWidget):
             return
         if len(self._chunk_inflight) >= MAX_FILMSTRIP_CHUNKS_INFLIGHT:
             return
-        source_key = str(key[0]) if key else str(Path(source).resolve())
+        source_key = str(key[0]) if key else _resolved_source_str(source)
         per_source = sum(1 for existing in self._chunk_inflight if existing and str(existing[0]) == source_key)
         if per_source >= MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE:
             return
@@ -4514,10 +4538,7 @@ class TimelinePanel(QWidget):
         clip: Clip,
         chunk_idx: int,
     ) -> QPixmap | None:
-        try:
-            source = str(Path(self._clip_decode_source(clip)).resolve())
-        except Exception:
-            source = self._clip_decode_source(clip)
+        source = _resolved_source_str(self._clip_decode_source(clip))
         if not source:
             return None
 
@@ -4554,17 +4575,18 @@ class TimelinePanel(QWidget):
 
         src = str(key_t[0]) if key_t else ""
         if src:
+            bucket = getattr(self, "_clip_items_by_source", {}).get(src)
+            if bucket is not None:
+                for item in list(bucket):
+                    item.update()
+                return
             for item in self._clip_items_by_id.values():
-                try:
-                    item_src = str(Path(self._clip_decode_source(item.clip)).resolve())
-                except Exception:
-                    item_src = self._clip_decode_source(item.clip)
-                if item_src == src:
+                if item._current_decode_source_key() == src:
                     item.update()
 
     @staticmethod
     def _peaks_key(clip: Clip, num_peaks: int) -> tuple[str, int, int]:
-        src = str(Path(TimelinePanel._clip_decode_source(clip)).resolve())
+        src = _resolved_source_str(TimelinePanel._clip_decode_source(clip))
         return TimelinePanel._peaks_key_from_source(src, num_peaks)
 
     @staticmethod
@@ -4584,13 +4606,10 @@ class TimelinePanel(QWidget):
     ) -> tuple[str, int, int, int]:
         start_ms = int(round(max(0.0, float(start)) * 1000.0))
         duration_ms = int(round(max(0.0, float(duration)) * 1000.0))
-        return (str(Path(source).resolve()), start_ms, duration_ms, int(num_peaks))
+        return (_resolved_source_str(source), start_ms, duration_ms, int(num_peaks))
 
     def _waveform_source_duration_seconds(self, clip: Clip) -> float:
-        try:
-            source = str(Path(self._clip_decode_source(clip)).resolve())
-        except Exception:
-            source = self._clip_decode_source(clip)
+        source = _resolved_source_str(self._clip_decode_source(clip))
 
         cached = float(self._wave_source_duration_cache.get(source, 0.0) or 0.0)
         if cached > 1e-6:
@@ -4599,10 +4618,7 @@ class TimelinePanel(QWidget):
         upper_bound = 0.0
         for track in self._project.tracks:
             for item in track.clips:
-                try:
-                    item_source = str(Path(self._clip_decode_source(item)).resolve())
-                except Exception:
-                    item_source = self._clip_decode_source(item)
+                item_source = _resolved_source_str(self._clip_decode_source(item))
                 if item_source != source:
                     continue
                 try:
@@ -4781,10 +4797,7 @@ class TimelinePanel(QWidget):
         target_peaks = max(1, int(num_peaks))
         if source_duration <= 1e-6:
             return None
-        try:
-            source = str(Path(self._clip_decode_source(clip)).resolve())
-        except Exception:
-            source = self._clip_decode_source(clip)
+        source = _resolved_source_str(self._clip_decode_source(clip))
         if not source:
             return None
         key = self._range_peaks_key_from_source(
@@ -4883,7 +4896,7 @@ class TimelinePanel(QWidget):
                 continue
             is_audio = ext in AUDIO_EXTS
             is_video = not is_audio
-            source = str(path.resolve())
+            source = _resolved_source_str(path)
 
             wave_key = self._peaks_key_from_source(source, WAVEFORM_PEAKS_FAST)
             self._submit_waveform_extract(
@@ -4960,10 +4973,7 @@ class TimelinePanel(QWidget):
             return
         if not self._clip_intersects_visible_timeline(clip):
             return
-        try:
-            source = str(Path(source_raw).resolve())
-        except Exception:
-            source = str(source_raw)
+        source = _resolved_source_str(source_raw)
         ext = Path(source).suffix.lower()
         is_audio = ext in AUDIO_EXTS
         try:
@@ -5081,10 +5091,7 @@ class TimelinePanel(QWidget):
             source_raw = self._clip_decode_source(clip)
             if not source_raw:
                 continue
-            try:
-                source = str(Path(source_raw).resolve())
-            except Exception:
-                source = str(source_raw)
+            source = _resolved_source_str(source_raw)
             try:
                 duration_ms = int(
                     round(
@@ -5124,9 +5131,10 @@ class TimelinePanel(QWidget):
         if not key:
             return
         source_key = str(key[0])
-        for item in getattr(self, "_clip_items_by_id", {}).values():
-            if item._current_decode_source_key() != source_key:
-                continue
+        bucket = getattr(self, "_clip_items_by_source", {}).get(source_key)
+        if not bucket:
+            return
+        for item in list(bucket):
             if invalidate_filmstrip:
                 item.invalidate_filmstrip()
             else:
@@ -5169,6 +5177,35 @@ class TimelinePanel(QWidget):
         self._transient_scene_items.append(item)
         return item
 
+    def _index_clip_item(self, item: ClipRect) -> None:
+        key = item._decode_source_key
+        self._clip_items_by_source.setdefault(key, []).append(item)
+
+    def _unindex_clip_item(self, item: ClipRect) -> None:
+        key = item._decode_source_key
+        bucket = self._clip_items_by_source.get(key)
+        if not bucket:
+            return
+        try:
+            bucket.remove(item)
+        except ValueError:
+            return
+        if not bucket:
+            self._clip_items_by_source.pop(key, None)
+
+    def _reindex_clip_item(self, item: ClipRect, old_key: str, new_key: str) -> None:
+        if old_key == new_key:
+            return
+        bucket = self._clip_items_by_source.get(old_key)
+        if bucket:
+            try:
+                bucket.remove(item)
+            except ValueError:
+                pass
+            if not bucket:
+                self._clip_items_by_source.pop(old_key, None)
+        self._clip_items_by_source.setdefault(new_key, []).append(item)
+
     def _clear_clip_items(self) -> None:
         for item in list(self._clip_items_by_id.values()):
             try:
@@ -5177,6 +5214,7 @@ class TimelinePanel(QWidget):
             except RuntimeError:
                 pass
         self._clip_items_by_id.clear()
+        self._clip_items_by_source.clear()
 
     def _compute_clip_layout_data(
         self,
@@ -5333,6 +5371,7 @@ class TimelinePanel(QWidget):
             for clip_id in existing_ids - new_ids:
                 item = self._clip_items_by_id.pop(clip_id, None)
                 if item is not None:
+                    self._unindex_clip_item(item)
                     try:
                         if item.scene() is not None:
                             self._scene.removeItem(item)
@@ -5354,10 +5393,12 @@ class TimelinePanel(QWidget):
                 )
                 self._scene.addItem(item)
                 self._clip_items_by_id[clip_id] = item
+                self._index_clip_item(item)
 
             for clip_id in new_ids & existing_ids:
                 clip, y_scene, lane_h, color, locked, muted, hidden, kind = clip_data[clip_id]
                 item = self._clip_items_by_id[clip_id]
+                old_key = item._decode_source_key
                 item.update_from_layout(
                     clip=clip,
                     lane_y=y_scene,
@@ -5368,6 +5409,7 @@ class TimelinePanel(QWidget):
                     muted=muted,
                     hidden=hidden,
                 )
+                self._reindex_clip_item(item, old_key, item._decode_source_key)
 
             scene_h = max(viewport_h, 200.0)
             self._scene.setSceneRect(0, 0, scene_w, scene_h)
@@ -5388,7 +5430,7 @@ class TimelinePanel(QWidget):
                 item.setSelected(clip_id in selected_ids and not item._locked)
         finally:
             del blocker
-        self._emit_current_selection()
+        self._emit_current_selection_if_changed()
 
     def _draw_ruler(self, scene_w: float) -> None:
         self._scene.invalidate(
@@ -5502,16 +5544,23 @@ class TimelinePanel(QWidget):
         self._refresh_toggle_icons()
         self._emit_current_selection()
 
+    def _emit_current_selection_if_changed(self) -> None:
+        self._emit_current_selection()
+
     def _emit_current_selection(self) -> None:
         items = self._scene.selectedItems()
-        if items and isinstance(items[0], ClipRect):
-            self.selection_changed.emit(items[0].clip)
-        else:
-            self.selection_changed.emit(None)
+        selected_clips = [item.clip for item in items if isinstance(item, ClipRect)]
+        clip = selected_clips[0] if selected_clips else None
+        selection_key = tuple(sorted(id(selected) for selected in selected_clips))
+        if selection_key == self._last_emitted_selection_key:
+            return
+        self._last_emitted_selection_key = selection_key
+        self.selection_changed.emit(clip)
 
     def set_project(self, project: Project) -> None:
         self._clear_transient_items()
         self._clear_clip_items()
+        self._last_emitted_selection_key = None
         self._reset_media_cache_generation()
         self._project = project
         self._ensure_unique_clip_ids()

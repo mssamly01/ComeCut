@@ -11,6 +11,7 @@ from comecut_py.core.audio_mixer import (
 from comecut_py.core.project import Clip, Track
 from comecut_py.gui.main_window import MainWindow
 from comecut_py.gui.preview_timeline import (
+    _ClipIntervalIndex,
     clip_fade_multiplier_at_local_time,
     next_playable_time_after,
     pick_timeline_audio_clip,
@@ -114,6 +115,33 @@ def test_fallback_to_first_audio_clip() -> None:
     audio = Clip(source="a.wav", start=3.0, in_point=0.0, out_point=2.0)
     tracks = [Track(kind="audio", clips=[audio])]
     assert pick_timeline_audio_clip(tracks, 0.5, fallback_to_first=True) is audio
+
+
+def test_audio_clip_interval_index_picks_clip_without_linear_scan() -> None:
+    clips = [
+        Clip(source=f"{idx}.wav", start=float(idx), in_point=0.0, out_point=0.5)
+        for idx in range(1000)
+    ]
+    tracks = [Track(kind="audio", clips=clips)]
+    index = _ClipIntervalIndex()
+    index.rebuild(audible_audio_tracks(tracks))
+
+    assert pick_timeline_audio_clip(tracks, 125.25, index=index) is clips[125]
+
+
+def test_audio_clip_interval_index_is_rebuilt_after_track_changes() -> None:
+    first = Clip(source="a.wav", start=0.0, in_point=0.0, out_point=1.0)
+    second = Clip(source="b.wav", start=2.0, in_point=0.0, out_point=1.0)
+    track = Track(kind="audio", clips=[first])
+    index = _ClipIntervalIndex()
+    index.rebuild(audible_audio_tracks([track]))
+
+    assert index.find(2.5) is None
+
+    track.clips.append(second)
+    index.rebuild(audible_audio_tracks([track]))
+
+    assert index.find(2.5) is second
 
 
 def test_main_window_preview_picker_does_not_fallback_by_default() -> None:

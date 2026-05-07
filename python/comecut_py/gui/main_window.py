@@ -48,7 +48,7 @@ from ..core.auto_ducking import (
     collect_role_intervals,
 )
 from ..core.beat_markers import add_beat_marker, remove_near_beat_marker
-from ..core.audio_mixer import track_output_gain
+from ..core.audio_mixer import audible_audio_tracks, track_output_gain
 from ..core.project_templates import (
     list_project_templates,
     new_project_from_template,
@@ -83,6 +83,7 @@ from .media_ingest_service import MediaIngestService
 from .dialogs.subtitle_edit_translate import SubtitleDialogInfo, SubtitleEditTranslateDialog
 from .plugin_config import PluginConfigStore, build_translate_provider
 from .preview_timeline import (
+    _ClipIntervalIndex,
     clip_fade_multiplier,
     next_playable_time_after,
     pick_timeline_audio_clip,
@@ -192,6 +193,9 @@ class MainWindow(QMainWindow):
         self._audio_proxy_inflight: set[str] = set()
         self._preview_audio_presence_cache: dict[str, bool] = {}
         self._preview_active_media_clip: Clip | None = None
+        self._audio_clip_index = _ClipIntervalIndex()
+        self._video_clip_index = _ClipIntervalIndex()
+        self._clip_interval_indexes_dirty = True
         self._media_ingest = MediaIngestService()
         self._duration_placeholder_clip_ids: set[int] = set()
         self._duration_placeholder_by_source_key: dict[str, list[Clip]] = {}
@@ -853,6 +857,21 @@ class MainWindow(QMainWindow):
             return str(Path(path).resolve())
         except Exception:
             return str(path)
+
+    def _invalidate_clip_interval_indexes(self) -> None:
+        self._clip_interval_indexes_dirty = True
+
+    def _ensure_clip_interval_indexes(self) -> None:
+        if not self._clip_interval_indexes_dirty:
+            return
+        self._audio_clip_index.rebuild(audible_audio_tracks(self.project.tracks))
+        video_tracks = [
+            track
+            for track in self.project.tracks
+            if track.kind == "video" and track.clips and not self._is_track_hidden(track)
+        ]
+        self._video_clip_index.rebuild(video_tracks)
+        self._clip_interval_indexes_dirty = False
 
     def _cached_media_info_for_path(self, path: Path | str) -> CachedMediaInfo | None:
         try:
@@ -1600,10 +1619,12 @@ class MainWindow(QMainWindow):
                 3000,
             )
             current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+            self._ensure_clip_interval_indexes()
             active_clip = pick_timeline_audio_clip(
                 self.project.tracks,
                 current,
                 fallback_to_first=False,
+                index=self._audio_clip_index,
             )
             if (
                 bool(getattr(self.timeline_panel, "_is_playing", False))
@@ -1667,16 +1688,8 @@ class MainWindow(QMainWindow):
                 if clip.start <= s < self._clip_end_seconds(clip):
                     return clip
 
-        video_tracks = [
-            tr
-            for tr in self.project.tracks
-            if tr.kind == "video" and tr.clips and not self._is_track_hidden(tr)
-        ]
-        for track in video_tracks:
-            for clip in track.clips:
-                if clip.start <= s < self._clip_end_seconds(clip):
-                    return clip
-        return None
+        self._ensure_clip_interval_indexes()
+        return self._video_clip_index.find(s)
 
     def _pick_preview_clip_for_time(
         self,
@@ -1689,10 +1702,16 @@ class MainWindow(QMainWindow):
         if video_candidate is not None:
             return video_candidate
 
+        audio_index = None
+        ensure_indexes = getattr(self, "_ensure_clip_interval_indexes", None)
+        if callable(ensure_indexes):
+            ensure_indexes()
+            audio_index = getattr(self, "_audio_clip_index", None)
         audio_candidate = pick_timeline_audio_clip(
             self.project.tracks,
             s,
             fallback_to_first=fallback_to_first,
+            index=audio_index,
         )
         if audio_candidate is not None:
             return audio_candidate
@@ -1757,10 +1776,12 @@ class MainWindow(QMainWindow):
                     anchor_seconds=timeline_seconds,
                 )
 
+        self._ensure_clip_interval_indexes()
         audio_clip = pick_timeline_audio_clip(
             self.project.tracks,
             timeline_seconds,
             fallback_to_first=False,
+            index=self._audio_clip_index,
         )
         if audio_clip is None:
             self.preview_panel.clear_timeline_audio()
@@ -2328,6 +2349,7 @@ class MainWindow(QMainWindow):
         self._preview_source_path = None
         self._preview_active_media_clip = None
         self._preview_active_text_clip = None
+        self._invalidate_clip_interval_indexes()
         self._invalidate_timeline_audio_mix(clear_player=True)
         self.timeline_panel.set_project(self.project)
         self.inspector_panel.set_project(self.project)
@@ -2391,6 +2413,7 @@ class MainWindow(QMainWindow):
     def _restore_tracks_snapshot(self, snapshot: str) -> None:
         raw = json.loads(snapshot)
         self.project.tracks = [Track.model_validate(item) for item in raw]
+        self._invalidate_clip_interval_indexes()
 
     def _set_history_index(self, index: int) -> None:
         self._history_index = max(0, min(index, len(self._history_snapshots) - 1))
@@ -2400,6 +2423,7 @@ class MainWindow(QMainWindow):
 
     def _reset_timeline_history(self) -> None:
         self._invalidate_subtitle_lookup_cache()
+        self._invalidate_clip_interval_indexes()
         self._invalidate_timeline_audio_mix(clear_player=True)
         self._history_snapshots = [self._tracks_snapshot()]
         self._set_history_index(0)
@@ -2413,6 +2437,7 @@ class MainWindow(QMainWindow):
             self._set_history_index(self._history_index)
             return
         self._invalidate_subtitle_lookup_cache()
+        self._invalidate_clip_interval_indexes()
         self._invalidate_timeline_audio_mix(clear_player=True)
         if self._history_index < len(self._history_snapshots) - 1:
             self._history_snapshots = self._history_snapshots[: self._history_index + 1]
@@ -2429,6 +2454,7 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self._history_snapshots):
             return
         self._invalidate_subtitle_lookup_cache()
+        self._invalidate_clip_interval_indexes()
         self._invalidate_timeline_audio_mix(clear_player=True)
         self._history_replaying = True
         try:
@@ -2478,6 +2504,7 @@ class MainWindow(QMainWindow):
     def _on_timeline_project_mutated(self) -> None:
         self._pause_timeline_playback_for_user_action()
         self._invalidate_subtitle_lookup_cache()
+        self._invalidate_clip_interval_indexes()
         self._sync_preview_play_availability()
         self._update_media_library_added_states()
         self._push_timeline_history()
@@ -3392,6 +3419,8 @@ class MainWindow(QMainWindow):
         if not changed_library and not changed_clips:
             return
 
+        if changed_clips:
+            self._invalidate_clip_interval_indexes()
         try:
             self.timeline_panel.refresh()
         except Exception:
@@ -3438,6 +3467,7 @@ class MainWindow(QMainWindow):
         if not changed_clips:
             return
         self._prewarm_timeline_cache_for_clips(changed_clips)
+        self._invalidate_clip_interval_indexes()
         self.timeline_panel.refresh()
         self._save_to_store_safe()
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
@@ -3455,10 +3485,12 @@ class MainWindow(QMainWindow):
         source_key = self._source_key_for_path(path)
         self._audio_proxy_by_source[source_key] = str(proxy)
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        self._ensure_clip_interval_indexes()
         active_clip = pick_timeline_audio_clip(
             self.project.tracks,
             current,
             fallback_to_first=False,
+            index=self._audio_clip_index,
         )
         if (
             bool(getattr(self.timeline_panel, "_is_playing", False))
@@ -3637,6 +3669,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Thêm Voice thất bại", str(exc))
             return
 
+        self._invalidate_clip_interval_indexes()
         self.timeline_panel.refresh()
         if created:
             large_import = len(created) > 250
@@ -4420,6 +4453,7 @@ class MainWindow(QMainWindow):
 
         self.project = project
         self._preview_source_path = None
+        self._invalidate_clip_interval_indexes()
         self._invalidate_timeline_audio_mix(clear_player=True)
         self.timeline_panel.set_project(self.project)
         self.inspector_panel.set_project(self.project)
@@ -4549,6 +4583,7 @@ class MainWindow(QMainWindow):
                         clip.source = str(new_path)
 
         if changed:
+            self._invalidate_clip_interval_indexes()
             self._save_to_store_safe()
             self._refresh_library_panels_from_project()
             self.timeline_panel.refresh()

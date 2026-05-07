@@ -2,10 +2,63 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
+
 from ..core.audio_mixer import audible_audio_tracks
 from ..core.project import Clip, Track
 
 _EPS = 1e-3
+
+
+class _ClipIntervalIndex:
+    """Per-track interval lookup for preview ticks.
+
+    The old preview picker walked every clip on every playhead tick. With long
+    voice tracks that can mean 1,000+ checks dozens of times per second. This
+    index keeps track priority unchanged while making the common lookup a
+    binary search inside each audible/visible track.
+    """
+
+    def __init__(self) -> None:
+        self._track_intervals: list[
+            tuple[list[float], list[tuple[float, float, Clip]], list[float]]
+        ] = []
+
+    def clear(self) -> None:
+        self._track_intervals.clear()
+
+    def rebuild(self, tracks: list[Track]) -> None:
+        rebuilt: list[tuple[list[float], list[tuple[float, float, Clip]], list[float]]] = []
+        for track in tracks:
+            intervals: list[tuple[float, float, Clip]] = []
+            for clip in track.clips:
+                start = float(clip.start)
+                end = clip_end_seconds(clip)
+                if end <= start:
+                    continue
+                intervals.append((start, end, clip))
+            if not intervals:
+                continue
+            intervals.sort(key=lambda item: item[0])
+            starts = [item[0] for item in intervals]
+            max_ends: list[float] = []
+            max_end = 0.0
+            for _, end, _clip in intervals:
+                max_end = max(max_end, end)
+                max_ends.append(max_end)
+            rebuilt.append((starts, intervals, max_ends))
+        self._track_intervals = rebuilt
+
+    def find(self, seconds: float) -> Clip | None:
+        s = max(0.0, float(seconds))
+        for starts, intervals, max_ends in self._track_intervals:
+            idx = bisect_right(starts, s) - 1
+            while idx >= 0 and max_ends[idx] > s:
+                start, end, clip = intervals[idx]
+                if start <= s < end:
+                    return clip
+                idx -= 1
+        return None
 
 
 def clip_end_seconds(clip: Clip) -> float:
@@ -63,9 +116,14 @@ def pick_timeline_audio_clip(
     seconds: float,
     *,
     fallback_to_first: bool = False,
+    index: _ClipIntervalIndex | None = None,
 ) -> Clip | None:
     s = max(0.0, float(seconds))
     audio_tracks = visible_audio_tracks(tracks)
+    if index is not None:
+        clip = index.find(s)
+        if clip is not None:
+            return clip
     for track in audio_tracks:
         for clip in track.clips:
             if clip_contains_time(clip, s):
