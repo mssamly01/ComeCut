@@ -28,9 +28,15 @@ class MediaIngestService(QObject):
     proxy_ready = Signal(object, object)  # Path, Path | None
     audio_proxy_ready = Signal(object, object)  # Path, Path | None
 
-    def __init__(self, cache: MediaCache | None = None) -> None:
+    def __init__(
+        self,
+        cache: MediaCache | None = None,
+        *,
+        enable_audio_proxies: bool = True,
+    ) -> None:
         super().__init__()
         self.cache = cache or MediaCache()
+        self.enable_audio_proxies = bool(enable_audio_proxies)
         self._probe_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-probe")
         self._decode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-decode")
         self._inflight_lock = Lock()
@@ -179,8 +185,10 @@ class MediaIngestService(QObject):
         needs_video_proxy = self.should_make_video_proxy(info) and not (
             info.video_proxy_path and Path(info.video_proxy_path).exists()
         )
-        needs_audio_proxy = self.should_make_audio_proxy(info, path) and not (
-            info.audio_proxy_path and Path(info.audio_proxy_path).exists()
+        needs_audio_proxy = (
+            self.enable_audio_proxies
+            and self.should_make_audio_proxy(info, path)
+            and not (info.audio_proxy_path and Path(info.audio_proxy_path).exists())
         )
         if not (needs_thumbnail or needs_video_proxy or needs_audio_proxy):
             return
@@ -233,7 +241,7 @@ class MediaIngestService(QObject):
                         info = self.cache.update(path, thumbnail_path=str(thumb))
                         self.thumbnail_ready.emit(path, Path(thumb))
 
-            if self.should_make_audio_proxy(info, path):
+            if self.enable_audio_proxies and self.should_make_audio_proxy(info, path):
                 cached_audio = audio_proxy_path(path)
                 if cached_audio.exists() and cached_audio.stat().st_size > 0:
                     info = self.cache.update(path, audio_proxy_path=str(cached_audio))
