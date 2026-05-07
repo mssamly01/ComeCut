@@ -1442,9 +1442,15 @@ class MainWindow(QMainWindow):
             for clip in track.clips:
                 if not bool(getattr(clip, "is_text_clip", False)):
                     total += 1
-        cached = (total > 0, total)
-        self._audio_mix_candidates_cache = cached
-        return cached
+        result = (total > 0, total)
+        self._audio_mix_candidates_cache = result
+        return result
+
+    def _timeline_has_audio_mix_candidates(self) -> bool:
+        return self._ensure_audio_mix_candidates_cache()[0]
+
+    def _timeline_audio_mix_candidate_count(self) -> int:
+        return self._ensure_audio_mix_candidates_cache()[1]
 
     def _should_use_windowed_timeline_audio_mix(self) -> bool:
         try:
