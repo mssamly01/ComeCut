@@ -28,6 +28,12 @@ from .render import (
     render_project_twopass,
 )
 from .stabilize import stabilize
+from .timeline_audio_proxy import (
+    clip_source_has_audio,
+    make_timeline_audio_proxy,
+    timeline_audio_project,
+    timeline_audio_proxy_path,
+)
 from .trim import trim
 from .zoompan import zoompan_image
 
@@ -42,12 +48,14 @@ __all__ = [
     "build_audio_level_command",
     "burn_bilingual_subtitles",
     "burn_subtitles",
+    "clip_source_has_audio",
     "concat",
     "cut",
     "duck",
     "extract_audio",
     "freeze_frame",
     "loudnorm_twopass",
+    "make_timeline_audio_proxy",
     "overlay_text",
     "parse_pcm_s16le_levels",
     "preset_output_args",
@@ -56,6 +64,8 @@ __all__ = [
     "render_project_still_frame",
     "render_project_twopass",
     "stabilize",
+    "timeline_audio_project",
+    "timeline_audio_proxy_path",
     "trim",
     "zoompan_image",
 ]
