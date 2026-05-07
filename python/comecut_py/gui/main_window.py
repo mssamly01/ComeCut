@@ -1442,9 +1442,15 @@ class MainWindow(QMainWindow):
             for clip in track.clips:
                 if not bool(getattr(clip, "is_text_clip", False)):
                     total += 1
-        cached = (total > 0, total)
-        self._audio_mix_candidates_cache = cached
-        return cached
+        result = (total > 0, total)
+        self._audio_mix_candidates_cache = result
+        return result
+
+    def _timeline_has_audio_mix_candidates(self) -> bool:
+        return self._ensure_audio_mix_candidates_cache()[0]
+
+    def _timeline_audio_mix_candidate_count(self) -> int:
+        return self._ensure_audio_mix_candidates_cache()[1]
 
     def _should_use_windowed_timeline_audio_mix(self) -> bool:
         try:
@@ -1508,7 +1514,7 @@ class MainWindow(QMainWindow):
         self._timeline_audio_mix_inflight = True
         self._timeline_audio_mix_generation_id += 1
         generation_id = self._timeline_audio_mix_generation_id
-        snapshot = self.project.model_copy(deep=True)
+        project_ref = self.project
         try:
             self.statusBar().showMessage("Preparing timeline audio preview...", 3000)
         except Exception:
@@ -1516,6 +1522,7 @@ class MainWindow(QMainWindow):
 
         def _job() -> None:
             try:
+                snapshot = project_ref.model_copy(deep=True)
                 if use_window and window_start is not None:
                     proxy = make_timeline_audio_window_proxy(
                         snapshot,
@@ -1682,9 +1689,8 @@ class MainWindow(QMainWindow):
         self.preview_panel.set_audio_gain(gain)
 
     def _pick_video_clip_for_time(self, seconds: float) -> Clip | None:
-        s = max(0.0, float(seconds))
         self._ensure_clip_interval_indexes()
-        return self._video_clip_index.find(s)
+        return self._video_clip_index.find(max(0.0, float(seconds)))
 
     def _pick_preview_clip_for_time(
         self,
@@ -2726,10 +2732,6 @@ class MainWindow(QMainWindow):
             return cached
         for track in self.project.tracks:
             if any(existing is clip for existing in track.clips):
-                self._clip_track_map[cache_key] = track
-                return track
-        for track in self.project.tracks:
-            if clip in track.clips:
                 self._clip_track_map[cache_key] = track
                 return track
         return None
