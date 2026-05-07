@@ -61,10 +61,6 @@ from ..core.store import load_project as store_load_project
 from ..core.store import save_project as store_save_project
 from ..engine.audio_proxy import audio_proxy_path, make_audio_proxy
 from ..engine.proxy import make_proxy, proxy_path
-from ..engine.timeline_audio_proxy import (
-    make_timeline_audio_proxy,
-    make_timeline_audio_window_proxy,
-)
 from ..engine import render_project, render_project_audio_only, render_project_still_frame
 from ..i18n import t
 from ..subtitles.ass import parse_ass, write_ass
@@ -152,11 +148,7 @@ class MainWindow(QMainWindow):
     _VIDEO_CLOCK_RESYNC_THRESHOLD_MS = 450
     _VIDEO_RESUME_RESYNC_DELAY_MS = 120
     _LARGE_SUBTITLE_IMPORT_CUE_COUNT = 500
-    _TIMELINE_AUDIO_WINDOW_SECONDS = 120.0
-    _TIMELINE_AUDIO_WINDOW_STEP_SECONDS = 60.0
-    _TIMELINE_AUDIO_WINDOW_PREFETCH_SECONDS = 30.0
-    _TIMELINE_AUDIO_WINDOW_PROJECT_SECONDS = 20 * 60.0
-    _TIMELINE_AUDIO_WINDOW_CLIP_THRESHOLD = 50
+    _GAP_PLAY_FULL_SYNC_INTERVAL = 0.080
     _proxy_ready = Signal(object, object, object)
     _audio_proxy_ready = Signal(object, object, object)
     _timeline_audio_mix_ready = Signal(object, object, object)
@@ -197,7 +189,6 @@ class MainWindow(QMainWindow):
         self._video_clip_index = _ClipIntervalIndex()
         self._clip_interval_indexes_dirty = True
         self._clip_track_map: dict[int, Track] = {}
-        self._audio_mix_candidates_cache: tuple[bool, int] | None = None
         self._media_ingest = MediaIngestService()
         self._duration_placeholder_clip_ids: set[int] = set()
         self._duration_placeholder_by_source_key: dict[str, list[Clip]] = {}
@@ -228,6 +219,7 @@ class MainWindow(QMainWindow):
         self._gap_play_timer.timeout.connect(self._on_gap_play_tick)
         self._gap_play_active = False
         self._gap_play_last_ts = 0.0
+        self._gap_play_last_full_sync_ts = 0.0
         self._proxy_ready.connect(self._on_proxy_ready)
         self._audio_proxy_ready.connect(self._on_audio_proxy_ready)
         self._timeline_audio_mix_ready.connect(self._on_timeline_audio_mix_ready)
@@ -863,7 +855,6 @@ class MainWindow(QMainWindow):
     def _invalidate_clip_interval_indexes(self) -> None:
         self._clip_interval_indexes_dirty = True
         self._clip_track_map.clear()
-        self._audio_mix_candidates_cache = None
 
     def _ensure_clip_interval_indexes(self) -> None:
         if not self._clip_interval_indexes_dirty:
@@ -1040,6 +1031,7 @@ class MainWindow(QMainWindow):
         # This timer is the timeline master clock; it also drives gaps.
         self._gap_play_active = True
         self._gap_play_last_ts = monotonic()
+        self._gap_play_last_full_sync_ts = self._gap_play_last_ts
         if not self._gap_play_timer.isActive():
             self._gap_play_timer.start()
         self.timeline_panel.set_playing_state(True)
@@ -1051,6 +1043,7 @@ class MainWindow(QMainWindow):
     def _stop_gap_playback(self) -> None:
         self._gap_play_active = False
         self._gap_play_last_ts = 0.0
+        self._gap_play_last_full_sync_ts = 0.0
         if self._gap_play_timer.isActive():
             self._gap_play_timer.stop()
 
@@ -1058,7 +1051,6 @@ class MainWindow(QMainWindow):
         s = self._clamp_timeline_seconds(timeline_seconds)
         if bool(getattr(self.timeline_panel, "_is_playing", False)) and not self._gap_play_active:
             self._start_gap_playback()
-        self._start_timeline_audio_mix_generation_if_needed()
         self._sync_preview_for_timeline_clock(
             s,
             playing=True,
@@ -1198,12 +1190,13 @@ class MainWindow(QMainWindow):
         )
         self._update_subtitle_overlay(s)
         self._auto_select_text_clip_at_playhead()
-        try:
-            info = self.inspector_panel._info
-            if info._btn_text_tab_caption.isChecked() and info._text_tab_stack.currentIndex() == 0:
-                info._caption_list.scroll_to_clip_at_time(s)
-        except Exception:
-            pass
+        if not playing:
+            try:
+                info = self.inspector_panel._info
+                if info._btn_text_tab_caption.isChecked() and info._text_tab_stack.currentIndex() == 0:
+                    info._caption_list.scroll_to_clip_at_time(s)
+            except Exception:
+                pass
 
     def _on_gap_play_tick(self) -> None:
         if not self._gap_play_active or self._preview_sync_mode != "timeline":
@@ -1237,6 +1230,13 @@ class MainWindow(QMainWindow):
             self.preview_panel.set_timeline_playing_override(False)
             return
         self.timeline_panel.set_playhead(next_seconds)
+        if (
+            self._gap_play_last_full_sync_ts > 0.0
+            and now - self._gap_play_last_full_sync_ts < self._GAP_PLAY_FULL_SYNC_INTERVAL
+        ):
+            self._set_preview_timeline_time_display(next_seconds)
+            return
+        self._gap_play_last_full_sync_ts = now
         self._sync_preview_for_timeline_clock(
             next_seconds,
             playing=True,
@@ -1380,85 +1380,7 @@ class MainWindow(QMainWindow):
                 self._start_audio_proxy_generation_if_needed(clip)
 
     def _timeline_audio_mix_path(self) -> Path | None:
-        proxy = str(self._timeline_audio_mix_proxy or "").strip()
-        if not proxy:
-            return None
-        path = Path(proxy)
-        return path if path.exists() and path.stat().st_size > 0 else None
-
-    def _timeline_audio_mix_covers(self, seconds: float) -> bool:
-        if not self._timeline_audio_mix_is_windowed:
-            return self._timeline_audio_mix_path() is not None
-        if self._timeline_audio_mix_path() is None:
-            return False
-        start = self._timeline_audio_mix_window_start
-        duration = self._timeline_audio_mix_window_duration
-        if start is None or duration is None:
-            return False
-        s = max(0.0, float(seconds))
-        return float(start) <= s <= float(start) + float(duration) + 1e-6
-
-    def _timeline_audio_mix_position_ms(self, seconds: float) -> int:
-        s = max(0.0, float(seconds))
-        if self._timeline_audio_mix_is_windowed:
-            s = max(0.0, s - float(self._timeline_audio_mix_window_start or 0.0))
-        return int(s * 1000.0)
-
-    def _timeline_audio_next_mix_covers(self, seconds: float) -> bool:
-        if not self._timeline_audio_next_mix_proxy:
-            return False
-        path = Path(self._timeline_audio_next_mix_proxy)
-        if not path.exists() or path.stat().st_size <= 0:
-            return False
-        start = self._timeline_audio_next_window_start
-        duration = self._timeline_audio_next_window_duration
-        if start is None or duration is None:
-            return False
-        s = max(0.0, float(seconds))
-        return float(start) <= s <= float(start) + float(duration) + 1e-6
-
-    def _promote_timeline_audio_next_mix_if_covers(self, seconds: float) -> bool:
-        if not self._timeline_audio_next_mix_covers(seconds):
-            return False
-        self._timeline_audio_mix_proxy = self._timeline_audio_next_mix_proxy
-        self._timeline_audio_mix_window_start = self._timeline_audio_next_window_start
-        self._timeline_audio_mix_window_duration = self._timeline_audio_next_window_duration
-        self._timeline_audio_mix_is_windowed = True
-        self._timeline_audio_next_mix_proxy = None
-        self._timeline_audio_next_window_start = None
-        self._timeline_audio_next_window_duration = None
-        return True
-
-    def _ensure_audio_mix_candidates_cache(self) -> tuple[bool, int]:
-        cached = self._audio_mix_candidates_cache
-        if cached is not None:
-            return cached
-        total = 0
-        for track in self.project.tracks:
-            if track.kind not in {"video", "audio"}:
-                continue
-            if self._is_track_hidden(track) or self._is_track_muted(track):
-                continue
-            for clip in track.clips:
-                if not bool(getattr(clip, "is_text_clip", False)):
-                    total += 1
-        cached = (total > 0, total)
-        self._audio_mix_candidates_cache = cached
-        return cached
-
-    def _should_use_windowed_timeline_audio_mix(self) -> bool:
-        try:
-            duration = float(self.project.duration or 0.0)
-        except Exception:
-            duration = 0.0
-        if duration >= self._TIMELINE_AUDIO_WINDOW_PROJECT_SECONDS:
-            return True
-        return self._ensure_audio_mix_candidates_cache()[1] > self._TIMELINE_AUDIO_WINDOW_CLIP_THRESHOLD
-
-    def _timeline_audio_window_start_for_time(self, seconds: float) -> float:
-        step = max(1.0, float(self._TIMELINE_AUDIO_WINDOW_STEP_SECONDS))
-        s = max(0.0, float(seconds))
-        return max(0.0, (int(s // step) * step))
+        return None
 
     def _invalidate_timeline_audio_mix(self, *, clear_player: bool = True) -> None:
         self._timeline_audio_mix_dirty = True
@@ -1480,64 +1402,22 @@ class MainWindow(QMainWindow):
         force: bool = False,
         anchor_seconds: float | None = None,
     ) -> None:
-        if not self._ensure_audio_mix_candidates_cache()[0]:
-            return
-        if self._timeline_audio_mix_inflight:
-            return
-        anchor = (
-            float(anchor_seconds)
-            if anchor_seconds is not None
-            else float(getattr(self.timeline_panel, "_playhead_seconds", 0.0) or 0.0)
-        )
-        use_window = self._should_use_windowed_timeline_audio_mix()
-        window_start = None
-        if use_window:
-            window_start = self._timeline_audio_window_start_for_time(anchor)
-            if (
-                not force
-                and not self._timeline_audio_mix_dirty
-                and self._timeline_audio_mix_is_windowed
-                and self._timeline_audio_mix_covers(anchor)
-            ):
-                return
-            if not force and not self._timeline_audio_mix_dirty and self._timeline_audio_next_mix_covers(anchor):
-                return
-        elif not force and not self._timeline_audio_mix_dirty and self._timeline_audio_mix_path():
-            return
-
-        self._timeline_audio_mix_inflight = True
-        self._timeline_audio_mix_generation_id += 1
-        generation_id = self._timeline_audio_mix_generation_id
-        snapshot = self.project.model_copy(deep=True)
-        try:
-            self.statusBar().showMessage("Preparing timeline audio preview...", 3000)
-        except Exception:
-            pass
-
-        def _job() -> None:
-            try:
-                if use_window and window_start is not None:
-                    proxy = make_timeline_audio_window_proxy(
-                        snapshot,
-                        start=window_start,
-                        duration=self._TIMELINE_AUDIO_WINDOW_SECONDS,
-                    )
-                    self._timeline_audio_mix_ready.emit(
-                        generation_id,
-                        {
-                            "path": str(proxy),
-                            "window_start": window_start,
-                            "window_duration": self._TIMELINE_AUDIO_WINDOW_SECONDS,
-                        },
-                        "",
-                    )
-                else:
-                    proxy = make_timeline_audio_proxy(snapshot)
-                    self._timeline_audio_mix_ready.emit(generation_id, str(proxy), "")
-            except Exception as exc:
-                self._timeline_audio_mix_ready.emit(generation_id, "", str(exc))
-
-        self._audio_proxy_executor.submit(_job)
+        # Timeline mix proxies are disabled; playback uses per-clip audio preview.
+        if (
+            self._timeline_audio_mix_proxy
+            or self._timeline_audio_next_mix_proxy
+            or self._timeline_audio_mix_inflight
+        ):
+            self._timeline_audio_mix_proxy = None
+            self._timeline_audio_mix_window_start = None
+            self._timeline_audio_mix_window_duration = None
+            self._timeline_audio_mix_is_windowed = False
+            self._timeline_audio_next_mix_proxy = None
+            self._timeline_audio_next_window_start = None
+            self._timeline_audio_next_window_duration = None
+            self._timeline_audio_mix_inflight = False
+            self._timeline_audio_mix_generation_id += 1
+        self._timeline_audio_mix_dirty = False
 
     def _on_timeline_audio_mix_ready(
         self,
@@ -1545,69 +1425,15 @@ class MainWindow(QMainWindow):
         proxy_obj: object,
         error_obj: object,
     ) -> None:
-        try:
-            generation_id = int(generation_obj)
-        except Exception:
-            generation_id = -1
-        if generation_id != self._timeline_audio_mix_generation_id:
-            return
-
         self._timeline_audio_mix_inflight = False
-        window_start: float | None = None
-        window_duration: float | None = None
-        if isinstance(proxy_obj, dict):
-            proxy = str(proxy_obj.get("path") or "")
-            try:
-                window_start = float(proxy_obj.get("window_start"))
-                window_duration = float(proxy_obj.get("window_duration"))
-            except Exception:
-                window_start = None
-                window_duration = None
-        else:
-            proxy = str(proxy_obj or "")
-        if proxy and Path(proxy).exists():
-            current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
-            new_is_windowed = window_start is not None and window_duration is not None
-            if (
-                new_is_windowed
-                and self._timeline_audio_mix_is_windowed
-                and self._timeline_audio_mix_covers(current)
-                and not (
-                    float(window_start) <= current <= float(window_start) + float(window_duration) + 1e-6
-                )
-            ):
-                self._timeline_audio_next_mix_proxy = proxy
-                self._timeline_audio_next_window_start = window_start
-                self._timeline_audio_next_window_duration = window_duration
-                self._timeline_audio_mix_dirty = False
-                return
-            self._timeline_audio_mix_proxy = proxy
-            self._timeline_audio_mix_window_start = window_start
-            self._timeline_audio_mix_window_duration = window_duration
-            self._timeline_audio_mix_is_windowed = new_is_windowed
-            self._timeline_audio_mix_dirty = False
-            playing = bool(getattr(self.timeline_panel, "_is_playing", False))
-            if self._preview_sync_mode == "timeline":
-                self._apply_preview_audio_state(self._preview_active_media_clip, current)
-                self._sync_timeline_audio_for_time(
-                    current,
-                    playing=playing,
-                    force_seek=True,
-                )
-            try:
-                self.statusBar().showMessage("Timeline audio preview ready.", 2500)
-            except Exception:
-                pass
-            return
-
         self._timeline_audio_mix_proxy = None
-        self._timeline_audio_mix_dirty = True
-        error = str(error_obj or "").strip()
-        if error and bool(getattr(self.timeline_panel, "_is_playing", False)):
-            self.statusBar().showMessage(
-                f"Timeline audio preview failed: {error}",
-                4000,
-            )
+        self._timeline_audio_mix_window_start = None
+        self._timeline_audio_mix_window_duration = None
+        self._timeline_audio_mix_is_windowed = False
+        self._timeline_audio_next_mix_proxy = None
+        self._timeline_audio_next_window_start = None
+        self._timeline_audio_next_window_duration = None
+        self._timeline_audio_mix_dirty = False
 
     def _on_audio_proxy_ready(self, source_key_obj: object, proxy_obj: object, error_obj: object) -> None:
         source_key = str(source_key_obj or "")
@@ -1733,44 +1559,6 @@ class MainWindow(QMainWindow):
         playing: bool,
         force_seek: bool = False,
     ) -> None:
-        if self._preview_sync_mode == "timeline":
-            if self._promote_timeline_audio_next_mix_if_covers(timeline_seconds):
-                force_seek = True
-            mix_path = self._timeline_audio_mix_path()
-            if mix_path is not None and self._timeline_audio_mix_covers(timeline_seconds):
-                if (
-                    playing
-                    and self._timeline_audio_mix_is_windowed
-                    and self._timeline_audio_mix_window_start is not None
-                    and self._timeline_audio_mix_window_duration is not None
-                ):
-                    window_end = (
-                        self._timeline_audio_mix_window_start
-                        + self._timeline_audio_mix_window_duration
-                    )
-                    if (
-                        window_end - max(0.0, float(timeline_seconds))
-                        <= self._TIMELINE_AUDIO_WINDOW_PREFETCH_SECONDS
-                    ):
-                        next_anchor = max(0.0, float(timeline_seconds)) + self._TIMELINE_AUDIO_WINDOW_STEP_SECONDS
-                        self._start_timeline_audio_mix_generation_if_needed(
-                            anchor_seconds=next_anchor,
-                        )
-                self.preview_panel.sync_timeline_audio(
-                    mix_path,
-                    self._timeline_audio_mix_position_ms(timeline_seconds),
-                    playback_rate=1.0,
-                    gain=1.0,
-                    muted=False,
-                    playing=playing,
-                    force_seek=force_seek,
-                )
-                return
-            if playing:
-                self._start_timeline_audio_mix_generation_if_needed(
-                    anchor_seconds=timeline_seconds,
-                )
-
         self._ensure_clip_interval_indexes()
         audio_clip = pick_timeline_audio_clip(
             self.project.tracks,
@@ -2356,7 +2144,6 @@ class MainWindow(QMainWindow):
         self._sync_preview_play_availability()
         all_clips = [clip for track in self.project.tracks for clip in track.clips]
         self._schedule_timeline_cache_prewarm(all_clips)
-        QTimer.singleShot(0, self._start_timeline_audio_mix_generation_if_needed)
         self._preview_sync_mode = "timeline"
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         seek_to = min(max(0.0, current), max(0.0, self.project.duration))
@@ -2724,6 +2511,13 @@ class MainWindow(QMainWindow):
         cached = self._clip_track_map.get(cache_key)
         if cached is not None:
             return cached
+        if not self._clip_track_map:
+            for track in self.project.tracks:
+                for existing in track.clips:
+                    self._clip_track_map[id(existing)] = track
+            cached = self._clip_track_map.get(cache_key)
+            if cached is not None:
+                return cached
         for track in self.project.tracks:
             if any(existing is clip for existing in track.clips):
                 self._clip_track_map[cache_key] = track
@@ -4468,7 +4262,6 @@ class MainWindow(QMainWindow):
         self._sync_preview_play_availability()
         all_clips = [clip for track in self.project.tracks for clip in track.clips]
         self._schedule_timeline_cache_prewarm(all_clips)
-        QTimer.singleShot(0, self._start_timeline_audio_mix_generation_if_needed)
         self._preview_sync_mode = "timeline"
         self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
         

@@ -15,8 +15,9 @@ from .render import render_project_audio_only
 
 
 _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"}
-_AUDIO_PROXY_RENDER_VERSION = 2
-_AUDIO_WINDOW_PROXY_RENDER_VERSION = 1
+_AUDIO_PROXY_RENDER_VERSION = 3
+_AUDIO_WINDOW_PROXY_RENDER_VERSION = 2
+_HAS_AUDIO_CACHE: dict[tuple[str, int, int], bool] = {}
 
 
 def _cache_dir() -> Path:
@@ -40,6 +41,18 @@ def _source_signature(source: str) -> dict[str, object]:
     return {"source": resolved, "stat": stat_sig}
 
 
+def _has_audio_cache_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        resolved = str(path.resolve())
+    except Exception:
+        resolved = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (resolved, int(stat.st_size), int(stat.st_mtime_ns))
+
+
 def clip_source_has_audio(clip: Clip) -> bool:
     """Best-effort audio stream check that does not touch GUI state."""
     if bool(getattr(clip, "is_text_clip", False)):
@@ -50,12 +63,18 @@ def clip_source_has_audio(clip: Clip) -> bool:
     path = Path(source)
     if path.suffix.lower() in _AUDIO_EXTS:
         return True
-    if not path.exists():
+    key = _has_audio_cache_key(path)
+    if key is None:
         return False
+    cached = _HAS_AUDIO_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
-        return bool(probe(path).has_audio)
+        has_audio = bool(probe(path).has_audio)
     except Exception:
-        return False
+        has_audio = False
+    _HAS_AUDIO_CACHE[key] = has_audio
+    return has_audio
 
 
 def _clip_sig(track: Track, clip: Clip) -> dict[str, object]:
@@ -276,7 +295,7 @@ def timeline_audio_proxy_path(
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha1(raw).hexdigest()[:24]
-    return _cache_dir() / f"{digest}.wav"
+    return _cache_dir() / f"{digest}.m4a"
 
 
 def timeline_audio_window_proxy_path(
@@ -307,7 +326,7 @@ def timeline_audio_window_proxy_path(
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha1(raw).hexdigest()[:24]
-    return _cache_dir() / f"win-{digest}.wav"
+    return _cache_dir() / f"win-{digest}.m4a"
 
 
 def make_timeline_audio_proxy(
@@ -327,7 +346,7 @@ def make_timeline_audio_proxy(
     tmp = out.with_name(f"{out.stem}.tmp{out.suffix}")
     if tmp.exists():
         tmp.unlink()
-    cmd = render_project_audio_only(audio_project, tmp, audio_format="wav")
+    cmd = render_project_audio_only(audio_project, tmp, audio_format="m4a")
     cmd.run()
     tmp.replace(out)
     return out
@@ -362,7 +381,7 @@ def make_timeline_audio_window_proxy(
     tmp = out.with_name(f"{out.stem}.tmp{out.suffix}")
     if tmp.exists():
         tmp.unlink()
-    cmd = render_project_audio_only(audio_project, tmp, audio_format="wav")
+    cmd = render_project_audio_only(audio_project, tmp, audio_format="m4a")
     cmd.run()
     tmp.replace(out)
     return out
