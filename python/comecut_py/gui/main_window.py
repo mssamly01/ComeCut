@@ -1514,7 +1514,7 @@ class MainWindow(QMainWindow):
         self._timeline_audio_mix_inflight = True
         self._timeline_audio_mix_generation_id += 1
         generation_id = self._timeline_audio_mix_generation_id
-        snapshot = self.project.model_copy(deep=True)
+        project_ref = self.project
         try:
             self.statusBar().showMessage("Preparing timeline audio preview...", 3000)
         except Exception:
@@ -1522,6 +1522,7 @@ class MainWindow(QMainWindow):
 
         def _job() -> None:
             try:
+                snapshot = project_ref.model_copy(deep=True)
                 if use_window and window_start is not None:
                     proxy = make_timeline_audio_window_proxy(
                         snapshot,
