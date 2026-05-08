@@ -150,7 +150,7 @@ class MainWindow(QMainWindow):
     _VIDEO_RESUME_RESYNC_DELAY_MS = 120
     _LARGE_SUBTITLE_IMPORT_CUE_COUNT = 500
     _GAP_PLAY_FULL_SYNC_INTERVAL = 0.080
-    _GAP_PLAY_UI_REFRESH_INTERVAL = 0.200
+    _SCRUB_FINISH_SYNC_DELAY_MS = 180
     _proxy_ready = Signal(object, object, object)
     _audio_proxy_ready = Signal(object, object, object)
     _timeline_audio_mix_ready = Signal(object, object, object)
@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         self._audio_clip_index = _ClipIntervalIndex()
         self._video_clip_index = _ClipIntervalIndex()
         self._clip_interval_indexes_dirty = True
+        self._timeline_duration_cache: float | None = None
         self._clip_track_map: dict[int, Track] = {}
         self._media_ingest = MediaIngestService(enable_audio_proxies=False)
         self._duration_placeholder_clip_ids: set[int] = set()
@@ -227,8 +228,8 @@ class MainWindow(QMainWindow):
         self._gap_play_active = False
         self._gap_play_last_ts = 0.0
         self._gap_play_last_full_sync_ts = 0.0
-        self._gap_play_last_ui_refresh_ts = 0.0
         self._video_clock_last_resync_ts = 0.0
+        self._scrub_finish_generation = 0
         self._proxy_ready.connect(self._on_proxy_ready)
         self._audio_proxy_ready.connect(self._on_audio_proxy_ready)
         self._timeline_audio_mix_ready.connect(self._on_timeline_audio_mix_ready)
@@ -424,9 +425,6 @@ class MainWindow(QMainWindow):
         self.preview_panel.playpause_requested.connect(self._on_preview_playpause_requested)
         self.preview_panel.position_changed.connect(self._on_preview_position_changed)
         self.timeline_panel.seek_requested.connect(self._on_timeline_seek)
-        self.preview_panel.playback_state_changed.connect(
-            self.timeline_panel.set_playing_state
-        )
         self.preview_panel.playback_state_changed.connect(
             self._on_preview_playback_state_changed
         )
@@ -824,10 +822,15 @@ class MainWindow(QMainWindow):
         self._preview_source_path = path_str
 
     def _timeline_duration_seconds(self) -> float:
+        cached = self._timeline_duration_cache
+        if cached is not None:
+            return cached
         try:
-            return max(0.0, float(self.project.duration))
+            duration = max(0.0, float(self.project.duration))
         except Exception:
-            return 0.0
+            duration = 0.0
+        self._timeline_duration_cache = duration
+        return duration
 
     def _clamp_timeline_seconds(self, seconds: float) -> float:
         try:
@@ -863,6 +866,7 @@ class MainWindow(QMainWindow):
 
     def _invalidate_clip_interval_indexes(self) -> None:
         self._clip_interval_indexes_dirty = True
+        self._timeline_duration_cache = None
         self._clip_track_map.clear()
         self._audio_proxy_path_cache.clear()
         self._clip_audio_preview_path_cache.clear()
@@ -1075,7 +1079,6 @@ class MainWindow(QMainWindow):
         self._gap_play_active = True
         self._gap_play_last_ts = monotonic()
         self._gap_play_last_full_sync_ts = self._gap_play_last_ts
-        self._gap_play_last_ui_refresh_ts = self._gap_play_last_ts
         self._video_clock_last_resync_ts = 0.0
         if not self._gap_play_timer.isActive():
             self._gap_play_timer.start()
@@ -1089,7 +1092,6 @@ class MainWindow(QMainWindow):
         self._gap_play_active = False
         self._gap_play_last_ts = 0.0
         self._gap_play_last_full_sync_ts = 0.0
-        self._gap_play_last_ui_refresh_ts = 0.0
         self._video_clock_last_resync_ts = 0.0
         if self._gap_play_timer.isActive():
             self._gap_play_timer.stop()
@@ -1228,6 +1230,9 @@ class MainWindow(QMainWindow):
         playing: bool,
         force_seek: bool,
         throttle_preview: bool = False,
+        sync_audio: bool = True,
+        sync_selection: bool = True,
+        sync_caption_scroll: bool = True,
     ) -> None:
         s = self._clamp_timeline_seconds(seconds)
         self._set_preview_timeline_time_display(s)
@@ -1237,14 +1242,16 @@ class MainWindow(QMainWindow):
             force_seek=force_seek,
             throttle_preview=throttle_preview,
         )
-        self._sync_timeline_audio_for_time(
-            s,
-            playing=playing,
-            force_seek=force_seek,
-        )
+        if sync_audio:
+            self._sync_timeline_audio_for_time(
+                s,
+                playing=playing,
+                force_seek=force_seek,
+            )
         self._update_subtitle_overlay(s)
-        self._auto_select_text_clip_at_playhead()
-        if not playing:
+        if sync_selection:
+            self._auto_select_text_clip_at_playhead()
+        if sync_caption_scroll and not playing:
             try:
                 info = self.inspector_panel._info
                 if info._btn_text_tab_caption.isChecked() and info._text_tab_stack.currentIndex() == 0:
@@ -1287,28 +1294,18 @@ class MainWindow(QMainWindow):
             self._gap_play_last_full_sync_ts > 0.0
             and now - self._gap_play_last_full_sync_ts < self._GAP_PLAY_FULL_SYNC_INTERVAL
         )
-        should_refresh_ui = (
-            self._gap_play_last_ui_refresh_ts <= 0.0
-            or now - self._gap_play_last_ui_refresh_ts >= self._GAP_PLAY_UI_REFRESH_INTERVAL
-        )
         if not should_full_sync:
-            if should_refresh_ui:
-                self._gap_play_last_ui_refresh_ts = now
-                self.timeline_panel.set_playhead(next_seconds)
-            else:
-                self.timeline_panel._playhead_seconds = next_seconds
+            self.timeline_panel.set_playhead_fast(next_seconds)
             self._set_preview_timeline_time_display(next_seconds)
             return
         self._gap_play_last_full_sync_ts = now
-        if should_refresh_ui:
-            self._gap_play_last_ui_refresh_ts = now
-            self.timeline_panel.set_playhead(next_seconds)
-        else:
-            self.timeline_panel._playhead_seconds = next_seconds
+        self.timeline_panel.set_playhead(next_seconds)
         self._sync_preview_for_timeline_clock(
             next_seconds,
             playing=True,
             force_seek=False,
+            sync_selection=False,
+            sync_caption_scroll=False,
         )
 
     def _start_proxy_generation_if_needed(
@@ -1737,12 +1734,47 @@ class MainWindow(QMainWindow):
             is_user_scrub = bool(throttle_preview)
         if is_user_scrub:
             self._pause_timeline_playback_for_user_action()
+            if (
+                self._timeline_audio_active_clip_id is not None
+                or getattr(self.preview_panel, "_timeline_audio_source_path", None)
+            ):
+                self.preview_panel.clear_timeline_audio()
+                self._timeline_audio_active_clip_id = None
+            self._schedule_scrub_finish_sync(seconds)
         self._sync_preview_for_timeline_clock(
             float(seconds),
             playing=bool(getattr(self.timeline_panel, "_is_playing", False)),
             force_seek=True,
             throttle_preview=throttle_preview,
+            sync_audio=not is_user_scrub,
+            sync_selection=not is_user_scrub,
+            sync_caption_scroll=not is_user_scrub,
         )
+
+    def _schedule_scrub_finish_sync(self, seconds: float) -> None:
+        self._scrub_finish_generation += 1
+        generation = self._scrub_finish_generation
+        target_seconds = float(seconds)
+
+        def _sync_after_scrub() -> None:
+            if generation != self._scrub_finish_generation:
+                return
+            try:
+                if self.timeline_panel.is_playhead_scrubbing():
+                    return
+            except Exception:
+                pass
+            if bool(getattr(self.timeline_panel, "_is_playing", False)):
+                return
+            current = float(getattr(self.timeline_panel, "_playhead_seconds", target_seconds))
+            self._sync_preview_for_timeline_clock(
+                current,
+                playing=False,
+                force_seek=True,
+                throttle_preview=False,
+            )
+
+        QTimer.singleShot(self._SCRUB_FINISH_SYNC_DELAY_MS, _sync_after_scrub)
 
     def _invalidate_subtitle_lookup_cache(self) -> None:
         self._subtitle_lookup_dirty = True
@@ -3317,6 +3349,12 @@ class MainWindow(QMainWindow):
                 affected_track_ids.add(id(track))
                 if track.kind == "video":
                     has_video_track_change = True
+                elif track.kind == "audio":
+                    resolved_track = self._move_audio_clip_to_non_overlapping_track(
+                        clip,
+                        track,
+                    )
+                    affected_track_ids.add(id(resolved_track))
 
         for track in self.project.tracks:
             if id(track) in affected_track_ids:
@@ -3499,13 +3537,9 @@ class MainWindow(QMainWindow):
             return candidates
 
         def _new_audio_track() -> Track:
-            insert_idx = len(self.project.tracks)
-            for idx, existing_track in enumerate(self.project.tracks):
-                if existing_track.kind == "audio":
-                    insert_idx = idx + 1
             return self._get_or_create_track(
                 "audio",
-                insert_idx,
+                self._audio_insert_index_after_last_audio(),
                 insert_new_track=True,
             )
 
@@ -3796,6 +3830,84 @@ class MainWindow(QMainWindow):
             if resolved < clip_end and resolved + duration > clip_start:
                 resolved = clip_end
         return resolved
+
+    @staticmethod
+    def _clip_overlaps_track(
+        track: Track,
+        clip: Clip,
+        *,
+        start: float | None = None,
+        duration: float | None = None,
+    ) -> bool:
+        clip_start = float(clip.start if start is None else start)
+        clip_duration = float(
+            (clip.timeline_duration or 0.0) if duration is None else duration
+        )
+        if clip_duration <= 0.0:
+            return False
+        clip_end = clip_start + clip_duration
+        eps = 1e-6
+        for existing in track.clips:
+            if existing is clip:
+                continue
+            existing_duration = float(existing.timeline_duration or 0.0)
+            if existing_duration <= 0.0:
+                continue
+            existing_start = float(existing.start)
+            existing_end = existing_start + existing_duration
+            if clip_start < existing_end - eps and clip_end > existing_start + eps:
+                return True
+        return False
+
+    def _audio_insert_index_after_last_audio(self) -> int:
+        insert_idx = len(self.project.tracks)
+        for idx, existing_track in enumerate(self.project.tracks):
+            if existing_track.kind == "audio":
+                insert_idx = idx + 1
+        return insert_idx
+
+    def _move_audio_clip_to_non_overlapping_track(
+        self,
+        clip: Clip,
+        current_track: Track,
+    ) -> Track:
+        if current_track.kind != "audio":
+            return current_track
+        duration = float(clip.timeline_duration or 0.0)
+        if duration <= 0.0:
+            return current_track
+        if not self._clip_overlaps_track(current_track, clip, duration=duration):
+            return current_track
+
+        for candidate in self.project.tracks:
+            if candidate.kind != "audio" or candidate is current_track:
+                continue
+            if self._is_track_locked(candidate):
+                continue
+            if self._clip_overlaps_track(candidate, clip, duration=duration):
+                continue
+            try:
+                current_track.clips.remove(clip)
+            except ValueError:
+                pass
+            candidate.clips.append(clip)
+            current_track.clips.sort(key=lambda c: float(c.start))
+            candidate.clips.sort(key=lambda c: float(c.start))
+            return candidate
+
+        new_track = self._get_or_create_track(
+            "audio",
+            self._audio_insert_index_after_last_audio(),
+            insert_new_track=True,
+        )
+        try:
+            current_track.clips.remove(clip)
+        except ValueError:
+            pass
+        new_track.clips.append(clip)
+        current_track.clips.sort(key=lambda c: float(c.start))
+        new_track.clips.sort(key=lambda c: float(c.start))
+        return new_track
 
     def _main_track_insert_start(self, track: Track, requested_start: float, duration: float) -> float:
         if not self._is_main_video_track(track):

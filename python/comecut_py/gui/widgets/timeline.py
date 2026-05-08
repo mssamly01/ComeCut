@@ -109,32 +109,42 @@ PIXELS_PER_SECOND = BASE_PIXELS_PER_SECOND
 TRACK_HEIGHT = 64.0
 LANE_GAP = 8.0
 RULER_HEIGHT = 30.0
+TRACK_EDGE_PADDING = 24.0
 TRACK_HEADER_WIDTH = 128
 TIMELINE_BG_COLOR = "#111318"
-MAIN_TRACK_HEIGHT_FACTOR = 1.25
-TEXT_TRACK_HEIGHT_FACTOR = 0.38
+MAIN_TRACK_HEIGHT_FACTOR = 1.1
+AUDIO_TRACK_HEIGHT_FACTOR = 0.7
+TEXT_TRACK_HEIGHT_FACTOR = 0.35
 MEDIA_MIME_TYPE = "application/x-comecut-media-path"
 ZOOM_MIN = 1
 ZOOM_MAX = 400
 ICON_NORMAL = "#8c93a0"
 ICON_ACTIVE = "#22d3c5"
 SNAP_TOLERANCE_PX = 5.0
-SCRUB_SEEK_INTERVAL_MS = 33
+SCRUB_SEEK_INTERVAL_MS = 120
+SCRUB_PLAYHEAD_REFRESH_INTERVAL_MS = 80
 LONG_MEDIA_CACHE_THRESHOLD_SECONDS = 30.0
 VISIBLE_CACHE_PREFETCH_VIEWPORTS = 1.0
 MEDIA_CACHE_IDLE_DELAY_MS = 250
 MAX_FILMSTRIP_CHUNKS_INFLIGHT = 64
 MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE = 8
+MAX_THUMB_PATH_CACHE_ITEMS = 512
+MAX_STRIP_PIXMAP_CACHE_ITEMS = 128
+MAX_CHUNK_PIXMAP_CACHE_ITEMS = 256
+MAX_WAVEFORM_PEAKS_CACHE_ITEMS = 512
+MAX_WAVEFORM_RANGE_CACHE_ITEMS = 1024
 SCENE_INDEX_CLIP_THRESHOLD = 800
 FILMSTRIP_FRAMES = 24
 FILMSTRIP_TILE_WIDTH = 120
 FILMSTRIP_HEIGHT_BUCKET = 16
 TIMELINE_USE_TILED_FILMSTRIP = True
-FILMSTRIP_TILE_W = 80
-FILMSTRIP_TILE_H = 48
+FILMSTRIP_TILE_W = 96
+FILMSTRIP_TILE_H = 54
 FILMSTRIP_TILES_PER_CHUNK = 60
 FILMSTRIP_DENSE_PX_PER_SECOND = 48.0
-FILMSTRIP_TARGET_THUMB_SPACING_PX = 82.0
+FILMSTRIP_SUBSECOND_PX_PER_SECOND = 112.0
+FILMSTRIP_ULTRA_DENSE_PX_PER_SECOND = 224.0
+FILMSTRIP_TARGET_THUMB_SPACING_PX = 56.0
 FILMSTRIP_SAMPLE_STEPS_SECONDS = (
     1,
     2,
@@ -601,6 +611,16 @@ def _filmstrip_sample_step_seconds(px_per_src_sec: float) -> int:
         if step >= raw_step:
             return int(step)
     return max(1, int(raw_step + 0.999))
+
+
+def _filmstrip_samples_per_second(px_per_src_sec: float) -> int:
+    """Choose denser chunk samples once one-second tiles would be stretched."""
+    px = max(0.0, float(px_per_src_sec))
+    if px >= FILMSTRIP_ULTRA_DENSE_PX_PER_SECOND:
+        return 4
+    if px >= FILMSTRIP_SUBSECOND_PX_PER_SECOND:
+        return 2
+    return 1
 
 
 from ...engine.thumbnails import (
@@ -1528,7 +1548,7 @@ class ClipRect(QGraphicsRectItem):
         film_rect: QRectF,
         exposed_rect: QRectF | None = None,
     ) -> bool:
-        """Draw zoom-independent, per-source-second filmstrip chunks."""
+        """Draw zoom-aware, source-time filmstrip chunks."""
         clip = self.clip
         in_point = float(getattr(clip, "in_point", 0.0) or 0.0)
         timeline_dur = float(getattr(clip, "timeline_duration", 0.0) or 0.0)
@@ -1561,6 +1581,8 @@ class ClipRect(QGraphicsRectItem):
         visible_src_end = min(src_end, visible_src_end + 1.0)
 
         chunk_size = max(1, int(FILMSTRIP_TILES_PER_CHUNK))
+        samples_per_second = _filmstrip_samples_per_second(px_per_src_sec)
+        tile_duration = 1.0 / float(max(1, samples_per_second))
         sample_step_seconds = _filmstrip_sample_step_seconds(px_per_src_sec)
         drawn_anything = False
 
@@ -1593,10 +1615,14 @@ class ClipRect(QGraphicsRectItem):
                     max(seg_start, src_start),
                     max(src_start, src_end - 1e-6),
                 )
-                tile_src_second = max(0, int(sample_src))
-                chunk_idx = int(tile_src_second // chunk_size)
-                tile_idx = int(tile_src_second % chunk_size)
-                pix = self._panel.request_filmstrip_chunk_async(clip, chunk_idx)
+                sample_number = max(0, int(math.floor(sample_src / tile_duration)))
+                chunk_idx = int(sample_number // chunk_size)
+                tile_idx = int(sample_number % chunk_size)
+                pix = self._panel.request_filmstrip_chunk_async(
+                    clip,
+                    chunk_idx,
+                    samples_per_second=samples_per_second,
+                )
                 if pix is None:
                     continue
 
@@ -1617,16 +1643,23 @@ class ClipRect(QGraphicsRectItem):
 
             return drawn_anything
 
-        first_chunk = max(0, int(visible_src_start // chunk_size))
+        first_sample = max(0, int(math.floor(visible_src_start / tile_duration)))
         last_visible_src = max(visible_src_start, visible_src_end - 1e-6)
-        last_chunk = max(first_chunk, int(last_visible_src // chunk_size))
+        last_sample = max(first_sample, int(math.floor(last_visible_src / tile_duration)))
+        first_chunk = int(first_sample // chunk_size)
+        last_chunk = max(first_chunk, int(last_sample // chunk_size))
         for chunk_idx in range(first_chunk, last_chunk + 1):
-            pix = self._panel.request_filmstrip_chunk_async(clip, chunk_idx)
+            pix = self._panel.request_filmstrip_chunk_async(
+                clip,
+                chunk_idx,
+                samples_per_second=samples_per_second,
+            )
             if pix is None:
                 continue
             for tile_idx in range(chunk_size):
-                tile_src_start = float(chunk_idx * chunk_size + tile_idx)
-                tile_src_end = tile_src_start + 1.0
+                tile_sample_idx = chunk_idx * chunk_size + tile_idx
+                tile_src_start = float(tile_sample_idx) * tile_duration
+                tile_src_end = tile_src_start + tile_duration
                 if tile_src_end < visible_src_start:
                     continue
                 if tile_src_start > visible_src_end:
@@ -2028,15 +2061,23 @@ class TimelineScene(QGraphicsScene):
         if visible_right < visible_left:
             visible_left, visible_right = visible_right, visible_left
         visible_width = max(1.0, visible_right - visible_left)
+        try:
+            viewport_rect = panel._view.mapToScene(
+                panel._view.viewport().rect()
+            ).boundingRect()
+            ruler_y = max(0.0, float(viewport_rect.top()))
+        except Exception:
+            ruler_y = max(0.0, float(rect.top()))
+        ruler_bottom = ruler_y + RULER_HEIGHT
 
         painter.fillRect(
-            QRectF(visible_left, 0.0, visible_width, RULER_HEIGHT),
+            QRectF(visible_left, ruler_y, visible_width, RULER_HEIGHT),
             QBrush(QColor("#1a1d23")),
         )
         painter.setPen(QPen(QColor("#2a2f38"), 1))
         painter.drawLine(
-            QPointF(visible_left, RULER_HEIGHT),
-            QPointF(visible_right, RULER_HEIGHT),
+            QPointF(visible_left, ruler_bottom),
+            QPointF(visible_right, ruler_bottom),
         )
 
         major_tick = panel._major_tick_seconds(panel._pixels_per_second)
@@ -2056,15 +2097,15 @@ class TimelineScene(QGraphicsScene):
             x = panel.seconds_to_pixels(sec)
             if (i % 5) == 0:
                 painter.setPen(major_pen)
-                painter.drawLine(QPointF(x, 8.0), QPointF(x, RULER_HEIGHT))
+                painter.drawLine(QPointF(x, ruler_y + 8.0), QPointF(x, ruler_bottom))
                 painter.setPen(QColor("#8c93a0"))
                 painter.drawText(
-                    QPointF(x + 4.0, 14.0),
+                    QPointF(x + 4.0, ruler_y + 14.0),
                     _format_ruler_label(sec, major_tick),
                 )
             else:
                 painter.setPen(minor_pen)
-                painter.drawLine(QPointF(x, 18.0), QPointF(x, RULER_HEIGHT))
+                painter.drawLine(QPointF(x, ruler_y + 18.0), QPointF(x, ruler_bottom))
 
         # Foreground is painted above scene items, so draw the playhead handle
         # here to keep it visible after the ruler background is painted.
@@ -2073,13 +2114,13 @@ class TimelineScene(QGraphicsScene):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             playhead_color = QColor("#22d3c5")
             painter.setPen(QPen(playhead_color, 1))
-            painter.drawLine(QPointF(x, RULER_HEIGHT), QPointF(x, self.height()))
-            painter.drawLine(QPointF(x, 0.0), QPointF(x, RULER_HEIGHT))
+            painter.drawLine(QPointF(x, ruler_bottom), QPointF(x, max(rect.bottom(), self.height())))
+            painter.drawLine(QPointF(x, ruler_y), QPointF(x, ruler_bottom))
             handle_path = QPainterPath()
-            handle_path.moveTo(x, 0.0)
-            handle_path.lineTo(x + 6.0, 8.0)
-            handle_path.lineTo(x, 16.0)
-            handle_path.lineTo(x - 6.0, 8.0)
+            handle_path.moveTo(x, ruler_y)
+            handle_path.lineTo(x + 6.0, ruler_y + 8.0)
+            handle_path.lineTo(x, ruler_y + 16.0)
+            handle_path.lineTo(x - 6.0, ruler_y + 8.0)
             handle_path.closeSubpath()
             painter.fillPath(handle_path, QBrush(playhead_color))
 
@@ -2102,7 +2143,7 @@ class TimelineView(QGraphicsView):
             True,
         )
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.horizontalScrollBar().setStyleSheet(
             """
             QScrollBar:horizontal {
@@ -2130,6 +2171,37 @@ class TimelineView(QGraphicsView):
             }
             QScrollBar::add-page:horizontal,
             QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
+            """
+        )
+        self.verticalScrollBar().setStyleSheet(
+            """
+            QScrollBar:vertical {
+                border: none;
+                background: transparent;
+                width: 14px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #4a4a4a;
+                min-height: 48px;
+                border-radius: 2px;
+                margin: 0px 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #6a6a6a;
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: #858585;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                width: 0px;
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
                 background: transparent;
             }
             """
@@ -2249,7 +2321,7 @@ class TimelineView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             self._panel._set_pointer_active(True)
             scene_pt = self.mapToScene(event.pos())
-            if float(scene_pt.y()) <= float(RULER_HEIGHT):
+            if float(event.pos().y()) <= float(RULER_HEIGHT):
                 self._panel.user_pause_requested.emit()
                 self._scrubbing_playhead = True
                 self._panel._begin_playhead_scrub()
@@ -2603,6 +2675,7 @@ class TimelinePanel(QWidget):
     def __init__(self, project: Project) -> None:
         super().__init__()
         self._project = project
+        self._timeline_end_cache: float | None = None
         self._playhead_seconds: float = 0.0
         self._playhead_item = None
         self._playhead_handle = None
@@ -2626,6 +2699,7 @@ class TimelinePanel(QWidget):
         self._pending_pointer_refresh = False
         self._is_playhead_scrubbing = False
         self._scrub_last_emit_ts = 0.0
+        self._scrub_last_visual_refresh_ts = 0.0
         self._scrub_pending_seconds: float | None = None
         self._last_seek_request_was_scrub = False
         self._scrub_emit_timer = QTimer(self)
@@ -2637,8 +2711,8 @@ class TimelinePanel(QWidget):
         self._thumb_cache: dict[tuple[str, int, int, int, int], Path | None] = {}
         self._thumb_inflight: set[tuple[str, int, int, int, int]] = set()
         self._strip_pixmap_cache: dict[str, QPixmap] = {}
-        self._chunk_pixmap_cache: dict[tuple[str, int, int, int, int], QPixmap | None] = {}
-        self._chunk_inflight: set[tuple[str, int, int, int, int]] = set()
+        self._chunk_pixmap_cache: dict[tuple[str, int, int, int, int, int], QPixmap | None] = {}
+        self._chunk_inflight: set[tuple[str, int, int, int, int, int]] = set()
         self._wave_peaks_cache: dict[tuple[str, int, int], list[float] | None] = {}
         self._wave_peaks_inflight: set[tuple[str, int, int]] = set()
         self._wave_range_peaks_cache: dict[tuple[str, int, int, int], list[float] | None] = {}
@@ -2682,7 +2756,14 @@ class TimelinePanel(QWidget):
         ruler_header.setStyleSheet("QWidget#TimelineRulerHeader { background: #1a1d23; border-right: 1px solid #2a2f38; border-bottom: 1px solid #2a2f38; }")
         self.sidebar_layout.addWidget(ruler_header)
         
-        self.headers_list = QWidget()
+        self.headers_viewport = QWidget()
+        self.headers_viewport.setObjectName("TimelineHeadersViewport")
+        self.headers_viewport.setStyleSheet(
+            f"QWidget#TimelineHeadersViewport {{ background: {TIMELINE_BG_COLOR}; border: none; border-right: 1px solid #2a2f38; }}"
+        )
+        self.sidebar_layout.addWidget(self.headers_viewport, 1)
+
+        self.headers_list = QWidget(self.headers_viewport)
         self.headers_list.setObjectName("TimelineHeadersList")
         self.headers_list.setStyleSheet(
             f"QWidget#TimelineHeadersList {{ background: {TIMELINE_BG_COLOR}; border: none; border-right: 1px solid #2a2f38; }}"
@@ -2690,8 +2771,6 @@ class TimelinePanel(QWidget):
         self.headers_list_layout = QVBoxLayout(self.headers_list)
         self.headers_list_layout.setContentsMargins(0, 0, 0, 0)
         self.headers_list_layout.setSpacing(LANE_GAP)
-        self.sidebar_layout.addWidget(self.headers_list)
-        self.sidebar_layout.addStretch()
         
         content_layout.addWidget(self.sidebar)
 
@@ -2706,6 +2785,7 @@ class TimelinePanel(QWidget):
         self._view = TimelineView(self._scene, self)
         self._view.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._view.setStyleSheet(f"background: {TIMELINE_BG_COLOR}; border: none;")
+        self._view.verticalScrollBar().valueChanged.connect(self._sync_header_scroll)
         content_layout.addWidget(self._view)
         
         main_layout.addWidget(content)
@@ -3375,17 +3455,22 @@ class TimelinePanel(QWidget):
         if not has_any_clips:
             # Empty project should fit current viewport (no phantom horizontal scroll).
             return 0.0
-        timeline_end = max(self._project.duration, self._playhead_seconds)
+        timeline_end = max(self._timeline_end_seconds(), self._playhead_seconds)
         if timeline_end <= 0.0:
             return 60.0
         # Follow media length once clips exist (CapCut-like first-drop behavior).
         return max(8.0, timeline_end + 5.0)
 
     def _timeline_end_seconds(self) -> float:
+        cached = self._timeline_end_cache
+        if cached is not None:
+            return cached
         try:
-            return max(0.0, float(self._project.duration))
+            end = max(0.0, float(self._project.duration))
         except Exception:
-            return 0.0
+            end = 0.0
+        self._timeline_end_cache = end
+        return end
 
     def _clamp_playhead_seconds(self, seconds: float) -> float:
         try:
@@ -3449,9 +3534,66 @@ class TimelinePanel(QWidget):
                 best_dist = dist
         return best_idx
 
+    def _constrain_insert_index_for_kind(self, kind: str, insert_idx: int) -> int:
+        safe_idx = max(0, min(int(insert_idx), len(self._project.tracks)))
+        main_idx = self._main_track_index()
+        if main_idx is None:
+            return safe_idx
+        if kind == "audio":
+            return max(main_idx + 1, safe_idx)
+        if kind in {"text", "video"}:
+            return min(main_idx, safe_idx)
+        return safe_idx
+
+    def _drop_target_for_kind_zone(
+        self,
+        kind: str,
+        idx: int,
+        insert_new_track: bool,
+    ) -> tuple[int, bool]:
+        main_idx = self._main_track_index()
+        if main_idx is None:
+            if insert_new_track:
+                return self._constrain_insert_index_for_kind(kind, idx), True
+            return idx, False
+
+        if insert_new_track:
+            return self._constrain_insert_index_for_kind(kind, idx), True
+
+        if kind == "audio":
+            if (
+                main_idx < idx < len(self._project.tracks)
+                and self._project.tracks[idx].kind == "audio"
+                and not self._is_track_locked(self._project.tracks[idx])
+            ):
+                return idx, False
+            anchor = max(main_idx + 1, idx)
+            alt_idx = self._nearest_unlocked_track_index("audio", anchor)
+            if alt_idx is not None and alt_idx > main_idx:
+                return alt_idx, False
+            return main_idx + 1, True
+
+        if kind in {"text", "video"}:
+            if (
+                0 <= idx < len(self._project.tracks)
+                and self._project.tracks[idx].kind == kind
+                and not self._is_track_locked(self._project.tracks[idx])
+                and idx <= main_idx
+            ):
+                return idx, False
+            anchor = min(main_idx, max(0, idx))
+            alt_idx = self._nearest_unlocked_track_index(kind, anchor)
+            if alt_idx is not None and alt_idx <= main_idx:
+                return alt_idx, False
+            return main_idx, True
+
+        return idx, False
+
     def _track_height_for(self, track: Track, idx: int, main_idx: int | None) -> float:
         if track.kind == "text":
             return max(20.0, TRACK_HEIGHT * TEXT_TRACK_HEIGHT_FACTOR)
+        if track.kind == "audio":
+            return max(40.0, TRACK_HEIGHT * AUDIO_TRACK_HEIGHT_FACTOR)
         if main_idx is not None and idx == main_idx and track.kind == "video":
             return TRACK_HEIGHT * MAIN_TRACK_HEIGHT_FACTOR
         return TRACK_HEIGHT
@@ -3471,17 +3613,22 @@ class TimelinePanel(QWidget):
         ]
         viewport_h = self._timeline_viewport_height()
         content_h = max(0.0, viewport_h - RULER_HEIGHT)
+        padding = TRACK_EDGE_PADDING if tracks_list else 0.0
+        usable_h = max(0.0, content_h - padding * 2.0)
+        top_limit = RULER_HEIGHT + padding
+        total_h = sum(heights) + max(0, len(heights) - 1) * LANE_GAP
 
-        if main_idx is None:
-            total_h = sum(heights) + max(0, len(heights) - 1) * LANE_GAP
-            first_track_y = RULER_HEIGHT + max(0.0, (content_h - total_h) / 2.0)
+        if total_h >= usable_h:
+            first_track_y = top_limit
+        elif main_idx is None:
+            first_track_y = top_limit + max(0.0, (usable_h - total_h) / 2.0)
         else:
             main_h = heights[main_idx]
-            main_top = RULER_HEIGHT + (content_h - main_h) / 2.0
+            main_top = top_limit + (usable_h - main_h) / 2.0
             before_h = sum(heights[:main_idx]) + main_idx * LANE_GAP
             first_track_y = main_top - before_h
-            if first_track_y < RULER_HEIGHT:
-                first_track_y = RULER_HEIGHT
+            max_first_y = RULER_HEIGHT + max(0.0, content_h - padding - total_h)
+            first_track_y = max(top_limit, min(first_track_y, max_first_y))
 
         tops: list[float] = []
         y = first_track_y
@@ -3946,7 +4093,8 @@ class TimelinePanel(QWidget):
                 return None
             top, bottom = self._track_scene_bounds(nearest_idx)
             center_y = (top + bottom) * 0.5
-            return nearest_idx if dragged_y < center_y else nearest_idx + 1
+            proposed = nearest_idx if dragged_y < center_y else nearest_idx + 1
+            return self._constrain_insert_index_for_kind(kind, proposed)
 
         if direct_idx < 0 or direct_idx >= len(self._project.tracks):
             return None
@@ -3957,15 +4105,15 @@ class TimelinePanel(QWidget):
 
         if direct_track.kind == kind:
             if ratio < 0.18:
-                return direct_idx
+                return self._constrain_insert_index_for_kind(kind, direct_idx)
             if ratio > 0.82:
-                return direct_idx + 1
+                return self._constrain_insert_index_for_kind(kind, direct_idx + 1)
             return None
 
         if ratio < 0.25:
-            return direct_idx
+            return self._constrain_insert_index_for_kind(kind, direct_idx)
         if ratio > 0.75:
-            return direct_idx + 1
+            return self._constrain_insert_index_for_kind(kind, direct_idx + 1)
         return None
 
     def _insert_track_for_dragged_clip(
@@ -3981,7 +4129,7 @@ class TimelinePanel(QWidget):
         if not self._can_create_track_for_clip(kind, clip, source_track):
             return None
 
-        safe_insert_idx = max(0, min(int(insert_idx), len(self._project.tracks)))
+        safe_insert_idx = self._constrain_insert_index_for_kind(kind, insert_idx)
         new_track = Track(kind=kind, name=self._new_track_name_for_kind(kind))
         self._project.tracks.insert(safe_insert_idx, new_track)
         if safe_insert_idx <= source_idx:
@@ -4220,6 +4368,11 @@ class TimelinePanel(QWidget):
             return raw_h
         return 400.0
 
+    def _sync_header_scroll(self, value: int | None = None) -> None:
+        if value is None:
+            value = int(self._view.verticalScrollBar().value())
+        self.headers_list.move(0, -max(0, int(value)))
+
     def scroll_horizontal_by(self, delta: int) -> None:
         bar = self._view.horizontalScrollBar()
         bar.setValue(bar.value() - int(delta))
@@ -4379,6 +4532,27 @@ class TimelinePanel(QWidget):
             return key
         return None
 
+    @staticmethod
+    def _remember_cache_entry(
+        cache: dict,
+        key: object,
+        value: object,
+        max_items: int,
+    ) -> object:
+        try:
+            del cache[key]
+        except KeyError:
+            pass
+        cache[key] = value
+        limit = max(1, int(max_items))
+        while len(cache) > limit:
+            try:
+                oldest = next(iter(cache))
+            except StopIteration:
+                break
+            cache.pop(oldest, None)
+        return value
+
     def _reset_media_cache_generation(self) -> None:
         self._media_cache_generation += 1
         self._thumb_inflight.clear()
@@ -4462,7 +4636,14 @@ class TimelinePanel(QWidget):
             frames=frames,
         )
         if key in self._thumb_cache:
-            return self._thumb_cache[key]
+            cached = self._thumb_cache[key]
+            self._remember_cache_entry(
+                self._thumb_cache,
+                key,
+                cached,
+                MAX_THUMB_PATH_CACHE_ITEMS,
+            )
+            return cached
         if key in self._thumb_inflight:
             return None
         if not self._allow_media_cache_request(clip, media_kind="video"):
@@ -4489,38 +4670,60 @@ class TimelinePanel(QWidget):
             resolved = Path(path)
         else:
             resolved = None
-        self._thumb_cache[key_t] = resolved
+        self._remember_cache_entry(
+            self._thumb_cache,
+            key_t,
+            resolved,
+            MAX_THUMB_PATH_CACHE_ITEMS,
+        )
         self._update_clip_items_for_cache_key(key_t, invalidate_filmstrip=False)
 
     def cached_strip_pixmap(self, path: Path) -> QPixmap | None:
         cache_key = str(path)
         pix = self._strip_pixmap_cache.get(cache_key)
         if pix is not None and not pix.isNull():
+            self._remember_cache_entry(
+                self._strip_pixmap_cache,
+                cache_key,
+                pix,
+                MAX_STRIP_PIXMAP_CACHE_ITEMS,
+            )
             return pix
         loaded = QPixmap(cache_key)
         if loaded.isNull():
             return None
-        self._strip_pixmap_cache[cache_key] = loaded
+        self._remember_cache_entry(
+            self._strip_pixmap_cache,
+            cache_key,
+            loaded,
+            MAX_STRIP_PIXMAP_CACHE_ITEMS,
+        )
         return loaded
 
     @staticmethod
     def _filmstrip_chunk_key(
         source: str,
         chunk_idx: int,
-    ) -> tuple[str, int, int, int, int]:
+        *,
+        samples_per_second: int = 1,
+    ) -> tuple[str, int, int, int, int, int]:
+        samples_key = max(1, int(samples_per_second))
         return (
             _resolved_source_str(source),
             int(chunk_idx),
             int(FILMSTRIP_TILE_W),
             int(FILMSTRIP_TILE_H),
             int(FILMSTRIP_TILES_PER_CHUNK),
+            samples_key,
         )
 
     def _submit_filmstrip_chunk_extract(
         self,
-        key: tuple[str, int, int, int, int],
+        key: tuple[str, int, int, int, int, int],
         source: str,
         chunk_idx: int,
+        *,
+        samples_per_second: int = 1,
     ) -> None:
         if key in self._chunk_pixmap_cache or key in self._chunk_inflight:
             return
@@ -4541,6 +4744,7 @@ class TimelinePanel(QWidget):
                     tile_width=FILMSTRIP_TILE_W,
                     tile_height=FILMSTRIP_TILE_H,
                     tiles_per_chunk=FILMSTRIP_TILES_PER_CHUNK,
+                    samples_per_second=max(1, int(samples_per_second)),
                 )
             except Exception:
                 path = None
@@ -4555,14 +4759,27 @@ class TimelinePanel(QWidget):
         self,
         clip: Clip,
         chunk_idx: int,
+        *,
+        samples_per_second: int = 1,
     ) -> QPixmap | None:
         source = _resolved_source_str(self._clip_decode_source(clip))
         if not source:
             return None
 
-        key = self._filmstrip_chunk_key(source, chunk_idx)
+        samples_per_second = max(1, int(samples_per_second))
+        key = self._filmstrip_chunk_key(
+            source,
+            chunk_idx,
+            samples_per_second=samples_per_second,
+        )
         if key in self._chunk_pixmap_cache:
             pix = self._chunk_pixmap_cache[key]
+            self._remember_cache_entry(
+                self._chunk_pixmap_cache,
+                key,
+                pix,
+                MAX_CHUNK_PIXMAP_CACHE_ITEMS,
+            )
             return pix if pix is not None and not pix.isNull() else None
         if key in self._chunk_inflight:
             return None
@@ -4572,7 +4789,12 @@ class TimelinePanel(QWidget):
         if not self._allow_media_cache_request(clip, media_kind="video"):
             return None
 
-        self._submit_filmstrip_chunk_extract(key, source, int(chunk_idx))
+        self._submit_filmstrip_chunk_extract(
+            key,
+            source,
+            int(chunk_idx),
+            samples_per_second=samples_per_second,
+        )
         return None
 
     def _on_filmstrip_chunk_ready(self, key: object, path: object) -> None:
@@ -4589,18 +4811,13 @@ class TimelinePanel(QWidget):
             loaded = QPixmap(path)
             if not loaded.isNull():
                 pix = loaded
-        self._chunk_pixmap_cache[key_t] = pix
-
-        src = str(key_t[0]) if key_t else ""
-        if src:
-            bucket = getattr(self, "_clip_items_by_source", {}).get(src)
-            if bucket is not None:
-                for item in list(bucket):
-                    item.update()
-                return
-            for item in self._clip_items_by_id.values():
-                if item._current_decode_source_key() == src:
-                    item.update()
+        self._remember_cache_entry(
+            self._chunk_pixmap_cache,
+            key_t,
+            pix,
+            MAX_CHUNK_PIXMAP_CACHE_ITEMS,
+        )
+        self._update_clip_items_for_cache_key(key_t)
 
     @staticmethod
     def _peaks_key(clip: Clip, num_peaks: int) -> tuple[str, int, int]:
@@ -4768,7 +4985,14 @@ class TimelinePanel(QWidget):
         if target_peaks <= WAVEFORM_PEAKS_FAST:
             key = self._peaks_key(clip, target_peaks)
             if key in self._wave_peaks_cache:
-                return self._wave_peaks_cache[key]
+                cached = self._wave_peaks_cache[key]
+                self._remember_cache_entry(
+                    self._wave_peaks_cache,
+                    key,
+                    cached,
+                    MAX_WAVEFORM_PEAKS_CACHE_ITEMS,
+                )
+                return cached
             if key in self._wave_peaks_inflight:
                 return None
             if not self._allow_media_cache_request(clip, media_kind=media_kind):
@@ -4779,12 +5003,24 @@ class TimelinePanel(QWidget):
         hi_key = self._peaks_key(clip, target_peaks)
         if hi_key in self._wave_peaks_cache:
             hi = self._wave_peaks_cache[hi_key]
+            self._remember_cache_entry(
+                self._wave_peaks_cache,
+                hi_key,
+                hi,
+                MAX_WAVEFORM_PEAKS_CACHE_ITEMS,
+            )
             if hi is not None:
                 return hi
 
         fast_key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
         if fast_key in self._wave_peaks_cache:
             fast = self._wave_peaks_cache[fast_key]
+            self._remember_cache_entry(
+                self._wave_peaks_cache,
+                fast_key,
+                fast,
+                MAX_WAVEFORM_PEAKS_CACHE_ITEMS,
+            )
             if fast is not None:
                 self._schedule_waveform_upgrade(
                     fast_key,
@@ -4825,7 +5061,14 @@ class TimelinePanel(QWidget):
             target_peaks,
         )
         if key in self._wave_range_peaks_cache:
-            return self._wave_range_peaks_cache[key]
+            cached = self._wave_range_peaks_cache[key]
+            self._remember_cache_entry(
+                self._wave_range_peaks_cache,
+                key,
+                cached,
+                MAX_WAVEFORM_RANGE_CACHE_ITEMS,
+            )
+            return cached
         if key in self._wave_range_peaks_inflight:
             return None
         if not self._allow_media_cache_request(clip, media_kind=media_kind):
@@ -4884,17 +5127,29 @@ class TimelinePanel(QWidget):
         if len(key_t) == 4:
             self._wave_range_peaks_inflight.discard(key_t)
             if isinstance(peaks, list):
-                self._wave_range_peaks_cache[key_t] = [float(x) for x in peaks]
+                cached_peaks = [float(x) for x in peaks]
             else:
-                self._wave_range_peaks_cache[key_t] = None
+                cached_peaks = None
+            self._remember_cache_entry(
+                self._wave_range_peaks_cache,
+                key_t,
+                cached_peaks,
+                MAX_WAVEFORM_RANGE_CACHE_ITEMS,
+            )
             self._update_clip_items_for_cache_key(key_t)
             return
 
         self._wave_peaks_inflight.discard(key_t)
         if isinstance(peaks, list):
-            self._wave_peaks_cache[key_t] = [float(x) for x in peaks]
+            cached_peaks = [float(x) for x in peaks]
         else:
-            self._wave_peaks_cache[key_t] = None
+            cached_peaks = None
+        self._remember_cache_entry(
+            self._wave_peaks_cache,
+            key_t,
+            cached_peaks,
+            MAX_WAVEFORM_PEAKS_CACHE_ITEMS,
+        )
         if (
             len(key_t) >= 3
             and int(key_t[1]) == WAVEFORM_PEAKS_FAST
@@ -5044,24 +5299,45 @@ class TimelinePanel(QWidget):
             src_duration = max(0.0, src_duration)
             if src_duration <= 1e-6:
                 return
+            try:
+                speed = max(1e-6, float(getattr(clip, "speed", 1.0) or 1.0))
+            except Exception:
+                speed = 1.0
+            samples_per_second = _filmstrip_samples_per_second(
+                float(self._pixels_per_second) / speed
+            )
+            chunk_duration = float(max(1, FILMSTRIP_TILES_PER_CHUNK)) / float(
+                max(1, samples_per_second)
+            )
             chunk_count = max(
                 1,
-                int(math.ceil(src_duration / float(max(1, FILMSTRIP_TILES_PER_CHUNK)))),
+                int(math.ceil(src_duration / chunk_duration)),
             )
             window = self._clip_visible_source_window(clip)
             if window is None:
                 return
             source_start, source_end, _, _ = window
-            chunk_size = float(max(1, FILMSTRIP_TILES_PER_CHUNK))
-            first_chunk = max(0, int(source_start // chunk_size))
+            first_chunk = max(0, int(source_start // chunk_duration))
             last_chunk = max(
                 first_chunk,
-                int(max(source_start, source_end - 1e-6) // chunk_size),
+                int(max(source_start, source_end - 1e-6) // chunk_duration),
             )
             last_chunk = min(chunk_count - 1, last_chunk)
             for chunk_idx in range(first_chunk, last_chunk + 1):
-                key = self._filmstrip_chunk_key(source, chunk_idx)
-                self._submit_filmstrip_chunk_extract(key, source, int(chunk_idx))
+                key = self._filmstrip_chunk_key(
+                    source,
+                    chunk_idx,
+                    samples_per_second=samples_per_second,
+                )
+                if samples_per_second == 1:
+                    self._submit_filmstrip_chunk_extract(key, source, int(chunk_idx))
+                else:
+                    self._submit_filmstrip_chunk_extract(
+                        key,
+                        source,
+                        int(chunk_idx),
+                        samples_per_second=samples_per_second,
+                    )
             return
 
         strip_width = FILMSTRIP_FRAMES * FILMSTRIP_TILE_WIDTH
@@ -5152,11 +5428,17 @@ class TimelinePanel(QWidget):
         bucket = getattr(self, "_clip_items_by_source", {}).get(source_key)
         if not bucket:
             return
+        updated = False
         for item in list(bucket):
+            if not self._clip_intersects_visible_timeline(item.clip):
+                continue
             if invalidate_filmstrip:
                 item.invalidate_filmstrip()
             else:
                 item.update()
+            updated = True
+        if updated and hasattr(self, "_view"):
+            self._view.viewport().update()
 
     def update_clip_visuals(self, clip: Clip) -> None:
         """Repaint a single clip item after cheap metadata/text changes."""
@@ -5258,6 +5540,7 @@ class TimelinePanel(QWidget):
         return data
 
     def refresh(self) -> None:
+        self._timeline_end_cache = None
         selected_clips = [it.clip for it in self._selected_clip_items()]
         selected_ids = {id(clip) for clip in selected_clips}
         blocker = QSignalBlocker(self._scene)
@@ -5304,7 +5587,7 @@ class TimelinePanel(QWidget):
                 0,
                 int(max(0.0, first_track_y - RULER_HEIGHT)),
                 0,
-                0,
+                int(TRACK_EDGE_PADDING),
             )
 
             clip_data = self._compute_clip_layout_data(tracks, lane_tops, lane_heights)
@@ -5429,8 +5712,18 @@ class TimelinePanel(QWidget):
                 )
                 self._reindex_clip_item(item, old_key, item._decode_source_key)
 
-            scene_h = max(viewport_h, 200.0)
+            content_bottom = (
+                lane_tops[-1] + lane_heights[-1] + TRACK_EDGE_PADDING
+                if lane_tops and lane_heights
+                else RULER_HEIGHT + TRACK_EDGE_PADDING
+            )
+            scene_h = max(viewport_h, 200.0, content_bottom)
             self._scene.setSceneRect(0, 0, scene_w, scene_h)
+            headers_h = max(0, int(math.ceil(scene_h - RULER_HEIGHT)))
+            self.headers_list.setFixedWidth(TRACK_HEADER_WIDTH)
+            self.headers_list.setFixedHeight(headers_h)
+            self.headers_viewport.setMinimumHeight(0)
+            self._sync_header_scroll()
             # Force horizontal scroll range to follow the new scene width.
             bar = self._view.horizontalScrollBar()
             scroll_overflow = scene_w - max(0.0, viewport_scene_w)
@@ -5451,8 +5744,10 @@ class TimelinePanel(QWidget):
         self._emit_current_selection_if_changed()
 
     def _draw_ruler(self, scene_w: float) -> None:
+        visible = self._view.mapToScene(self._view.viewport().rect()).boundingRect()
+        ruler_y = max(0.0, float(visible.top()))
         self._scene.invalidate(
-            QRectF(0.0, 0.0, max(1.0, scene_w), RULER_HEIGHT),
+            QRectF(0.0, ruler_y, max(1.0, scene_w), RULER_HEIGHT),
             QGraphicsScene.SceneLayer.ForegroundLayer,
         )
 
@@ -5580,6 +5875,7 @@ class TimelinePanel(QWidget):
         self._clear_clip_items()
         self._last_emitted_selection_key = None
         self._reset_media_cache_generation()
+        self._timeline_end_cache = None
         self._project = project
         self._ensure_unique_clip_ids()
         self.refresh()
@@ -5599,6 +5895,9 @@ class TimelinePanel(QWidget):
         self._playhead_seconds = self._clamp_playhead_seconds(seconds)
         self._refresh_playhead()
 
+    def set_playhead_fast(self, seconds: float) -> None:
+        self._playhead_seconds = self._clamp_playhead_seconds(seconds)
+
     def is_playhead_scrubbing(self) -> bool:
         return self._is_playhead_scrubbing
 
@@ -5614,6 +5913,7 @@ class TimelinePanel(QWidget):
     def _begin_playhead_scrub(self) -> None:
         self._is_playhead_scrubbing = True
         self._scrub_last_emit_ts = 0.0
+        self._scrub_last_visual_refresh_ts = 0.0
         self._scrub_pending_seconds = None
         if self._scrub_emit_timer.isActive():
             self._scrub_emit_timer.stop()
@@ -5637,11 +5937,22 @@ class TimelinePanel(QWidget):
     def _scrub_playhead_to_scene_x(self, scene_x: float, *, emit_seek: bool) -> None:
         seconds = max(0.0, self.pixels_to_seconds(scene_x))
         seconds = self._snap_playhead_time(seconds)
-        self.set_playhead(seconds)
+        scrub_like = self._is_playhead_scrubbing or self._hover_scrub_enabled
+        if scrub_like:
+            self.set_playhead_fast(seconds)
+            visual_interval = SCRUB_PLAYHEAD_REFRESH_INTERVAL_MS / 1000.0
+            now = monotonic()
+            if (
+                self._scrub_last_visual_refresh_ts <= 0.0
+                or (now - self._scrub_last_visual_refresh_ts) >= visual_interval
+            ):
+                self._scrub_last_visual_refresh_ts = now
+                self._refresh_playhead()
+        else:
+            self.set_playhead(seconds)
         seconds = float(self._playhead_seconds)
         if not emit_seek:
             return
-        scrub_like = self._is_playhead_scrubbing or self._hover_scrub_enabled
         if not scrub_like:
             self._emit_seek_request(seconds, scrub=False)
             return
@@ -5829,6 +6140,11 @@ class TimelinePanel(QWidget):
                 else:
                     idx = anchor
                     insert_new_track = True
+            idx, insert_new_track = self._drop_target_for_kind_zone(
+                kind,
+                idx,
+                insert_new_track,
+            )
             self.media_drop_requested.emit(str(path), start, idx, insert_new_track)
             return True
 
@@ -5891,6 +6207,12 @@ class TimelinePanel(QWidget):
                 insert_new_track = True
             else:
                 idx = alt_idx
+
+        idx, insert_new_track = self._drop_target_for_kind_zone(
+            kind,
+            idx,
+            insert_new_track,
+        )
 
         self.media_drop_requested.emit(str(path), start, idx, insert_new_track)
         return True

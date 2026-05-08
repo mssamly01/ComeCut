@@ -53,6 +53,31 @@ def test_internal_audio_drag_can_create_new_track(timeline_app) -> None:
     panel.deleteLater()
 
 
+def test_internal_audio_drag_above_main_still_creates_track_below_main(
+    timeline_app,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    clip_a = _media_clip("a.mp3", duration=2.0)
+    clip_b = _media_clip("b.mp3", start=3.0, duration=2.0)
+    audio = Track(kind="audio", name="Audio", clips=[clip_a, clip_b])
+    main = Track(kind="video", name="Main")
+    project = Project(tracks=[main, audio])
+    panel = TimelinePanel(project)
+    panel.resize(1000, 500)
+
+    main_idx = project.tracks.index(main)
+    top, _bottom = panel._track_scene_bounds(main_idx)
+    panel.handle_clip_release_by_clip(clip_a, top - 20.0, clip_a.start)
+
+    main_idx = project.tracks.index(main)
+    audio_indices = [idx for idx, track in enumerate(project.tracks) if track.kind == "audio"]
+    assert audio_indices
+    assert all(idx > main_idx for idx in audio_indices)
+    assert any(clip_a in project.tracks[idx].clips for idx in audio_indices)
+    panel.deleteLater()
+
+
 def test_internal_text_drag_can_create_new_track(timeline_app) -> None:
     from comecut_py.gui.widgets.timeline import TimelinePanel
 
@@ -77,6 +102,60 @@ def test_internal_text_drag_can_create_new_track(timeline_app) -> None:
     assert any(clip_a in track.clips for track in text_tracks)
     assert any(clip_b in track.clips for track in text_tracks)
     assert not any(len(track.clips) > 1 and clip_a in track.clips for track in text_tracks)
+    panel.deleteLater()
+
+
+def test_internal_text_drag_below_main_still_creates_track_above_main(
+    timeline_app,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    clip_a = _text_clip(0.0, 1.0, "first")
+    clip_b = _text_clip(2.0, 1.0, "second")
+    text = Track(kind="text", name="Text", clips=[clip_a, clip_b])
+    main = Track(kind="video", name="Main")
+    audio = Track(kind="audio", name="Audio")
+    project = Project(tracks=[text, main, audio])
+    panel = TimelinePanel(project)
+    panel.resize(1000, 500)
+
+    audio_idx = project.tracks.index(audio)
+    _top, bottom = panel._track_scene_bounds(audio_idx)
+    panel.handle_clip_release_by_clip(clip_a, bottom + 20.0, clip_a.start)
+
+    main_idx = project.tracks.index(main)
+    text_indices = [idx for idx, track in enumerate(project.tracks) if track.kind == "text"]
+    assert text_indices
+    assert all(idx < main_idx for idx in text_indices)
+    assert any(clip_a in project.tracks[idx].clips for idx in text_indices)
+    panel.deleteLater()
+
+
+def test_internal_video_drag_below_main_creates_overlay_above_main(
+    timeline_app,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    clip = _media_clip("main.mp4", duration=2.0)
+    main = Track(kind="video", name="Main", clips=[clip])
+    audio = Track(kind="audio", name="Audio")
+    project = Project(tracks=[main, audio])
+    panel = TimelinePanel(project)
+    panel.resize(1000, 500)
+
+    audio_idx = project.tracks.index(audio)
+    _top, bottom = panel._track_scene_bounds(audio_idx)
+    panel.handle_clip_release_by_clip(clip, bottom + 20.0, clip.start)
+
+    main_idx = project.tracks.index(main)
+    overlay_indices = [
+        idx
+        for idx, track in enumerate(project.tracks)
+        if track.kind == "video" and track.name.strip().lower() != "main"
+    ]
+    assert overlay_indices
+    assert all(idx < main_idx for idx in overlay_indices)
+    assert any(clip in project.tracks[idx].clips for idx in overlay_indices)
     panel.deleteLater()
 
 
@@ -174,6 +253,29 @@ def test_internal_video_track_limit_excludes_main_track(timeline_app) -> None:
     assert any(clip_a in track.clips for track in overlay_tracks)
     assert any(clip_b in track.clips for track in overlay_tracks)
     assert all(track.clips for track in overlay_tracks)
+    panel.deleteLater()
+
+
+def test_track_layout_keeps_edge_padding_and_expands_scene_for_scroll(
+    timeline_app,
+) -> None:
+    from comecut_py.gui.widgets.timeline import RULER_HEIGHT, TRACK_EDGE_PADDING, TimelinePanel
+
+    tracks = [Track(kind="video", name="Main")]
+    tracks.extend(
+        Track(kind="audio", name=f"Audio {idx}", clips=[_media_clip(f"{idx}.mp3")])
+        for idx in range(10)
+    )
+    project = Project(tracks=tracks)
+    panel = TimelinePanel(project)
+    panel.resize(900, 260)
+    panel.refresh()
+
+    _tracks, lane_tops, lane_heights, _main_idx = panel._track_layout_data(project.tracks)
+
+    assert lane_tops[0] >= RULER_HEIGHT + TRACK_EDGE_PADDING - 0.5
+    assert panel._scene.sceneRect().height() >= lane_tops[-1] + lane_heights[-1] + TRACK_EDGE_PADDING - 0.5
+    assert panel._scene.sceneRect().height() > panel._timeline_viewport_height()
     panel.deleteLater()
 
 

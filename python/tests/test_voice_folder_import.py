@@ -21,6 +21,11 @@ class _VoiceImportHarness:
     _duration_for_insert = MainWindow._duration_for_insert
     _register_placeholder_clip = MainWindow._register_placeholder_clip
     _unregister_placeholder_clip = MainWindow._unregister_placeholder_clip
+    _clip_overlaps_track = staticmethod(MainWindow._clip_overlaps_track)
+    _audio_insert_index_after_last_audio = MainWindow._audio_insert_index_after_last_audio
+    _move_audio_clip_to_non_overlapping_track = (
+        MainWindow._move_audio_clip_to_non_overlapping_track
+    )
     _voice_target_subtitle_clips = MainWindow._voice_target_subtitle_clips
     _voice_audio_files_from_folder = MainWindow._voice_audio_files_from_folder
     _add_voice_folder_to_timeline = MainWindow._add_voice_folder_to_timeline
@@ -258,6 +263,52 @@ def test_add_voice_folder_uses_new_audio_track_when_existing_track_overlaps(
     assert len(audio_tracks[1].clips) == 1
     assert audio_tracks[0].clips[0].source == "existing.mp3"
     assert Path(audio_tracks[1].clips[0].source).name == "1.mp3"
+
+
+def test_voice_placeholder_duration_update_moves_audio_that_would_overlap(
+    tmp_path: Path,
+) -> None:
+    _touch_mp3(tmp_path, "1.mp3")
+    _touch_mp3(tmp_path, "2.mp3")
+    project = Project(
+        tracks=[
+            Track(
+                kind="text",
+                name="Subtitle",
+                clips=[
+                    _text_clip(0.0, 0.5, "first"),
+                    _text_clip(0.75, 0.5, "second"),
+                ],
+            )
+        ]
+    )
+    harness = _VoiceImportHarness(project)
+
+    created = harness._add_voice_folder_to_timeline(tmp_path)
+
+    audio_tracks = [track for track in project.tracks if track.kind == "audio"]
+    assert len(audio_tracks) == 1
+    assert audio_tracks[0].clips == created
+
+    created[0].out_point = 1.0
+    moved_to = harness._move_audio_clip_to_non_overlapping_track(
+        created[0],
+        audio_tracks[0],
+    )
+
+    audio_tracks = [track for track in project.tracks if track.kind == "audio"]
+    assert len(audio_tracks) == 2
+    assert moved_to is audio_tracks[1]
+    assert created[0] in audio_tracks[1].clips
+    assert created[1] in audio_tracks[0].clips
+    for track in audio_tracks:
+        assert not any(
+            a is not b
+            and float(a.start) < float(b.start) + float(b.timeline_duration or 0.0)
+            and float(a.start) + float(a.timeline_duration or 0.0) > float(b.start)
+            for a in track.clips
+            for b in track.clips
+        )
 
 
 def test_media_panel_voice_folder_signal_does_not_import_to_library(

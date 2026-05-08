@@ -15,8 +15,8 @@ from ..core.ffmpeg_cmd import detect_cuda_decode_available, ensure_ffmpeg
 from ..core.media_cache import user_cache_root
 
 TILES_PER_CHUNK = 60
-DEFAULT_TILE_WIDTH = 80
-DEFAULT_TILE_HEIGHT = 48
+DEFAULT_TILE_WIDTH = 96
+DEFAULT_TILE_HEIGHT = 54
 THUMB_COVER_MODE_VERSION = "cover-v1"
 
 
@@ -58,16 +58,21 @@ def _chunk_cache_key(
     tile_width: int,
     tile_height: int,
     tiles_per_chunk: int,
+    samples_per_second: float,
 ) -> str:
     path = Path(src).resolve()
+    samples_key = int(round(max(0.001, float(samples_per_second)) * 1000.0))
     try:
         st = path.stat()
         sig = (
             f"{path}:{st.st_size}:{int(st.st_mtime)}:"
-            f"{tile_width}x{tile_height}:tpc{tiles_per_chunk}:m{THUMB_COVER_MODE_VERSION}"
+            f"{tile_width}x{tile_height}:tpc{tiles_per_chunk}:sps{samples_key}:m{THUMB_COVER_MODE_VERSION}"
         )
     except OSError:
-        sig = f"{path}:{tile_width}x{tile_height}:tpc{tiles_per_chunk}:m{THUMB_COVER_MODE_VERSION}"
+        sig = (
+            f"{path}:{tile_width}x{tile_height}:"
+            f"tpc{tiles_per_chunk}:sps{samples_key}:m{THUMB_COVER_MODE_VERSION}"
+        )
     return hashlib.sha1(sig.encode("utf-8")).hexdigest()[:16]
 
 
@@ -78,6 +83,7 @@ def chunk_path(
     tile_width: int = DEFAULT_TILE_WIDTH,
     tile_height: int = DEFAULT_TILE_HEIGHT,
     tiles_per_chunk: int = TILES_PER_CHUNK,
+    samples_per_second: float = 1.0,
 ) -> Path:
     """Return the cache path for one per-second filmstrip chunk."""
     key = _chunk_cache_key(
@@ -85,6 +91,7 @@ def chunk_path(
         tile_width=tile_width,
         tile_height=tile_height,
         tiles_per_chunk=tiles_per_chunk,
+        samples_per_second=samples_per_second,
     )
     return _chunk_cache_dir() / key / f"c{int(chunk_idx):05d}.jpg"
 
@@ -169,16 +176,18 @@ def extract_filmstrip_chunk(
     tile_width: int = DEFAULT_TILE_WIDTH,
     tile_height: int = DEFAULT_TILE_HEIGHT,
     tiles_per_chunk: int = TILES_PER_CHUNK,
+    samples_per_second: float = 1.0,
 ) -> Path | None:
-    """Extract a cache chunk containing one thumbnail per source second.
+    """Extract a cache chunk containing timeline thumbnail samples.
 
     The output is one horizontal JPG with ``tiles_per_chunk`` tiles. It is
-    zoom-independent, so the timeline can draw only the source-second tiles it
+    zoom-independent, so the timeline can draw only the source-time tiles it
     needs instead of stretching one fixed filmstrip across the whole clip.
     """
     tile_width = max(1, int(tile_width))
     tile_height = max(1, int(tile_height))
     tiles_per_chunk = max(1, int(tiles_per_chunk))
+    samples_per_second = max(0.001, float(samples_per_second))
     chunk_idx = max(0, int(chunk_idx))
 
     src_path = Path(src)
@@ -191,6 +200,7 @@ def extract_filmstrip_chunk(
         tile_width=tile_width,
         tile_height=tile_height,
         tiles_per_chunk=tiles_per_chunk,
+        samples_per_second=samples_per_second,
     )
     if out.exists() and out.stat().st_size > 0:
         return out
@@ -209,9 +219,10 @@ def extract_filmstrip_chunk(
     except Exception:
         hwaccel_args = []
 
-    start_seconds = chunk_idx * tiles_per_chunk
+    chunk_duration = max(0.001, tiles_per_chunk / samples_per_second)
+    start_seconds = chunk_idx * chunk_duration
     filt = (
-        "fps=1,"
+        f"fps={samples_per_second:.4f},"
         f"scale={tile_width}:{tile_height}:force_original_aspect_ratio=increase,"
         f"crop={tile_width}:{tile_height},"
         f"tile={tiles_per_chunk}x1"
@@ -223,9 +234,9 @@ def extract_filmstrip_chunk(
         "-y",
         *hwaccel_args,
         "-ss",
-        str(start_seconds),
+        f"{start_seconds:.6f}",
         "-t",
-        str(tiles_per_chunk),
+        f"{chunk_duration:.6f}",
         "-i",
         str(src_path),
         "-vf",
