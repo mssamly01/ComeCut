@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from comecut_py.core.project import Clip, Project, Track
@@ -279,7 +281,7 @@ def test_track_layout_keeps_edge_padding_and_expands_scene_for_scroll(
     panel.deleteLater()
 
 
-def test_prewarm_long_video_limits_to_visible_cache_window(
+def test_prewarm_long_video_queues_full_waveform_left_to_right(
     timeline_app,
     tmp_path,
     monkeypatch,
@@ -318,8 +320,60 @@ def test_prewarm_long_video_limits_to_visible_cache_window(
     panel.prewarm_track_clips([clip])
 
     assert full_waveform_requests == []
-    assert range_waveform_requests == [(0.0, 120.0, 256)]
+    assert range_waveform_requests == [(0.0, 300.0, 256)]
     assert chunk_requests == [0, 1]
+    wave_tasks = [
+        task
+        for task in panel._progressive_media_cache_tasks
+        if task and task[0] == "wave_range"
+    ]
+    assert len(wave_tasks) == 48
+    assert [(task[3], task[4], task[5]) for task in wave_tasks[:4]] == [
+        (0.0, 300.0, 256),
+        (0.0, 300.0, 2048),
+        (300.0, 300.0, 256),
+        (300.0, 300.0, 2048),
+    ]
+    assert (wave_tasks[-1][3], wave_tasks[-1][4], wave_tasks[-1][5]) == (
+        6900.0,
+        300.0,
+        2048,
+    )
+    panel.deleteLater()
+
+
+def test_prewarm_audio_clips_queues_waveforms_by_timeline_start(
+    timeline_app,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    early_source = tmp_path / "early.mp3"
+    late_source = tmp_path / "late.mp3"
+    early_source.write_bytes(b"audio")
+    late_source.write_bytes(b"audio")
+    early = _media_clip(str(early_source), start=0.5, duration=2.0)
+    late = _media_clip(str(late_source), start=10.0, duration=2.0)
+    project = Project(tracks=[Track(kind="audio", name="Voice", clips=[late, early])])
+    panel = TimelinePanel(project)
+
+    monkeypatch.setattr(panel, "_submit_waveform_extract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(panel, "_submit_waveform_range_extract", lambda *args, **kwargs: None)
+
+    panel.prewarm_track_clips([late, early])
+
+    wave_tasks = [
+        task
+        for task in panel._progressive_media_cache_tasks
+        if task and task[0] == "wave"
+    ]
+    assert [(Path(task[2]).name, task[3]) for task in wave_tasks] == [
+        ("early.mp3", 256),
+        ("early.mp3", 2048),
+        ("late.mp3", 256),
+        ("late.mp3", 2048),
+    ]
     panel.deleteLater()
 
 

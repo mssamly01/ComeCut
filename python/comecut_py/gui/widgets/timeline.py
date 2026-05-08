@@ -136,8 +136,8 @@ MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE = 8
 MAX_THUMB_PATH_CACHE_ITEMS = 512
 MAX_STRIP_PIXMAP_CACHE_ITEMS = 128
 MAX_CHUNK_PIXMAP_CACHE_ITEMS = 256
-MAX_WAVEFORM_PEAKS_CACHE_ITEMS = 512
-MAX_WAVEFORM_RANGE_CACHE_ITEMS = 1024
+MAX_WAVEFORM_PEAKS_CACHE_ITEMS = 4096
+MAX_WAVEFORM_RANGE_CACHE_ITEMS = 8192
 SCENE_INDEX_CLIP_THRESHOLD = 800
 FILMSTRIP_FRAMES = 24
 FILMSTRIP_TILE_WIDTH = 120
@@ -4533,7 +4533,10 @@ class TimelinePanel(QWidget):
             dur = float(clip.source_duration or clip.timeline_duration or 0.0)
         except Exception:
             dur = 0.0
-        is_long_video = media_kind == "video" and dur >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS
+        is_long_video = (
+            media_kind == "filmstrip"
+            and dur >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS
+        )
         if is_long_video and not self._clip_has_ready_proxy(clip):
             return False
         return True
@@ -4669,7 +4672,7 @@ class TimelinePanel(QWidget):
             return cached
         if key in self._thumb_inflight:
             return None
-        if not self._allow_media_cache_request(clip, media_kind="video"):
+        if not self._allow_media_cache_request(clip, media_kind="filmstrip"):
             return None
 
         self._submit_filmstrip_extract(
@@ -4810,7 +4813,7 @@ class TimelinePanel(QWidget):
 
         # Selection/drag blocks new extraction work, but already-cached chunks
         # must still paint. Otherwise clicking a clip can cache a blank filmstrip.
-        if not self._allow_media_cache_request(clip, media_kind="video"):
+        if not self._allow_media_cache_request(clip, media_kind="filmstrip"):
             return None
 
         self._submit_filmstrip_chunk_extract(
@@ -5114,6 +5117,7 @@ class TimelinePanel(QWidget):
         num_peaks: int = 256,
         media_kind: str = "video",
     ) -> tuple[list[float], float, float] | None:
+        target_peaks = max(1, int(num_peaks))
         try:
             duration = max(
                 0.0,
@@ -5140,16 +5144,109 @@ class TimelinePanel(QWidget):
         if window is None:
             return None
         source_start, source_end, local_start, local_end = window
-        peaks = self.request_waveform_peaks_range_async(
-            clip,
-            source_start=source_start,
-            source_duration=source_end - source_start,
-            num_peaks=num_peaks,
-            media_kind=media_kind,
-        )
-        if not peaks:
+        source = _resolved_source_str(self._clip_decode_source(clip))
+        if not source:
             return None
-        visible_peaks = list(peaks)
+        span = self._clip_source_time_span(clip)
+        if span is None:
+            return None
+        span_start, span_end, speed = span
+        chunk_specs = self._waveform_range_chunk_specs(
+            source,
+            span_start=span_start,
+            span_end=span_end,
+            request_start=source_start,
+            request_end=source_end,
+            num_peaks=target_peaks,
+        )
+        if not chunk_specs:
+            return None
+
+        ready_segments: list[tuple[float, float, list[float]]] = []
+        can_submit = self._allow_media_cache_request(clip, media_kind=media_kind)
+        for key, chunk_start, chunk_duration in chunk_specs:
+            target_cached = key in self._wave_range_peaks_cache
+            peaks = self._wave_range_peaks_cache.get(key)
+            if peaks is None and target_peaks != WAVEFORM_PEAKS_FAST:
+                fast_key = self._range_peaks_key_from_source(
+                    source,
+                    chunk_start,
+                    chunk_duration,
+                    WAVEFORM_PEAKS_FAST,
+                )
+                peaks = self._wave_range_peaks_cache.get(fast_key)
+                if (
+                    can_submit
+                    and not target_cached
+                    and key not in self._wave_range_peaks_inflight
+                ):
+                    self._submit_waveform_range_extract(
+                        key,
+                        source,
+                        start=chunk_start,
+                        duration=chunk_duration,
+                        num_peaks=target_peaks,
+                    )
+            if peaks is None:
+                if can_submit:
+                    if target_peaks != WAVEFORM_PEAKS_FAST:
+                        fast_key = self._range_peaks_key_from_source(
+                            source,
+                            chunk_start,
+                            chunk_duration,
+                            WAVEFORM_PEAKS_FAST,
+                        )
+                        if (
+                            fast_key not in self._wave_range_peaks_cache
+                            and fast_key not in self._wave_range_peaks_inflight
+                        ):
+                            self._submit_waveform_range_extract(
+                                fast_key,
+                                source,
+                                start=chunk_start,
+                                duration=chunk_duration,
+                                num_peaks=WAVEFORM_PEAKS_FAST,
+                            )
+                    if (
+                        not target_cached
+                        and key not in self._wave_range_peaks_inflight
+                    ):
+                        self._submit_waveform_range_extract(
+                            key,
+                            source,
+                            start=chunk_start,
+                            duration=chunk_duration,
+                            num_peaks=target_peaks,
+                        )
+                break
+            ready_segments.append(
+                (
+                    float(chunk_start),
+                    float(chunk_start + chunk_duration),
+                    [float(value) for value in peaks],
+                )
+            )
+        if not ready_segments:
+            return None
+
+        ready_source_start = ready_segments[0][0]
+        ready_source_end = ready_segments[-1][1]
+        visible_peaks: list[float] = []
+        for _, _, segment_peaks in ready_segments:
+            visible_peaks.extend(segment_peaks)
+        if not visible_peaks:
+            return None
+
+        timeline_dur = max(
+            1e-6,
+            float(getattr(clip, "timeline_duration", 0.0) or 0.0),
+        )
+        if bool(getattr(clip, "reverse", False)):
+            local_start = max(0.0, min(timeline_dur, (span_end - ready_source_end) / speed))
+            local_end = max(0.0, min(timeline_dur, (span_end - ready_source_start) / speed))
+        else:
+            local_start = max(0.0, min(timeline_dur, (ready_source_start - span_start) / speed))
+            local_end = max(0.0, min(timeline_dur, (ready_source_end - span_start) / speed))
         if bool(getattr(clip, "reverse", False)):
             visible_peaks.reverse()
         return visible_peaks, local_start, local_end
@@ -5280,6 +5377,30 @@ class TimelinePanel(QWidget):
         self._progressive_media_cache_task_keys.add(task_key)
         self._progressive_media_cache_tasks.append(task)
 
+    @staticmethod
+    def _progressive_media_cache_task_priority(task: tuple) -> tuple[float, int, str]:
+        marker = task[-1] if task else None
+        if (
+            isinstance(marker, tuple)
+            and len(marker) >= 3
+            and str(marker[0]) == "priority"
+        ):
+            try:
+                return float(marker[1]), int(marker[2]), str(task[0])
+            except Exception:
+                pass
+        return float("inf"), 99, str(task[0] if task else "")
+
+    def _sort_progressive_media_cache_tasks(self) -> None:
+        if len(self._progressive_media_cache_tasks) <= 1:
+            return
+        self._progressive_media_cache_tasks = deque(
+            sorted(
+                self._progressive_media_cache_tasks,
+                key=self._progressive_media_cache_task_priority,
+            )
+        )
+
     def _clip_source_time_span(self, clip: Clip) -> tuple[float, float, float] | None:
         try:
             timeline_dur = max(
@@ -5310,6 +5431,45 @@ class TimelinePanel(QWidget):
         if source_span <= 1e-6:
             return None
         return in_point, in_point + source_span, speed
+
+    def _waveform_range_chunk_specs(
+        self,
+        source: str,
+        *,
+        span_start: float,
+        span_end: float,
+        request_start: float,
+        request_end: float,
+        num_peaks: int,
+    ) -> list[tuple[tuple[str, int, int, int], float, float]]:
+        chunk_seconds = max(1.0, float(MEDIA_CACHE_PROGRESSIVE_WAVE_RANGE_SECONDS))
+        span_start = max(0.0, float(span_start))
+        span_end = max(span_start, float(span_end))
+        request_start = max(span_start, min(span_end, float(request_start)))
+        request_end = max(request_start, min(span_end, float(request_end)))
+        if request_end <= request_start + 1e-6:
+            return []
+
+        first_chunk = max(0, int(math.floor((request_start - span_start) / chunk_seconds)))
+        last_chunk = max(
+            first_chunk,
+            int(math.floor((max(request_start, request_end - 1e-6) - span_start) / chunk_seconds)),
+        )
+        specs: list[tuple[tuple[str, int, int, int], float, float]] = []
+        for chunk_idx in range(first_chunk, last_chunk + 1):
+            chunk_start = span_start + float(chunk_idx) * chunk_seconds
+            chunk_end = min(span_end, chunk_start + chunk_seconds)
+            duration = max(0.0, chunk_end - chunk_start)
+            if duration <= 1e-6:
+                continue
+            key = self._range_peaks_key_from_source(
+                source,
+                chunk_start,
+                duration,
+                int(num_peaks),
+            )
+            specs.append((key, chunk_start, duration))
+        return specs
 
     def _enqueue_progressive_media_cache_for_clip(self, clip: Clip) -> None:
         if not isinstance(clip, Clip):
@@ -5343,18 +5503,29 @@ class TimelinePanel(QWidget):
                 pass
 
         if range_basis_duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
-            range_seconds = max(1.0, MEDIA_CACHE_PROGRESSIVE_WAVE_RANGE_SECONDS)
-            range_start = source_start
-            while range_start < source_end - 1e-6:
-                range_end = min(source_end, range_start + range_seconds)
-                range_duration = max(0.0, range_end - range_start)
-                if range_duration > 1e-6:
-                    key = self._range_peaks_key_from_source(
-                        source,
-                        range_start,
-                        range_duration,
-                        WAVEFORM_PEAKS_FAST,
-                    )
+            peak_counts = (WAVEFORM_PEAKS_FAST, WAVEFORM_PEAKS_RESOLUTION)
+            for num_peaks in peak_counts:
+                chunk_specs = self._waveform_range_chunk_specs(
+                    source,
+                    span_start=source_start,
+                    span_end=source_end,
+                    request_start=source_start,
+                    request_end=source_end,
+                    num_peaks=num_peaks,
+                )
+                if bool(getattr(clip, "reverse", False)):
+                    chunk_specs = list(reversed(chunk_specs))
+                for key, range_start, range_duration in chunk_specs:
+                    if bool(getattr(clip, "reverse", False)):
+                        timeline_start = float(clip.start) + max(
+                            0.0,
+                            (source_end - (range_start + range_duration)) / max(1e-6, speed),
+                        )
+                    else:
+                        timeline_start = float(clip.start) + max(
+                            0.0,
+                            (range_start - source_start) / max(1e-6, speed),
+                        )
                     self._enqueue_progressive_media_cache_task(
                         (
                             "wave_range",
@@ -5362,14 +5533,34 @@ class TimelinePanel(QWidget):
                             source,
                             float(range_start),
                             float(range_duration),
-                            WAVEFORM_PEAKS_FAST,
+                            int(num_peaks),
+                            (
+                                "priority",
+                                timeline_start,
+                                0 if num_peaks == WAVEFORM_PEAKS_FAST else 1,
+                            ),
                         )
                     )
-                range_start = range_end
         else:
             key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
             self._enqueue_progressive_media_cache_task(
-                ("wave", key, source, WAVEFORM_PEAKS_FAST)
+                (
+                    "wave",
+                    key,
+                    source,
+                    WAVEFORM_PEAKS_FAST,
+                    ("priority", float(clip.start), 0),
+                )
+            )
+            hi_key = self._peaks_key(clip, WAVEFORM_PEAKS_RESOLUTION)
+            self._enqueue_progressive_media_cache_task(
+                (
+                    "wave",
+                    hi_key,
+                    source,
+                    WAVEFORM_PEAKS_RESOLUTION,
+                    ("priority", float(clip.start), 1),
+                )
             )
 
         if is_audio or not TIMELINE_USE_TILED_FILMSTRIP:
@@ -5416,6 +5607,7 @@ class TimelinePanel(QWidget):
         for item in items:
             self._enqueue_progressive_media_cache_for_clip(item.clip)
         if len(self._progressive_media_cache_tasks) > before:
+            self._sort_progressive_media_cache_tasks()
             self._schedule_progressive_media_cache()
 
     def _submit_progressive_media_cache_task(self, task: tuple) -> bool:
@@ -5526,21 +5718,25 @@ class TimelinePanel(QWidget):
         is_long = duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS
         if is_long:
             window = self._clip_visible_source_window(clip)
-            if window is not None:
+            span = self._clip_source_time_span(clip)
+            if window is not None and span is not None:
                 source_start, source_end, _, _ = window
-                range_key = self._range_peaks_key_from_source(
+                span_start, span_end, _ = span
+                for range_key, chunk_start, chunk_duration in self._waveform_range_chunk_specs(
                     source,
-                    source_start,
-                    source_end - source_start,
-                    WAVEFORM_PEAKS_FAST,
-                )
-                self._submit_waveform_range_extract(
-                    range_key,
-                    source,
-                    start=source_start,
-                    duration=source_end - source_start,
+                    span_start=span_start,
+                    span_end=span_end,
+                    request_start=source_start,
+                    request_end=source_end,
                     num_peaks=WAVEFORM_PEAKS_FAST,
-                )
+                ):
+                    self._submit_waveform_range_extract(
+                        range_key,
+                        source,
+                        start=chunk_start,
+                        duration=chunk_duration,
+                        num_peaks=WAVEFORM_PEAKS_FAST,
+                    )
         else:
             fast_key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
             self._submit_waveform_extract(
@@ -5689,6 +5885,7 @@ class TimelinePanel(QWidget):
         for clip in progressive_clips:
             self._enqueue_progressive_media_cache_for_clip(clip)
         if len(self._progressive_media_cache_tasks) > before:
+            self._sort_progressive_media_cache_tasks()
             self._schedule_progressive_media_cache()
 
     def _update_clip_items_for_cache_key(
