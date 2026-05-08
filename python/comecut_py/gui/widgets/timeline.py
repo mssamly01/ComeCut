@@ -4582,6 +4582,7 @@ class TimelinePanel(QWidget):
         self._wave_upgrade_pending.clear()
         self._progressive_media_cache_tasks.clear()
         self._progressive_media_cache_task_keys.clear()
+        self._wave_source_duration_cache.clear()
 
     @staticmethod
     def _filmstrip_key(
@@ -5124,7 +5125,16 @@ class TimelinePanel(QWidget):
             )
         except Exception:
             duration = 0.0
-        if duration < LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
+        range_basis_duration = duration
+        if media_kind == "video":
+            try:
+                range_basis_duration = max(
+                    range_basis_duration,
+                    float(self._waveform_source_duration_seconds(clip) or 0.0),
+                )
+            except Exception:
+                pass
+        if range_basis_duration < LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
             return None
         window = self._clip_visible_source_window(clip)
         if window is None:
@@ -5322,7 +5332,17 @@ class TimelinePanel(QWidget):
 
         ext = Path(source).suffix.lower()
         is_audio = ext in AUDIO_EXTS
-        if source_duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
+        range_basis_duration = source_duration
+        if not is_audio:
+            try:
+                range_basis_duration = max(
+                    range_basis_duration,
+                    float(self._waveform_source_duration_seconds(clip) or 0.0),
+                )
+            except Exception:
+                pass
+
+        if range_basis_duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
             range_seconds = max(1.0, MEDIA_CACHE_PROGRESSIVE_WAVE_RANGE_SECONDS)
             range_start = source_start
             while range_start < source_end - 1e-6:

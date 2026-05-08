@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (  # type: ignore
 )
 
 from ...engine.audio_levels import AudioLevelStats, analyze_audio_levels, audio_clipping_warning
+from ...engine.thumbnails import DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH, chunk_path
 
 try:
     from PySide6.QtSvg import QSvgRenderer  # type: ignore
@@ -46,6 +47,7 @@ ICON_ACTIVE = "#22d3c5"
 PREVIEW_PLAY_SEEK_INTERVAL_MS = 45
 PREVIEW_SCRUB_SEEK_INTERVAL_MS = 70
 PREVIEW_METER_WINDOW_SECONDS = 12.0
+_POSTER_FILMSTRIP_SAMPLES_PER_SECOND = (1, 2, 4)
 
 _SYMBOL_RE = re.compile(
     r'<symbol\s+id="(?P<id>[^"]+)"(?P<attrs>[^>]*)>(?P<body>.*?)</symbol>',
@@ -65,6 +67,44 @@ def _fit_rect(outer: QRect, inner_w: int, inner_h: int) -> QRect:
     draw_x = outer.left() + (outer.width() - draw_w) // 2
     draw_y = outer.top() + (outer.height() - draw_h) // 2
     return QRect(draw_x, draw_y, draw_w, draw_h)
+
+
+def _load_paintable_image(path: Path | str) -> QImage | None:
+    try:
+        image = QImage(str(path))
+    except Exception:
+        return None
+    if image.isNull():
+        return None
+    return image.convertToFormat(QImage.Format.Format_RGB32).copy()
+
+
+def _load_cached_filmstrip_first_tile(source: Path | str) -> QImage | None:
+    for samples_per_second in _POSTER_FILMSTRIP_SAMPLES_PER_SECOND:
+        try:
+            path = chunk_path(
+                source,
+                0,
+                tile_width=DEFAULT_TILE_WIDTH,
+                tile_height=DEFAULT_TILE_HEIGHT,
+                samples_per_second=samples_per_second,
+            )
+        except Exception:
+            continue
+        try:
+            if not path.exists() or path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        image = _load_paintable_image(path)
+        if image is None:
+            continue
+        tile_w = min(int(DEFAULT_TILE_WIDTH), image.width())
+        tile_h = min(int(DEFAULT_TILE_HEIGHT), image.height())
+        if tile_w <= 0 or tile_h <= 0:
+            continue
+        return image.copy(0, 0, tile_w, tile_h)
+    return None
 
 
 def compute_preview_rects(
@@ -166,6 +206,7 @@ class _VideoCanvas(QWidget):
 
         self._current_frame: QVideoFrame | None = None
         self._current_image: QImage | None = None
+        self._poster_image: QImage | None = None
         self._subtitle_main: str = ""
         self._subtitle_second: str = ""
         self._subtitle_pos_x: int | None = None
@@ -189,7 +230,26 @@ class _VideoCanvas(QWidget):
 
     def _on_frame(self, frame: QVideoFrame) -> None:
         self._current_frame = frame
-        self._current_image = None  # invalidate cached image
+        self._current_image = None
+        if frame.isValid():
+            try:
+                img = frame.toImage()
+                if not img.isNull():
+                    self._current_image = (
+                        img.convertToFormat(QImage.Format.Format_RGB32).copy()
+                    )
+                    self._poster_image = None
+            except Exception:
+                self._current_image = None
+        self.update()
+
+    def set_poster_image(self, image: QImage | None) -> None:
+        self._current_frame = None
+        self._current_image = None
+        if image is not None and not image.isNull():
+            self._poster_image = image.convertToFormat(QImage.Format.Format_RGB32).copy()
+        else:
+            self._poster_image = None
         self.update()
 
     def set_subtitle(self, main: str, second: str) -> None:
@@ -247,6 +307,7 @@ class _VideoCanvas(QWidget):
     def clear_frame(self) -> None:
         self._current_frame = None
         self._current_image = None
+        self._poster_image = None
         self._subtitle_main = ""
         self._subtitle_second = ""
         self.update()
@@ -312,17 +373,17 @@ class _VideoCanvas(QWidget):
 
     def _get_image(self) -> QImage | None:
         if self._current_frame is None:
-            return None
+            return self._poster_image
         if self._current_image is not None:
             return self._current_image
         frame = self._current_frame
         if not frame.isValid():
-            return None
+            return self._poster_image
         img = frame.toImage()
         if img.isNull():
-            return None
+            return self._poster_image
         # Convert to a format QPainter handles well
-        self._current_image = img.convertToFormat(QImage.Format.Format_RGB32)
+        self._current_image = img.convertToFormat(QImage.Format.Format_RGB32).copy()
         return self._current_image
 
     def _draw_canvas_guides(self, painter: QPainter) -> None:
@@ -1327,7 +1388,13 @@ class PreviewPanel(QWidget):
 
     # ---- playback control ----
 
-    def load(self, path: Path | str) -> None:
+    def load(
+        self,
+        path: Path | str,
+        *,
+        poster_path: Path | str | None = None,
+        poster_source_path: Path | str | tuple[Path | str, ...] | None = None,
+    ) -> None:
         self._cancel_prime_frame(keep_playing=False)
         if self._seek_flush.isActive():
             self._seek_flush.stop()
@@ -1339,10 +1406,46 @@ class PreviewPanel(QWidget):
         self._duration_ms = 0
         self._media_source_path = str(path)
         self._clear_meter_status()
+        self.set_cached_poster_frame(
+            poster_path=poster_path,
+            source_path=poster_source_path or path,
+            clear_existing=True,
+        )
         self._player.pause()
         self._player.setSource(QUrl.fromLocalFile(str(path)))
-        self.seek(0)
         self._sync_play_icon()
+
+    def set_cached_poster_frame(
+        self,
+        *,
+        poster_path: Path | str | None = None,
+        source_path: Path | str | tuple[Path | str, ...] | None = None,
+        clear_existing: bool = False,
+    ) -> bool:
+        image: QImage | None = None
+        if poster_path is not None:
+            try:
+                path_obj = Path(poster_path)
+                if path_obj.exists() and path_obj.stat().st_size > 0:
+                    image = _load_paintable_image(path_obj)
+            except OSError:
+                image = None
+        if image is None and source_path is not None:
+            source_paths: tuple[Path | str, ...]
+            if isinstance(source_path, tuple):
+                source_paths = source_path
+            else:
+                source_paths = (source_path,)
+            for candidate in source_paths:
+                image = _load_cached_filmstrip_first_tile(candidate)
+                if image is not None:
+                    break
+        if image is None:
+            if clear_existing:
+                self._video.set_poster_image(None)
+            return False
+        self._video.set_poster_image(image)
+        return True
 
     def clear(self) -> None:
         self._cancel_prime_frame(keep_playing=False)
@@ -1951,7 +2054,7 @@ class PreviewPanel(QWidget):
             return
         ms = self._seek_on_load_ms
         self._seek_on_load_ms = None
-        self.seek(ms)
+        self.force_seek(ms)
         self._start_prime_frame(ms)
 
     def _start_prime_frame(self, ms: int) -> None:
@@ -1987,7 +2090,7 @@ class PreviewPanel(QWidget):
         self._cancel_prime_frame(keep_playing=False)
         if ms is None:
             return
-        self.seek(ms)
+        self.force_seek(ms)
 
     def _on_position(self, pos: int) -> None:
         self._last_seek_ms = int(pos)

@@ -123,9 +123,9 @@ class _VoiceMatchWorker(QThread):
 
     def run(self) -> None:
         try:
-            from ..integrations.capcut_generator.adapter import generate_voice_match_from_timeline
+            from ..integrations.capcut_generator.adapter import generate_voice_match_project_from_timeline
 
-            result = generate_voice_match_from_timeline(
+            result = generate_voice_match_project_from_timeline(
                 self.options,  # type: ignore[arg-type]
                 progress_callback=lambda percent, message: self.progress.emit(
                     int(percent),
@@ -815,12 +815,24 @@ class MainWindow(QMainWindow):
         self.timeline_panel.set_playing_state(True)
         self._start_timeline_playback_at(next_time)
 
-    def _set_preview_source(self, path: Path | str, *, force: bool = False) -> None:
+    def _set_preview_source(
+        self,
+        path: Path | str,
+        *,
+        force: bool = False,
+        poster_path: Path | str | None = None,
+        poster_source_path: Path | str | tuple[Path | str, ...] | None = None,
+    ) -> bool:
         path_str = str(path)
         if not force and self._preview_source_path == path_str:
-            return
-        self.preview_panel.load(path)
+            return False
+        self.preview_panel.load(
+            path,
+            poster_path=poster_path,
+            poster_source_path=poster_source_path,
+        )
         self._preview_source_path = path_str
+        return True
 
     def _timeline_duration_seconds(self) -> float:
         cached = self._timeline_duration_cache
@@ -1012,6 +1024,29 @@ class MainWindow(QMainWindow):
                 return proxy_path_obj
         return Path(clip.source)
 
+    def _clip_cached_poster_path(self, clip: Clip, preview_path: Path) -> Path | None:
+        candidates: list[Path | str] = [clip.source, preview_path]
+        proxy = str(getattr(clip, "proxy", "") or "").strip()
+        if proxy:
+            candidates.append(proxy)
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            info = self._cached_media_info_for_path(candidate)
+            thumb = getattr(info, "thumbnail_path", None) if info is not None else None
+            if not thumb:
+                continue
+            thumb_path = Path(str(thumb))
+            try:
+                if thumb_path.exists() and thumb_path.stat().st_size > 0:
+                    return thumb_path
+            except OSError:
+                continue
+        return None
+
     def _source_has_audio_stream(self, path: Path) -> bool:
         ext = path.suffix.lower()
         if ext in self._AUDIO_EXTS:
@@ -1041,7 +1076,14 @@ class MainWindow(QMainWindow):
 
     def _set_preview_source_for_clip(self, clip: Clip, *, force: bool = False) -> None:
         self._preview_active_media_clip = clip
-        self._set_preview_source(self._clip_preview_path(clip), force=force)
+        preview_path = self._clip_preview_path(clip)
+        poster_source_paths: tuple[Path | str, ...] = (preview_path, clip.source)
+        self._set_preview_source(
+            preview_path,
+            force=force,
+            poster_path=self._clip_cached_poster_path(clip, preview_path),
+            poster_source_path=poster_source_paths,
+        )
         self.preview_panel.set_playback_rate(float(getattr(clip, "speed", 1.0) or 1.0))
 
     def _play_preview_clip_at(self, clip: Clip, timeline_seconds: float) -> None:
@@ -2122,17 +2164,11 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_voice_match_worker_succeeded(self, path_obj: object) -> None:
-        from ..core.capcut_importer import import_capcut_draft
-
-        path = Path(path_obj)
+        path = Path(getattr(path_obj, "output_json_path", path_obj))
         try:
-            if self._voice_match_original_project is None:
-                raise RuntimeError("Thiếu snapshot ban đầu để áp dụng khớp voice.")
-            matched_project = import_capcut_draft(path)
-            matched_snapshot = self._build_direct_main_matched_project(
-                original=self._voice_match_original_project,
-                matched=matched_project,
-            )
+            matched_snapshot = getattr(path_obj, "project", None)
+            if matched_snapshot is None:
+                raise RuntimeError("Khớp voice không trả về project ComeCut đã tích hợp.")
         except Exception as exc:
             self._on_voice_match_worker_failed(str(exc))
             return
@@ -2155,157 +2191,6 @@ class MainWindow(QMainWindow):
         self.voice_match_panel.append_log(text)
         self._voice_match_worker = None
         QMessageBox.warning(self, "Không thể khớp voice", text)
-
-    @staticmethod
-    def _main_video_track_for_project(project: Project) -> Track | None:
-        for track in project.tracks:
-            if (
-                track.kind == "video"
-                and track.name.strip().lower() == "main"
-                and not bool(getattr(track, "hidden", False))
-            ):
-                return track
-        return next(
-            (
-                track
-                for track in project.tracks
-                if track.kind == "video" and not bool(getattr(track, "hidden", False))
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _first_visible_video_track(project: Project) -> Track | None:
-        return next(
-            (
-                track
-                for track in project.tracks
-                if track.kind == "video"
-                and track.clips
-                and not bool(getattr(track, "hidden", False))
-            ),
-            None,
-        )
-
-    @staticmethod
-    def _matched_tracks_for_kind(matched: Project, kind: str, default_name: str) -> list[Track]:
-        tracks: list[Track] = []
-        for track in matched.tracks:
-            if track.kind != kind or not track.clips:
-                continue
-            copied = track.model_copy(deep=True)
-            if not copied.name.strip():
-                index = len(tracks) + 1
-                copied.name = default_name if index == 1 else f"{default_name} {index}"
-            tracks.append(copied)
-        return tracks
-
-    @staticmethod
-    def _copy_matched_main_video_clips(
-        matched_video_track: Track,
-        original_main_track: Track | None = None,
-    ) -> list[Clip]:
-        def _source_key(source: object) -> str:
-            raw = str(source or "").strip()
-            if not raw:
-                return ""
-            try:
-                return str(Path(raw).resolve()).lower()
-            except Exception:
-                return raw.lower()
-
-        original_volume_by_source: dict[str, float] = {}
-        if original_main_track is not None:
-            for original_clip in original_main_track.clips:
-                if bool(getattr(original_clip, "is_text_clip", False)):
-                    continue
-                key = _source_key(getattr(original_clip, "source", ""))
-                if not key or key in original_volume_by_source:
-                    continue
-                try:
-                    original_volume_by_source[key] = max(0.0, float(original_clip.volume))
-                except Exception:
-                    original_volume_by_source[key] = 1.0
-
-        clips: list[Clip] = []
-        for clip in matched_video_track.clips:
-            copied = clip.model_copy(deep=True)
-            # Voice match cuts/speeds video into segments. Keep source audio embedded
-            # in each Main segment, but remove generated fade/gain automation at edges.
-            source_key = _source_key(getattr(copied, "source", ""))
-            if source_key in original_volume_by_source:
-                copied.volume = original_volume_by_source[source_key]
-            copied.volume_keyframes = []
-            copied.audio_effects.fade_in = 0.0
-            copied.audio_effects.fade_out = 0.0
-            clips.append(copied)
-        return clips
-
-    @staticmethod
-    def _build_direct_main_matched_project(original: Project, matched: Project) -> Project:
-        result = original.model_copy(deep=True)
-        result_main = MainWindow._main_video_track_for_project(result)
-        matched_video_track = MainWindow._first_visible_video_track(matched)
-        if result_main is None or matched_video_track is None:
-            raise ValueError("Không tìm thấy track Main hoặc track video đã khớp.")
-
-        result_main.name = "Main"
-        original_main_track = MainWindow._main_video_track_for_project(original)
-        result_main.clips = MainWindow._copy_matched_main_video_clips(
-            matched_video_track,
-            original_main_track,
-        )
-        result_main.transitions = [
-            transition.model_copy(deep=True)
-            for transition in getattr(matched_video_track, "transitions", [])
-        ]
-        matched_text_tracks = MainWindow._matched_tracks_for_kind(
-            matched,
-            "text",
-            "Khớp voice - Text",
-        )
-        matched_audio_tracks = MainWindow._matched_tracks_for_kind(
-            matched,
-            "audio",
-            "Khớp voice - Voice",
-        )
-        if not matched_text_tracks and not matched_audio_tracks:
-            return result
-
-        rebuilt_tracks: list[Track] = []
-        inserted_text = False
-        inserted_audio = False
-        for track in result.tracks:
-            if matched_text_tracks and track.kind == "text":
-                if not inserted_text:
-                    rebuilt_tracks.extend([tr.model_copy(deep=True) for tr in matched_text_tracks])
-                    inserted_text = True
-                continue
-            if matched_audio_tracks and track.kind == "audio":
-                if not inserted_audio:
-                    rebuilt_tracks.extend([tr.model_copy(deep=True) for tr in matched_audio_tracks])
-                    inserted_audio = True
-                continue
-            rebuilt_tracks.append(track)
-
-        if matched_text_tracks and not inserted_text:
-            main_idx = next(
-                (idx for idx, track in enumerate(rebuilt_tracks) if track is result_main),
-                len(rebuilt_tracks),
-            )
-            for track in reversed(matched_text_tracks):
-                rebuilt_tracks.insert(main_idx, track.model_copy(deep=True))
-        if matched_audio_tracks and not inserted_audio:
-            main_idx = next(
-                (idx for idx, track in enumerate(rebuilt_tracks) if track is result_main),
-                len(rebuilt_tracks) - 1,
-            )
-            insert_idx = max(0, main_idx + 1)
-            for offset, track in enumerate(matched_audio_tracks):
-                rebuilt_tracks.insert(insert_idx + offset, track.model_copy(deep=True))
-
-        result.tracks = rebuilt_tracks
-        return result
 
     def _apply_voice_match_project_snapshot(self, snapshot: Project, view_state: str) -> None:
         self._stop_preview_playback()

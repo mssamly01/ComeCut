@@ -9,7 +9,9 @@ import pytest
 from comecut_py.core.project import Clip, Keyframe, Project, Track
 from comecut_py.integrations.capcut_generator.adapter import (
     TimelineVoiceMatchOptions,
+    build_direct_main_voice_match_project,
     generate_voice_match_from_timeline,
+    generate_voice_match_project_from_timeline,
     prepare_timeline_voice_match_inputs,
 )
 
@@ -195,6 +197,87 @@ def test_generate_voice_match_uses_comecut_media_probe(
     assert ("probe", "voice.mp3") in calls
 
 
+def test_generate_voice_match_project_from_timeline_imports_and_integrates_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from comecut_py.integrations.capcut_generator import adapter as adapter_mod
+
+    output_path = tmp_path / "matched.json"
+    original = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Main",
+                clips=[Clip(source="main.mp4", start=0.0, in_point=0.0, out_point=5.0, volume=0.4)],
+            ),
+            Track(kind="audio", name="Old Voice", clips=[Clip(source="old.mp3", out_point=1.0)]),
+            Track(
+                kind="text",
+                name="Old Text",
+                clips=[Clip(clip_type="text", source="", out_point=1.0, text_main="old")],
+            ),
+        ],
+    )
+    matched = Project(
+        tracks=[
+            Track(
+                kind="video",
+                name="Matched Video",
+                clips=[Clip(source="main.mp4", start=1.0, in_point=2.0, out_point=3.0, speed=1.1)],
+            ),
+            Track(
+                kind="audio",
+                name="Matched Voice",
+                clips=[Clip(source="voice.mp3", start=1.25, in_point=0.0, out_point=0.75)],
+            ),
+            Track(
+                kind="text",
+                name="Matched Text",
+                clips=[
+                    Clip(
+                        clip_type="text",
+                        source="",
+                        start=1.25,
+                        in_point=0.0,
+                        out_point=0.75,
+                        text_main="matched",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    def _fake_generate(options: TimelineVoiceMatchOptions, progress_callback=None) -> Path:
+        assert options.output_json_path == output_path
+        return output_path
+
+    monkeypatch.setattr(adapter_mod, "generate_voice_match_from_timeline", _fake_generate)
+    monkeypatch.setattr(adapter_mod, "import_capcut_draft", lambda path: matched)
+
+    result = generate_voice_match_project_from_timeline(
+        TimelineVoiceMatchOptions(
+            project=original,
+            output_json_path=output_path,
+            work_dir=tmp_path / "work",
+        )
+    )
+
+    main = next(track for track in result.project.tracks if track.kind == "video" and track.name == "Main")
+    voice = next(track for track in result.project.tracks if track.kind == "audio")
+    text = next(track for track in result.project.tracks if track.kind == "text")
+
+    assert result.output_json_path == output_path
+    assert [track.name for track in result.project.tracks] == ["Main", "Matched Voice", "Matched Text"]
+    assert main.clips[0].source == "main.mp4"
+    assert main.clips[0].speed == 1.1
+    assert main.clips[0].volume == 0.4
+    assert voice.clips[0].linked_parent_id == main.clips[0].clip_id
+    assert text.clips[0].linked_parent_id == main.clips[0].clip_id
+    assert voice.clips[0].linked_offset == pytest.approx(0.25)
+    assert text.clips[0].text_main == "matched"
+
+
 def test_voice_match_panel_has_no_source_picker_fields() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
@@ -248,9 +331,6 @@ def test_set_left_tab_voice_match_uses_side_stack_index_2() -> None:
 
 
 def test_direct_main_voice_match_replaces_main_without_compare_track() -> None:
-    pytest.importorskip("PySide6")
-    from comecut_py.gui.main_window import MainWindow
-
     original = Project(
         tracks=[
             Track(
@@ -332,8 +412,11 @@ def test_direct_main_voice_match_replaces_main_without_compare_track() -> None:
         ],
     )
 
-    result = MainWindow._build_direct_main_matched_project(original, matched)
-    result_main = MainWindow._main_video_track_for_project(result)
+    result = build_direct_main_voice_match_project(original, matched)
+    result_main = next(
+        (track for track in result.tracks if track.kind == "video" and track.name == "Main"),
+        None,
+    )
     result_text = next(track for track in result.tracks if track.kind == "text")
     result_audio = next(track for track in result.tracks if track.kind == "audio")
 
@@ -348,6 +431,13 @@ def test_direct_main_voice_match_replaces_main_without_compare_track() -> None:
     assert result_text.clips[0].start == 2.25
     assert result_text.clips[0].text_main == "matched subtitle"
     assert result_audio.clips[0].start == 2.25
+    parent = result_main.clips[1]
+    assert result_text.clips[0].linked_parent_id == parent.clip_id
+    assert result_audio.clips[0].linked_parent_id == parent.clip_id
+    assert result_text.clips[0].link_group_id == parent.link_group_id
+    assert result_audio.clips[0].link_group_id == parent.link_group_id
+    assert result_text.clips[0].linked_offset == pytest.approx(0.25)
+    assert result_audio.clips[0].linked_offset == pytest.approx(0.25)
     assert original.tracks[0].clips[0].source == "original.mp4"
     assert len(original.tracks[0].clips) == 1
 

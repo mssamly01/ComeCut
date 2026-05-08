@@ -321,3 +321,45 @@ def test_prewarm_long_video_limits_to_visible_cache_window(
     assert range_waveform_requests == [(0.0, 120.0, 256)]
     assert chunk_requests == [0, 1]
     panel.deleteLater()
+
+
+def test_short_segment_of_long_video_uses_range_waveform(
+    timeline_app,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from comecut_py.gui.widgets.timeline import TimelinePanel
+
+    source = tmp_path / "long.mp4"
+    source.write_bytes(b"video")
+    visible_clip = Clip(source=str(source), start=0.0, in_point=0.0, out_point=2.0)
+    later_clip = Clip(source=str(source), start=10.0, in_point=3600.0, out_point=3602.0)
+    project = Project(tracks=[Track(kind="video", name="Main", clips=[visible_clip, later_clip])])
+    panel = TimelinePanel(project)
+    panel.resize(1000, 500)
+    monkeypatch.setattr(panel, "_visible_timeline_seconds", lambda: (0.0, 2.0))
+
+    full_waveform_requests: list[object] = []
+    range_waveform_requests: list[tuple[float, float, int]] = []
+    monkeypatch.setattr(
+        panel,
+        "_submit_waveform_extract",
+        lambda key, source, num_peaks: full_waveform_requests.append(key),
+    )
+
+    def fake_submit_range(key, source, *, start, duration, num_peaks):
+        del key, source
+        range_waveform_requests.append((float(start), float(duration), int(num_peaks)))
+
+    monkeypatch.setattr(panel, "_submit_waveform_range_extract", fake_submit_range)
+
+    peaks = panel.request_visible_waveform_peaks_async(
+        visible_clip,
+        num_peaks=256,
+        media_kind="video",
+    )
+
+    assert peaks is None
+    assert full_waveform_requests == []
+    assert range_waveform_requests == [(0.0, 2.0, 256)]
+    panel.deleteLater()
