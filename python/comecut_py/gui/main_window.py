@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self._gap_play_last_full_sync_ts = 0.0
         self._video_clock_last_resync_ts = 0.0
         self._scrub_finish_generation = 0
+        self._timeline_preview_prime_generation = 0
         self._proxy_ready.connect(self._on_proxy_ready)
         self._audio_proxy_ready.connect(self._on_audio_proxy_ready)
         self._timeline_audio_mix_ready.connect(self._on_timeline_audio_mix_ready)
@@ -1190,6 +1191,10 @@ class MainWindow(QMainWindow):
             self._preview_active_media_clip is video_clip
             and self._preview_source_path == preview_path_s
         )
+        try:
+            player_has_source = bool(self.preview_panel.main_player_has_source())
+        except Exception:
+            player_has_source = bool(self._preview_source_path)
 
         if playing:
             if not same_clip or force_seek or not self.preview_panel.main_player_is_playing():
@@ -1219,7 +1224,10 @@ class MainWindow(QMainWindow):
         self._preview_active_media_clip = video_clip
         if not same_clip or force_seek:
             self._subtitle_overlay_state = None
-        self._set_preview_source_for_clip(video_clip)
+        self._set_preview_source_for_clip(
+            video_clip,
+            force=bool(force_seek and not player_has_source),
+        )
         self.preview_panel.seek(source_ms, throttle=throttle_preview)
         self.preview_panel.pause()
 
@@ -1751,6 +1759,38 @@ class MainWindow(QMainWindow):
             sync_caption_scroll=not is_user_scrub,
         )
 
+    def _schedule_timeline_preview_prime(self, seconds: float) -> None:
+        self._timeline_preview_prime_generation += 1
+        generation = int(self._timeline_preview_prime_generation)
+        target_seconds = float(seconds)
+
+        def _prime() -> None:
+            if generation != int(self._timeline_preview_prime_generation):
+                return
+            if self._preview_sync_mode != "timeline":
+                return
+            if bool(getattr(self.timeline_panel, "_is_playing", False)):
+                return
+            try:
+                if self.timeline_panel.is_playhead_scrubbing():
+                    return
+            except Exception:
+                pass
+            current = self._clamp_timeline_seconds(
+                float(getattr(self.timeline_panel, "_playhead_seconds", target_seconds))
+            )
+            self._sync_preview_for_timeline_clock(
+                current,
+                playing=False,
+                force_seek=True,
+                throttle_preview=False,
+                sync_selection=False,
+                sync_caption_scroll=False,
+            )
+
+        QTimer.singleShot(0, _prime)
+        QTimer.singleShot(180, _prime)
+
     def _schedule_scrub_finish_sync(self, seconds: float) -> None:
         self._scrub_finish_generation += 1
         generation = self._scrub_finish_generation
@@ -1869,6 +1909,8 @@ class MainWindow(QMainWindow):
 
         current = self.inspector_panel.current_clip()
         if current is active_clip:
+            return
+        if isinstance(current, Clip) and not bool(getattr(current, "is_text_clip", False)):
             return
 
         try:
@@ -2288,7 +2330,7 @@ class MainWindow(QMainWindow):
         current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
         seek_to = min(max(0.0, current), max(0.0, self.project.duration))
         self.timeline_panel.set_playhead(seek_to)
-        self._on_timeline_seek(seek_to)
+        self._schedule_timeline_preview_prime(seek_to)
         self._refresh_auto_speed_issue_overlays()
         self._reset_timeline_history()
 
@@ -2527,6 +2569,8 @@ class MainWindow(QMainWindow):
                 current_seconds,
                 playing=is_playing,
                 force_seek=not is_playing,
+                sync_selection=False,
+                sync_caption_scroll=False,
             )
         if clip is not None:
             try:
@@ -4490,7 +4534,10 @@ class MainWindow(QMainWindow):
         all_clips = [clip for track in self.project.tracks for clip in track.clips]
         self._schedule_timeline_cache_prewarm(all_clips)
         self._preview_sync_mode = "timeline"
-        self._on_timeline_seek(float(getattr(self.timeline_panel, "_playhead_seconds", 0.0)))
+        current = float(getattr(self.timeline_panel, "_playhead_seconds", 0.0))
+        seek_to = min(max(0.0, current), max(0.0, self.project.duration))
+        self.timeline_panel.set_playhead(seek_to)
+        self._schedule_timeline_preview_prime(seek_to)
         
         # Repopulate library panels with missing state awareness
         self.media_panel.set_imported_entries(

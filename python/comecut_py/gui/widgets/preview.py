@@ -1527,6 +1527,9 @@ class PreviewPanel(QWidget):
     def main_player_is_playing(self) -> bool:
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
+    def main_player_has_source(self) -> bool:
+        return not self._player.source().isEmpty()
+
     def main_player_position_ms(self) -> int:
         return int(self._player.position())
 

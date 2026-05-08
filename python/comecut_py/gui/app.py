@@ -144,6 +144,10 @@ def run() -> int:
         "qt.multimedia.ffmpeg*=false;*.debug=false",
     )
     os.environ.setdefault("QT_FFMPEG_DEBUG", "0")
+    # ComeCut paints QVideoFrame via toImage(); GPU-backed D3D11 frames can stay
+    # black or destabilize Qt Multimedia on long timelines. Force CPU frames.
+    os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", ",")
+    os.environ.setdefault("QT_DISABLE_HW_TEXTURES_CONVERSION", "1")
     try:
         from PySide6.QtWidgets import QApplication  # type: ignore
     except ImportError as e:  # pragma: no cover
