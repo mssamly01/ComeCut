@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import math
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -126,6 +127,10 @@ SCRUB_PLAYHEAD_REFRESH_INTERVAL_MS = 80
 LONG_MEDIA_CACHE_THRESHOLD_SECONDS = 30.0
 VISIBLE_CACHE_PREFETCH_VIEWPORTS = 1.0
 MEDIA_CACHE_IDLE_DELAY_MS = 250
+MEDIA_CACHE_PROGRESSIVE_DELAY_MS = 350
+MEDIA_CACHE_PROGRESSIVE_BATCH_SIZE = 4
+MEDIA_CACHE_PROGRESSIVE_WAVE_RANGE_SECONDS = 300.0
+MAX_PROGRESSIVE_WAVEFORM_INFLIGHT = 4
 MAX_FILMSTRIP_CHUNKS_INFLIGHT = 64
 MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE = 8
 MAX_THUMB_PATH_CACHE_ITEMS = 512
@@ -2719,6 +2724,8 @@ class TimelinePanel(QWidget):
         self._wave_range_peaks_inflight: set[tuple[str, int, int, int]] = set()
         self._wave_upgrade_pending: set[tuple[str, int, int]] = set()
         self._wave_source_duration_cache: dict[str, float] = {}
+        self._progressive_media_cache_tasks: deque[tuple] = deque()
+        self._progressive_media_cache_task_keys: set[tuple] = set()
         self._media_cache_generation = 0
         self._media_cache_idle_timer = QTimer(self)
         self._media_cache_idle_timer.setSingleShot(True)
@@ -2837,6 +2844,17 @@ class TimelinePanel(QWidget):
         except RuntimeError:
             return
 
+    def _schedule_progressive_media_cache(self) -> None:
+        if not self._progressive_media_cache_tasks:
+            return
+        if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            return
+        try:
+            if not self._media_cache_idle_timer.isActive():
+                self._media_cache_idle_timer.start(MEDIA_CACHE_PROGRESSIVE_DELAY_MS)
+        except RuntimeError:
+            return
+
     def _on_media_cache_idle(self) -> None:
         if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
             self._bump_media_cache_idle()
@@ -2852,6 +2870,7 @@ class TimelinePanel(QWidget):
             item.update()
         if visible_items and hasattr(self, "_view"):
             self._view.viewport().update()
+        self._process_progressive_media_cache()
 
     def _build_transport(self) -> QWidget:
         bar = QWidget()
@@ -4414,6 +4433,7 @@ class TimelinePanel(QWidget):
         self._zoom_percent = value
         self._pixels_per_second = BASE_PIXELS_PER_SECOND * (value / 100.0)
         self.refresh()
+        self._enqueue_progressive_media_cache_from_items()
         if self._zoom_anchor_seconds is None or self._zoom_anchor_view_x is None:
             return
         anchor_scene_x = self.seconds_to_pixels(self._zoom_anchor_seconds)
@@ -4560,6 +4580,8 @@ class TimelinePanel(QWidget):
         self._wave_peaks_inflight.clear()
         self._wave_range_peaks_inflight.clear()
         self._wave_upgrade_pending.clear()
+        self._progressive_media_cache_tasks.clear()
+        self._progressive_media_cache_task_keys.clear()
 
     @staticmethod
     def _filmstrip_key(
@@ -4677,6 +4699,7 @@ class TimelinePanel(QWidget):
             MAX_THUMB_PATH_CACHE_ITEMS,
         )
         self._update_clip_items_for_cache_key(key_t, invalidate_filmstrip=False)
+        self._schedule_progressive_media_cache()
 
     def cached_strip_pixmap(self, path: Path) -> QPixmap | None:
         cache_key = str(path)
@@ -4818,6 +4841,7 @@ class TimelinePanel(QWidget):
             MAX_CHUNK_PIXMAP_CACHE_ITEMS,
         )
         self._update_clip_items_for_cache_key(key_t)
+        self._schedule_progressive_media_cache()
 
     @staticmethod
     def _peaks_key(clip: Clip, num_peaks: int) -> tuple[str, int, int]:
@@ -5137,6 +5161,7 @@ class TimelinePanel(QWidget):
                 MAX_WAVEFORM_RANGE_CACHE_ITEMS,
             )
             self._update_clip_items_for_cache_key(key_t)
+            self._schedule_progressive_media_cache()
             return
 
         self._wave_peaks_inflight.discard(key_t)
@@ -5157,6 +5182,7 @@ class TimelinePanel(QWidget):
         ):
             self._schedule_waveform_upgrade(key_t)
         self._update_clip_items_for_cache_key(key_t)
+        self._schedule_progressive_media_cache()
 
     def prewarm_media(self, paths: list[Path | str]) -> None:
         """Warm timeline filmstrip/waveform caches before media is dropped."""
@@ -5234,6 +5260,225 @@ class TimelinePanel(QWidget):
                     return
 
             self._thumb_executor.submit(_prewarm_video)
+
+    def _enqueue_progressive_media_cache_task(self, task: tuple) -> None:
+        if len(task) < 2:
+            return
+        task_key = (task[0], task[1])
+        if task_key in self._progressive_media_cache_task_keys:
+            return
+        self._progressive_media_cache_task_keys.add(task_key)
+        self._progressive_media_cache_tasks.append(task)
+
+    def _clip_source_time_span(self, clip: Clip) -> tuple[float, float, float] | None:
+        try:
+            timeline_dur = max(
+                0.0,
+                float(getattr(clip, "timeline_duration", 0.0) or 0.0),
+            )
+        except Exception:
+            timeline_dur = 0.0
+        try:
+            speed = max(1e-6, float(getattr(clip, "speed", 1.0) or 1.0))
+        except Exception:
+            speed = 1.0
+        try:
+            in_point = max(0.0, float(getattr(clip, "in_point", 0.0) or 0.0))
+        except Exception:
+            in_point = 0.0
+        try:
+            source_span = max(
+                0.0,
+                float(
+                    getattr(clip, "source_duration", 0.0)
+                    or timeline_dur * speed
+                    or 0.0
+                ),
+            )
+        except Exception:
+            source_span = 0.0
+        if source_span <= 1e-6:
+            return None
+        return in_point, in_point + source_span, speed
+
+    def _enqueue_progressive_media_cache_for_clip(self, clip: Clip) -> None:
+        if not isinstance(clip, Clip):
+            return
+        if bool(getattr(clip, "is_text_clip", False)):
+            return
+        source_raw = self._clip_decode_source(clip)
+        if not source_raw:
+            return
+        source = _resolved_source_str(source_raw)
+        if not source:
+            return
+        span = self._clip_source_time_span(clip)
+        if span is None:
+            return
+        source_start, source_end, speed = span
+        source_duration = max(0.0, source_end - source_start)
+        if source_duration <= 1e-6:
+            return
+
+        ext = Path(source).suffix.lower()
+        is_audio = ext in AUDIO_EXTS
+        if source_duration >= LONG_MEDIA_CACHE_THRESHOLD_SECONDS:
+            range_seconds = max(1.0, MEDIA_CACHE_PROGRESSIVE_WAVE_RANGE_SECONDS)
+            range_start = source_start
+            while range_start < source_end - 1e-6:
+                range_end = min(source_end, range_start + range_seconds)
+                range_duration = max(0.0, range_end - range_start)
+                if range_duration > 1e-6:
+                    key = self._range_peaks_key_from_source(
+                        source,
+                        range_start,
+                        range_duration,
+                        WAVEFORM_PEAKS_FAST,
+                    )
+                    self._enqueue_progressive_media_cache_task(
+                        (
+                            "wave_range",
+                            key,
+                            source,
+                            float(range_start),
+                            float(range_duration),
+                            WAVEFORM_PEAKS_FAST,
+                        )
+                    )
+                range_start = range_end
+        else:
+            key = self._peaks_key(clip, WAVEFORM_PEAKS_FAST)
+            self._enqueue_progressive_media_cache_task(
+                ("wave", key, source, WAVEFORM_PEAKS_FAST)
+            )
+
+        if is_audio or not TIMELINE_USE_TILED_FILMSTRIP:
+            return
+
+        samples_per_second = _filmstrip_samples_per_second(
+            float(self._pixels_per_second) / max(1e-6, speed)
+        )
+        chunk_duration = float(max(1, FILMSTRIP_TILES_PER_CHUNK)) / float(
+            max(1, samples_per_second)
+        )
+        if chunk_duration <= 1e-6:
+            return
+        first_chunk = max(0, int(source_start // chunk_duration))
+        last_chunk = max(
+            first_chunk,
+            int(max(source_start, source_end - 1e-6) // chunk_duration),
+        )
+        for chunk_idx in range(first_chunk, last_chunk + 1):
+            key = self._filmstrip_chunk_key(
+                source,
+                chunk_idx,
+                samples_per_second=samples_per_second,
+            )
+            self._enqueue_progressive_media_cache_task(
+                (
+                    "filmstrip_chunk",
+                    key,
+                    source,
+                    int(chunk_idx),
+                    int(samples_per_second),
+                )
+            )
+
+    def _enqueue_progressive_media_cache_from_items(self) -> None:
+        items = [
+            item
+            for item in getattr(self, "_clip_items_by_id", {}).values()
+            if isinstance(item, ClipRect)
+            and not getattr(item, "_is_text_clip", False)
+        ]
+        items.sort(key=lambda item: float(getattr(item.clip, "start", 0.0) or 0.0))
+        before = len(self._progressive_media_cache_tasks)
+        for item in items:
+            self._enqueue_progressive_media_cache_for_clip(item.clip)
+        if len(self._progressive_media_cache_tasks) > before:
+            self._schedule_progressive_media_cache()
+
+    def _submit_progressive_media_cache_task(self, task: tuple) -> bool:
+        kind = str(task[0] if task else "")
+        if kind == "filmstrip_chunk" and len(task) >= 5:
+            key = task[1]
+            source = str(task[2])
+            chunk_idx = int(task[3])
+            samples_per_second = max(1, int(task[4]))
+            if key in self._chunk_pixmap_cache or key in self._chunk_inflight:
+                return True
+            if len(self._chunk_inflight) >= MAX_FILMSTRIP_CHUNKS_INFLIGHT:
+                return False
+            source_key = str(key[0]) if isinstance(key, tuple) and key else source
+            per_source = sum(
+                1
+                for existing in self._chunk_inflight
+                if existing and str(existing[0]) == source_key
+            )
+            if per_source >= MAX_FILMSTRIP_CHUNKS_INFLIGHT_PER_SOURCE:
+                return False
+            self._submit_filmstrip_chunk_extract(
+                key,
+                source,
+                chunk_idx,
+                samples_per_second=samples_per_second,
+            )
+            return True
+
+        if kind == "wave_range" and len(task) >= 6:
+            key = task[1]
+            source = str(task[2])
+            start = float(task[3])
+            duration = float(task[4])
+            num_peaks = int(task[5])
+            if key in self._wave_range_peaks_cache or key in self._wave_range_peaks_inflight:
+                return True
+            if (
+                len(self._wave_range_peaks_inflight) + len(self._wave_peaks_inflight)
+                >= MAX_PROGRESSIVE_WAVEFORM_INFLIGHT
+            ):
+                return False
+            self._submit_waveform_range_extract(
+                key,
+                source,
+                start=start,
+                duration=duration,
+                num_peaks=num_peaks,
+            )
+            return True
+
+        if kind == "wave" and len(task) >= 4:
+            key = task[1]
+            source = str(task[2])
+            num_peaks = int(task[3])
+            if key in self._wave_peaks_cache or key in self._wave_peaks_inflight:
+                return True
+            if (
+                len(self._wave_range_peaks_inflight) + len(self._wave_peaks_inflight)
+                >= MAX_PROGRESSIVE_WAVEFORM_INFLIGHT
+            ):
+                return False
+            self._submit_waveform_extract(key, source, num_peaks)
+            return True
+
+        return True
+
+    def _process_progressive_media_cache(self) -> None:
+        if self._is_playing or self._is_playhead_scrubbing or self._pointer_active:
+            self._schedule_progressive_media_cache()
+            return
+        processed = 0
+        while (
+            self._progressive_media_cache_tasks
+            and processed < MEDIA_CACHE_PROGRESSIVE_BATCH_SIZE
+        ):
+            task = self._progressive_media_cache_tasks[0]
+            if not self._submit_progressive_media_cache_task(task):
+                break
+            self._progressive_media_cache_tasks.popleft()
+            processed += 1
+        if self._progressive_media_cache_tasks:
+            self._schedule_progressive_media_cache()
 
     def _prewarm_clip_media_assets(self, clip: Clip) -> None:
         if bool(getattr(clip, "is_text_clip", False)):
@@ -5377,6 +5622,7 @@ class TimelinePanel(QWidget):
     def prewarm_track_clips(self, clips: list[Clip]) -> None:
         """Eagerly preload timeline cache for clips already on tracks."""
         seen: set[tuple[str, int, str, int, int]] = set()
+        progressive_clips: list[Clip] = []
         for clip in clips:
             if not isinstance(clip, Clip):
                 continue
@@ -5414,7 +5660,16 @@ class TimelinePanel(QWidget):
             if signature in seen:
                 continue
             seen.add(signature)
+            progressive_clips.append(clip)
             self._prewarm_clip_media_assets(clip)
+        progressive_clips.sort(
+            key=lambda item: float(getattr(item, "start", 0.0) or 0.0)
+        )
+        before = len(self._progressive_media_cache_tasks)
+        for clip in progressive_clips:
+            self._enqueue_progressive_media_cache_for_clip(clip)
+        if len(self._progressive_media_cache_tasks) > before:
+            self._schedule_progressive_media_cache()
 
     def _update_clip_items_for_cache_key(
         self,

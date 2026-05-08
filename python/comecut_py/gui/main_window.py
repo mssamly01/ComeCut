@@ -3628,7 +3628,7 @@ class MainWindow(QMainWindow):
                 if id(clip) not in self._duration_placeholder_clip_ids
             ]
             try:
-                if ready_created and not large_import:
+                if ready_created:
                     self.timeline_panel.prewarm_track_clips(ready_created)
             except Exception:
                 pass
